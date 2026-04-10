@@ -46,7 +46,10 @@ mod tests {
 
     #[test]
     fn test_single_chunk_short_text() {
-        let cfg = ChunkerConfig { chunk_size: 10, overlap: 2 };
+        let cfg = ChunkerConfig {
+            chunk_size: 10,
+            overlap: 2,
+        };
         let chunks = chunk_text("hello world foo bar", &cfg);
         assert_eq!(chunks.len(), 1);
     }
@@ -54,7 +57,10 @@ mod tests {
     #[test]
     fn test_overlap() {
         let words: Vec<String> = (0..20).map(|i| i.to_string()).collect();
-        let cfg = ChunkerConfig { chunk_size: 10, overlap: 3 };
+        let cfg = ChunkerConfig {
+            chunk_size: 10,
+            overlap: 3,
+        };
         let chunks = chunk_text(&words.join(" "), &cfg);
         assert!(chunks.len() > 1);
         let first: Vec<&str> = chunks[0].split_whitespace().collect();

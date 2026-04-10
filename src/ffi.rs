@@ -50,15 +50,21 @@ pub extern "C" fn memoire_free(handle: *mut MemoireHandle) {
 
 /// Store `content`. Returns chunks stored (>= 1) or -1 on error.
 #[no_mangle]
-pub extern "C" fn memoire_remember(
-    handle: *mut MemoireHandle,
-    content: *const c_char,
-) -> c_int {
-    let m = match mut_ref(handle) { Some(h) => h, None => return -1 };
-    let content = match to_str(content) { Some(s) => s, None => return -1 };
+pub extern "C" fn memoire_remember(handle: *mut MemoireHandle, content: *const c_char) -> c_int {
+    let m = match mut_ref(handle) {
+        Some(h) => h,
+        None => return -1,
+    };
+    let content = match to_str(content) {
+        Some(s) => s,
+        None => return -1,
+    };
     match m.remember(content) {
         Ok(ids) => ids.len() as c_int,
-        Err(e) => { log::error!("memoire_remember: {e}"); -1 }
+        Err(e) => {
+            log::error!("memoire_remember: {e}");
+            -1
+        }
     }
 }
 
@@ -74,20 +80,28 @@ pub extern "C" fn memoire_recall(
     query: *const c_char,
     top_k: c_int,
 ) -> *mut c_char {
-    let m = match const_ref(handle) { Some(h) => h, None => return ptr::null_mut() };
-    let query = match to_str(query) { Some(s) => s, None => return ptr::null_mut() };
+    let m = match const_ref(handle) {
+        Some(h) => h,
+        None => return ptr::null_mut(),
+    };
+    let query = match to_str(query) {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
     let k = if top_k <= 0 { 5 } else { top_k as usize };
 
     match m.recall(query, k) {
         Ok(memories) => {
-            let json = serde_json::to_string(&memories)
-                .unwrap_or_else(|_| "[]".to_string());
+            let json = serde_json::to_string(&memories).unwrap_or_else(|_| "[]".to_string());
             match CString::new(json) {
                 Ok(s) => s.into_raw(),
                 Err(_) => ptr::null_mut(),
             }
         }
-        Err(e) => { log::error!("memoire_recall: {e}"); ptr::null_mut() }
+        Err(e) => {
+            log::error!("memoire_recall: {e}");
+            ptr::null_mut()
+        }
     }
 }
 
@@ -98,7 +112,10 @@ pub extern "C" fn memoire_forget(handle: *mut MemoireHandle, id: c_longlong) -> 
         Some(m) => match m.forget(id) {
             Ok(true) => 1,
             Ok(false) => 0,
-            Err(e) => { log::error!("memoire_forget: {e}"); -1 }
+            Err(e) => {
+                log::error!("memoire_forget: {e}");
+                -1
+            }
         },
         None => -1,
     }
@@ -117,7 +134,10 @@ pub extern "C" fn memoire_count(handle: *const MemoireHandle) -> c_longlong {
 #[no_mangle]
 pub extern "C" fn memoire_clear(handle: *mut MemoireHandle) -> c_int {
     match mut_ref(handle) {
-        Some(m) => match m.clear() { Ok(()) => 0, Err(_) => -1 },
+        Some(m) => match m.clear() {
+            Ok(()) => 0,
+            Err(_) => -1,
+        },
         None => -1,
     }
 }
@@ -133,16 +153,22 @@ pub extern "C" fn memoire_free_string(s: *mut c_char) {
 // ─── Private helpers ─────────────────────────────────────────────────────────
 
 fn to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
-    if ptr.is_null() { return None; }
+    if ptr.is_null() {
+        return None;
+    }
     unsafe { CStr::from_ptr(ptr) }.to_str().ok()
 }
 
 fn mut_ref(handle: *mut MemoireHandle) -> Option<&'static mut Memoire> {
-    if handle.is_null() { return None; }
+    if handle.is_null() {
+        return None;
+    }
     Some(unsafe { &mut (*handle).0 })
 }
 
 fn const_ref(handle: *const MemoireHandle) -> Option<&'static Memoire> {
-    if handle.is_null() { return None; }
+    if handle.is_null() {
+        return None;
+    }
     Some(unsafe { &(*handle).0 })
 }

@@ -98,13 +98,19 @@ impl Store {
             .filter_map(|(id, content, blob, created_at)| {
                 let embedding = blob_to_vec(&blob)?;
                 let score = cosine_similarity(query_vec, &embedding);
-                Some((score, Memory { id, content, score, created_at }))
+                Some((
+                    score,
+                    Memory {
+                        id,
+                        content,
+                        score,
+                        created_at,
+                    },
+                ))
             })
             .collect();
 
-        scored.sort_unstable_by(|a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(top_k);
 
         Ok(scored.into_iter().map(|(_, m)| m).collect())
@@ -113,15 +119,15 @@ impl Store {
     /// Return every stored memory ordered by insertion time descending.
     /// Score is set to 1.0 as a sentinel (no query was made).
     pub fn all(&self) -> Result<Vec<Memory>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content, created_at FROM memories ORDER BY created_at DESC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content, created_at FROM memories ORDER BY created_at DESC")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(Memory {
-                    id:         row.get(0)?,
-                    content:    row.get(1)?,
-                    score:      1.0,
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    score: 1.0,
                     created_at: row.get(2)?,
                 })
             })?
@@ -131,19 +137,16 @@ impl Store {
     }
 
     pub fn forget(&self, id: i64) -> Result<bool> {
-        let rows = self.conn.execute(
-            "DELETE FROM memories WHERE id = ?1",
-            params![id],
-        )?;
+        let rows = self
+            .conn
+            .execute("DELETE FROM memories WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
     pub fn count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM memories",
-            [],
-            |r| r.get(0),
-        )?)
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?)
     }
 
     pub fn clear(&self) -> Result<()> {
@@ -191,7 +194,7 @@ mod tests {
     fn test_all() {
         let store = Store::in_memory().unwrap();
         store.insert("alpha", &[1.0_f32, 0.0]).unwrap();
-        store.insert("beta",  &[0.0_f32, 1.0]).unwrap();
+        store.insert("beta", &[0.0_f32, 1.0]).unwrap();
         let all = store.all().unwrap();
         assert_eq!(all.len(), 2);
     }
@@ -199,8 +202,8 @@ mod tests {
     #[test]
     fn test_scores_descending() {
         let store = Store::in_memory().unwrap();
-        store.insert("closest",  &[1.0_f32, 0.0, 0.0]).unwrap();
-        store.insert("middle",   &[0.7_f32, 0.7, 0.0]).unwrap();
+        store.insert("closest", &[1.0_f32, 0.0, 0.0]).unwrap();
+        store.insert("middle", &[0.7_f32, 0.7, 0.0]).unwrap();
         store.insert("farthest", &[0.0_f32, 1.0, 0.0]).unwrap();
         let results = store.search(&[1.0, 0.0, 0.0], 3).unwrap();
         for w in results.windows(2) {

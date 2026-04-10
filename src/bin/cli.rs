@@ -58,13 +58,28 @@ struct Args {
 }
 
 enum Command {
-    Remember { text: String },
-    Recall { query: String, top: usize, json: bool, min_score: f32 },
-    Forget { id: i64 },
+    Remember {
+        text: String,
+    },
+    Recall {
+        query: String,
+        top: usize,
+        json: bool,
+        min_score: f32,
+    },
+    Forget {
+        id: i64,
+    },
     Count,
-    Clear { confirmed: bool },
-    Import { path: String },
-    Export { json: bool },
+    Clear {
+        confirmed: bool,
+    },
+    Import {
+        path: String,
+    },
+    Export {
+        json: bool,
+    },
     Info,
     Help,
 }
@@ -82,7 +97,10 @@ fn parse_args() -> Result<Args, String> {
                 db = raw.get(i).cloned().ok_or("--db requires a path")?;
             }
             "--help" | "-h" => {
-                return Ok(Args { db, command: Command::Help });
+                return Ok(Args {
+                    db,
+                    command: Command::Help,
+                });
             }
             _ => break,
         }
@@ -100,7 +118,9 @@ fn parse_args() -> Result<Args, String> {
             }
             let text = if text == "-" {
                 let stdin = io::stdin();
-                stdin.lock().lines()
+                stdin
+                    .lock()
+                    .lines()
                     .filter_map(|l| l.ok())
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -120,24 +140,34 @@ fn parse_args() -> Result<Args, String> {
                 match raw[i].as_str() {
                     "--top" | "-n" => {
                         i += 1;
-                        top = raw.get(i).and_then(|s| s.parse().ok())
+                        top = raw
+                            .get(i)
+                            .and_then(|s| s.parse().ok())
                             .ok_or("--top requires a number")?;
                     }
                     "--json" => json = true,
                     "--min-score" => {
                         i += 1;
-                        min_score = raw.get(i).and_then(|s| s.parse().ok())
+                        min_score = raw
+                            .get(i)
+                            .and_then(|s| s.parse().ok())
                             .ok_or("--min-score requires a float")?;
                     }
                     _ => {}
                 }
                 i += 1;
             }
-            Command::Recall { query, top, json, min_score }
+            Command::Recall {
+                query,
+                top,
+                json,
+                min_score,
+            }
         }
 
         "forget" => {
-            let id: i64 = raw.get(i)
+            let id: i64 = raw
+                .get(i)
                 .and_then(|s| s.parse().ok())
                 .ok_or("forget requires an integer id")?;
             Command::Forget { id }
@@ -197,7 +227,12 @@ fn run() -> anyhow::Result<()> {
             println!("✓ stored {} chunk(s) → ids: {:?}", ids.len(), ids);
         }
 
-        Command::Recall { query, top, json, min_score } => {
+        Command::Recall {
+            query,
+            top,
+            json,
+            min_score,
+        } => {
             let mut results = m.recall(&query, top)?;
             results.retain(|r| r.score >= min_score);
 
@@ -269,7 +304,12 @@ fn run() -> anyhow::Result<()> {
             for (i, line) in lines.iter().enumerate() {
                 let ids = m.remember(line)?;
                 total_chunks += ids.len();
-                print!("\r  [{}/{}] {} chunk(s) stored", i + 1, lines.len(), total_chunks);
+                print!(
+                    "\r  [{}/{}] {} chunk(s) stored",
+                    i + 1,
+                    lines.len(),
+                    total_chunks
+                );
                 io::stdout().flush()?;
             }
             println!("\n✓ done. {total_chunks} total chunk(s) stored.");

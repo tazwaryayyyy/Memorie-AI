@@ -8,16 +8,20 @@ fn m() -> Memoire {
 fn test_remember_and_count() {
     let mem = m();
     assert_eq!(mem.count().unwrap(), 0);
-    mem.remember("Fixed the pagination bug in the user list endpoint").unwrap();
+    mem.remember("Fixed the pagination bug in the user list endpoint")
+        .unwrap();
     assert!(mem.count().unwrap() >= 1);
 }
 
 #[test]
 fn test_recall_relevance() {
     let mem = m();
-    mem.remember("Fixed a null pointer dereference in the auth middleware").unwrap();
-    mem.remember("Refactored the database connection pool for throughput").unwrap();
-    mem.remember("Added unit tests for the payment module").unwrap();
+    mem.remember("Fixed a null pointer dereference in the auth middleware")
+        .unwrap();
+    mem.remember("Refactored the database connection pool for throughput")
+        .unwrap();
+    mem.remember("Added unit tests for the payment module")
+        .unwrap();
 
     let results = mem.recall("authentication security bug", 3).unwrap();
     assert!(!results.is_empty());
@@ -72,7 +76,8 @@ fn test_empty_recall_returns_empty() {
 fn test_top_k_limit() {
     let mem = m();
     for i in 0..10 {
-        mem.remember(&format!("memory {i} about coding in Rust")).unwrap();
+        mem.remember(&format!("memory {i} about coding in Rust"))
+            .unwrap();
     }
     let results = mem.recall("Rust coding", 3).unwrap();
     assert!(results.len() <= 3);
@@ -90,7 +95,10 @@ fn test_whitespace_only_input_ignored() {
 fn test_long_input_is_chunked() {
     let mem = m();
     // ~300 words — should exceed the 128-word default chunk size
-    let long = (0..300).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+    let long = (0..300)
+        .map(|i| format!("word{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let ids = mem.remember(&long).unwrap();
     assert!(ids.len() > 1, "long input should produce multiple chunks");
 }

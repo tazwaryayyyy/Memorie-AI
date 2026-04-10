@@ -2,12 +2,6 @@
 # Use all available cores for compilation
 jobs = 4
 
-[env]
-# The shell on this machine exports CARGO_NET_OFFLINE=true, which prevents
-# ort-sys from downloading or re-resolving ONNX Runtime during builds.
-# Point directly at the cached runtime so plain `cargo build --release` works.
-ORT_LIB_LOCATION = "C:\\Users\\MSI\\AppData\\Local\\ort.pyke.io\\dfbin\\x86_64-pc-windows-msvc\\a03948a02dec0c38485febb0e54ccb89af070d3adcbcb91e2e4fa5fec278943a"
-
 [target.x86_64-unknown-linux-gnu]
 # Enable AVX2 for faster cosine similarity SIMD on modern x86 CPUs.
 # Remove if targeting older hardware (pre-2013 CPUs).

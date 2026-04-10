@@ -13,18 +13,14 @@ fn main() -> anyhow::Result<()> {
         "Session 2024-01-15: Fixed an off-by-one error in the user pagination \
          endpoint. The `limit` parameter was applied before `offset`, causing \
          the first page to return one fewer result than expected.",
-
         "Session 2024-01-16: Redis cache was not being invalidated after a user \
          profile update. Added cache eviction in `update_profile` service method.",
-
         "Session 2024-01-17: Refactored authentication middleware to use async \
          token validation. Reduced p99 latency on authenticated routes from 340ms \
          to 45ms.",
-
         "Session 2024-01-18: Diagnosed a memory leak in the websocket connection \
          handler. Connections were not being dropped on client disconnect. Fixed \
          by implementing the Drop trait on the handler struct.",
-
         "Session 2024-01-19: Upgraded the ORM from v1 to v2. Required migration \
          of 14 raw SQL queries to the new query builder API. All existing tests pass.",
     ];
@@ -48,7 +44,11 @@ fn main() -> anyhow::Result<()> {
         println!("Query: \"{q}\"");
         let results = m.recall(q, 2)?;
         for (i, r) in results.iter().enumerate() {
-            println!("  [{i}] score={:.4}  {}", r.score, &r.content[..80.min(r.content.len())]);
+            println!(
+                "  [{i}] score={:.4}  {}",
+                r.score,
+                &r.content[..80.min(r.content.len())]
+            );
         }
         println!();
     }

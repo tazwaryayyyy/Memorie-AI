@@ -11,8 +11,7 @@ impl Embedder {
     pub fn new() -> Result<Self> {
         log::info!("Initialising local embedding model (all-MiniLM-L6-v2)...");
         let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                .with_show_download_progress(true),
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
         )?;
         log::info!("Embedding model ready.");
         Ok(Self {
@@ -31,6 +30,7 @@ impl Embedder {
 
     pub fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
         let mut r = self.embed(vec![text.to_string()])?;
-        r.pop().ok_or_else(|| anyhow::anyhow!("embedder returned empty result"))
+        r.pop()
+            .ok_or_else(|| anyhow::anyhow!("embedder returned empty result"))
     }
 }

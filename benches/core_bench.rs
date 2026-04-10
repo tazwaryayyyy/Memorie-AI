@@ -3,17 +3,14 @@ use memoire::Memoire;
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const SHORT: &str =
-    "Fixed a null pointer dereference in the authentication middleware.";
+const SHORT: &str = "Fixed a null pointer dereference in the authentication middleware.";
 
-const MEDIUM: &str =
-    "Refactored the database connection pool to use async/await throughout. \
+const MEDIUM: &str = "Refactored the database connection pool to use async/await throughout. \
      Changed the max pool size from 5 to 20 and added idle connection pruning \
      every 30 seconds. This reduced connection setup overhead on burst traffic \
      from 340ms to under 10ms per request on the staging environment.";
 
-const LONG: &str =
-    "Session 2024-01-20: Investigated a production incident where the payment \
+const LONG: &str = "Session 2024-01-20: Investigated a production incident where the payment \
      processing service was failing for approximately 3% of transactions. Root \
      cause was a race condition in the idempotency key validation logic — two \
      concurrent requests with the same key could both pass the uniqueness check \
@@ -39,8 +36,16 @@ fn seed_store(m: &Memoire, n: usize) {
         "Upgraded {} from v1 to v2 and migrated all API call sites to the new interface",
     ];
     let domains = [
-        "auth", "payment", "database", "cache", "websocket",
-        "worker", "scheduler", "api-gateway", "metrics", "search",
+        "auth",
+        "payment",
+        "database",
+        "cache",
+        "websocket",
+        "worker",
+        "scheduler",
+        "api-gateway",
+        "metrics",
+        "search",
     ];
     for i in 0..n {
         let t = templates[i % templates.len()];
@@ -81,7 +86,8 @@ fn bench_recall(c: &mut Criterion) {
                 let m = make_store();
                 seed_store(&m, n);
                 b.iter(|| {
-                    m.recall(black_box("authentication security bug"), black_box(5)).unwrap()
+                    m.recall(black_box("authentication security bug"), black_box(5))
+                        .unwrap()
                 });
             },
         );
@@ -99,7 +105,10 @@ fn bench_recall_top_k(c: &mut Criterion) {
 
     for k in [1usize, 5, 10, 25] {
         group.bench_with_input(BenchmarkId::new("top_k", k), &k, |b, &top| {
-            b.iter(|| m.recall(black_box("database performance"), black_box(top)).unwrap());
+            b.iter(|| {
+                m.recall(black_box("database performance"), black_box(top))
+                    .unwrap()
+            });
         });
     }
 
@@ -109,25 +118,35 @@ fn bench_recall_top_k(c: &mut Criterion) {
 // ─── chunker benchmark ───────────────────────────────────────────────────────
 
 fn bench_chunker(c: &mut Criterion) {
-    use memoire::chunker::{ChunkerConfig, chunk_text};
+    use memoire::chunker::{chunk_text, ChunkerConfig};
 
     let mut group = c.benchmark_group("chunker");
     let cfg = ChunkerConfig::default();
 
     // Build inputs of varying sizes
-    let small  = "word ".repeat(50);
+    let small = "word ".repeat(50);
     let medium = "word ".repeat(500);
-    let large  = "word ".repeat(5000);
+    let large = "word ".repeat(5000);
 
     for (name, input) in [("50w", &small), ("500w", &medium), ("5000w", &large)] {
         group.throughput(Throughput::Bytes(input.len() as u64));
-        group.bench_with_input(BenchmarkId::new("words", name), input.as_str(), |b, text| {
-            b.iter(|| chunk_text(black_box(text), black_box(&cfg)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("words", name),
+            input.as_str(),
+            |b, text| {
+                b.iter(|| chunk_text(black_box(text), black_box(&cfg)));
+            },
+        );
     }
 
     group.finish();
 }
 
-criterion_group!(benches, bench_remember, bench_recall, bench_recall_top_k, bench_chunker);
+criterion_group!(
+    benches,
+    bench_remember,
+    bench_recall,
+    bench_recall_top_k,
+    bench_chunker
+);
 criterion_main!(benches);

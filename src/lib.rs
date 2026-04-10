@@ -4,7 +4,7 @@ pub mod error;
 pub mod ffi;
 pub mod store;
 
-use chunker::{ChunkerConfig, chunk_text};
+use chunker::{chunk_text, ChunkerConfig};
 use embedder::Embedder;
 use error::{MemoireError, Result};
 use store::{Memory, Store};
