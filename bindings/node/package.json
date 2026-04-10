@@ -1,0 +1,19 @@
+{
+  "name": "memoire-node",
+  "version": "0.1.0",
+  "description": "Node.js binding for the Memoire semantic memory engine",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js",
+    "demo": "node demo.js"
+  },
+  "keywords": ["ai", "memory", "embeddings", "semantic-search"],
+  "license": "MIT",
+  "peerDependencies": {
+    "ffi-napi": "^4.0.3",
+    "ref-napi": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

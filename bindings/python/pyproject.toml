@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "memoire"
+version = "0.1.0"
+description = "Local-first semantic memory engine for AI coding agents"
+readme = "../../README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["ai", "memory", "embeddings", "semantic-search", "llm", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/memoire"
+Repository = "https://github.com/yourusername/memoire"
+Issues = "https://github.com/yourusername/memoire/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["memoire*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

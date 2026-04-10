@@ -1,0 +1,8 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+.env
+*.so
+*.dylib
+*.dll
