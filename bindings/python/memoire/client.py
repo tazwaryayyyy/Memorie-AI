@@ -57,10 +57,12 @@ def _find_lib() -> str:
         raise MemoireError(f"Unsupported platform: {platform!r}")
 
     # Walk up from this file to find the repo root and the Cargo output
+    repo_root = Path(__file__).parent.parent.parent.parent
     candidates = [
-        Path(__file__).parent.parent.parent.parent /
-        "target" / "release" / lib_name,
-        Path(lib_name),  # system path / LD_LIBRARY_PATH
+        repo_root / "target" / "release" / lib_name,
+        repo_root / "target" / "debug" / lib_name,
+        Path(__file__).parent / lib_name,  # installed alongside the package
+        Path(lib_name),                    # LD_LIBRARY_PATH / PATH / cwd
     ]
     for p in candidates:
         if p.exists():
@@ -69,7 +71,7 @@ def _find_lib() -> str:
     raise MemoireError(
         f"Could not find {lib_name}.\n"
         "Build it first:  cargo build --release\n"
-        "Or set MEMOIRE_LIB=/path/to/libmemoire.so"
+        f"Or set MEMOIRE_LIB=/full/path/to/{lib_name}"
     )
 
 
