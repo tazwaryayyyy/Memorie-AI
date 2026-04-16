@@ -18,6 +18,34 @@ pub struct QualityFeatures {
     pub evidence: f32,
 }
 
+/// Weights applied to quality features when computing importance score.
+///
+/// The frozen `Default` profile is the calibrated baseline used in all
+/// benchmarks. Supply a custom profile via `Memoire::with_scoring_weights()`
+/// for domain-specific weighting (e.g. raise `novelty` for research agents)
+/// without recompiling the Rust core or touching the trust formula.
+#[derive(Debug, Clone)]
+pub struct ScoringWeights {
+    pub actionability: f32,
+    pub consequence: f32,
+    pub novelty: f32,
+    pub reusability: f32,
+    pub evidence: f32,
+}
+
+impl Default for ScoringWeights {
+    fn default() -> Self {
+        // Calibrated defaults — frozen for reproducibility.
+        Self {
+            actionability: 0.30,
+            consequence: 0.25,
+            novelty: 0.20,
+            reusability: 0.15,
+            evidence: 0.10,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QualityMeta {
     pub importance_base: f32,
@@ -87,14 +115,17 @@ pub fn fingerprint(text: &str) -> String {
     format!("{:x}", hasher.finish())
 }
 
-// SCORING FROZEN — weights and thresholds are fixed for reproducibility.
-// Do not adjust without forking the quality module.
-pub fn score_importance(features: &QualityFeatures) -> f32 {
-    (0.30 * features.actionability
-        + 0.25 * features.consequence
-        + 0.20 * features.novelty
-        + 0.15 * features.reusability
-        + 0.10 * features.evidence)
+/// Score importance using explicit weights.
+///
+/// The `ScoringWeights::default()` profile is frozen for reproducibility.
+/// Advanced callers supply a custom profile via `Memoire::with_scoring_weights()`
+/// without recompiling the Rust core.
+pub fn score_importance(features: &QualityFeatures, weights: &ScoringWeights) -> f32 {
+    (weights.actionability * features.actionability
+        + weights.consequence * features.consequence
+        + weights.novelty * features.novelty
+        + weights.reusability * features.reusability
+        + weights.evidence * features.evidence)
         .clamp(0.0, 1.0)
 }
 
@@ -289,9 +320,10 @@ pub fn build_quality_meta(
     content: &str,
     novelty: f32,
     source_kind: &str,
+    weights: &ScoringWeights,
 ) -> (QualityMeta, IngestDecision) {
     let features = extract_features(content, novelty);
-    let score = score_importance(&features);
+    let score = score_importance(&features, weights);
     let decision = decide_store(score, 1.0 - novelty);
     let claim = extract_claim(content);
 

@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::quality::{compute_trust, effective_weight, recency_bonus, QualityMeta};
+use crate::quality::{compute_trust, effective_weight, now_ts, recency_bonus, QualityMeta};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Memory {
@@ -583,6 +583,28 @@ impl Store {
             .collect();
 
         Ok(result)
+    }
+
+    /// Like `search`, but only returns memories created within `max_age_days`.
+    ///
+    /// Addresses **semantic drift**: a memory correct for library version 1.0
+    /// may be wrong for version 2.0. This recency gate treats outdated memories
+    /// as stale context rather than mistakes — no trust penalty is applied,
+    /// unlike `penalize_if_used`. The gate is read-only.
+    pub fn search_within_days(
+        &self,
+        query_vec: &[f32],
+        top_k: usize,
+        max_age_days: f32,
+    ) -> Result<Vec<Memory>> {
+        let cutoff_ts = now_ts() - (max_age_days * 86_400.0) as i64;
+        // Fetch a larger pool so age-filtering does not starve top_k.
+        let pool = self.search(query_vec, (top_k * 4).max(20))?;
+        Ok(pool
+            .into_iter()
+            .filter(|m| m.created_at >= cutoff_ts)
+            .take(top_k)
+            .collect())
     }
 
     pub fn resolve_contradictions_for_id(&self, id: i64) -> Result<()> {

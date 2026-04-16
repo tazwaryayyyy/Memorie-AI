@@ -34,3 +34,52 @@ impl Embedder {
             .ok_or_else(|| anyhow::anyhow!("embedder returned empty result"))
     }
 }
+
+/// Embedding backend abstraction.
+///
+/// Implement this trait to swap `all-MiniLM-L6-v2` for any model — BERT-large,
+/// an OpenAI API wrapper, or a proprietary encoder — without recompiling the
+/// Rust core. Pass the custom backend via [`crate::Memoire::new_with_embedder`].
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use memoire::embedder::EmbedProvider;
+///
+/// struct MyEmbedder;
+/// impl EmbedProvider for MyEmbedder {
+///     fn embed(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+///         // call your model here
+///         Ok(texts.iter().map(|_| vec![0.0_f32; 768]).collect())
+///     }
+///     fn dim(&self) -> usize { 768 }
+/// }
+/// ```
+pub trait EmbedProvider: Send + Sync {
+    /// Embed a batch of texts. Returns one output vector per input.
+    fn embed(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>>;
+
+    /// Embed a single text. Default implementation calls `embed`.
+    fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let mut r = self.embed(vec![text.to_string()])?;
+        r.pop()
+            .ok_or_else(|| anyhow::anyhow!("embedder returned empty result"))
+    }
+
+    /// Dimensionality of the output vectors produced by this backend.
+    fn dim(&self) -> usize;
+}
+
+impl EmbedProvider for Embedder {
+    fn embed(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("embedder mutex poisoned"))?;
+        model.embed(texts, None)
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}

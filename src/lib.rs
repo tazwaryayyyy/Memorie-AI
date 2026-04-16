@@ -6,9 +6,9 @@ pub mod quality;
 pub mod store;
 
 use chunker::{chunk_text, ChunkerConfig};
-use embedder::Embedder;
+use embedder::{EmbedProvider, Embedder};
 use error::{MemoireError, Result};
-use quality::{build_quality_meta, fingerprint, IngestDecision};
+use quality::{build_quality_meta, fingerprint, IngestDecision, ScoringWeights};
 use store::{Memory, Store};
 
 /// The central Memoire instance.
@@ -28,18 +28,49 @@ use store::{Memory, Store};
 /// ```
 pub struct Memoire {
     store: Store,
-    embedder: Embedder,
+    embedder: Box<dyn EmbedProvider>,
     chunker_config: ChunkerConfig,
+    scoring_weights: ScoringWeights,
 }
 
 impl Memoire {
     /// Open or create a persistent memory store at `db_path`.
     pub fn new(db_path: &str) -> Result<Self> {
         let _ = env_logger::try_init();
+        Self::new_with_embedder(
+            db_path,
+            Box::new(Embedder::new().map_err(MemoireError::Embedding)?),
+        )
+    }
+
+    /// Open or create a persistent store with a custom embedding backend.
+    ///
+    /// Allows swapping `all-MiniLM-L6-v2` for any model — BERT-large, an
+    /// OpenAI API wrapper, or a proprietary encoder — without recompiling the
+    /// Rust core. Implement [`embedder::EmbedProvider`] and pass the backend here.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use memoire::{Memoire, embedder::EmbedProvider};
+    ///
+    /// struct MyEmbedder;
+    /// impl EmbedProvider for MyEmbedder {
+    ///     fn embed(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+    ///         Ok(texts.iter().map(|_| vec![0.0_f32; 768]).collect())
+    ///     }
+    ///     fn dim(&self) -> usize { 768 }
+    /// }
+    ///
+    /// let m = Memoire::new_with_embedder("agent.db", Box::new(MyEmbedder))?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn new_with_embedder(db_path: &str, embedder: Box<dyn EmbedProvider>) -> Result<Self> {
         Ok(Self {
             store: Store::open(db_path)?,
-            embedder: Embedder::new().map_err(MemoireError::Embedding)?,
+            embedder,
             chunker_config: ChunkerConfig::default(),
+            scoring_weights: ScoringWeights::default(),
         })
     }
 
@@ -48,13 +79,29 @@ impl Memoire {
         let _ = env_logger::try_init();
         Ok(Self {
             store: Store::in_memory()?,
-            embedder: Embedder::new().map_err(MemoireError::Embedding)?,
+            embedder: Box::new(Embedder::new().map_err(MemoireError::Embedding)?),
             chunker_config: ChunkerConfig::default(),
+            scoring_weights: ScoringWeights::default(),
         })
     }
 
     pub fn with_chunker_config(mut self, config: ChunkerConfig) -> Self {
         self.chunker_config = config;
+        self
+    }
+
+    /// Override the default scoring weights used at ingestion time.
+    ///
+    /// The `ScoringWeights::default()` profile is frozen for reproducibility
+    /// and is the baseline for all benchmarks. Use this to tune for your domain
+    /// without recompiling — e.g. raise `novelty` to 0.40 for research agents
+    /// where unique facts matter more than actionability.
+    ///
+    /// Does NOT affect the trust formula (computed at recall time from
+    /// reinforcement history). Only affects which memories reach `Active`
+    /// vs `Shadow` at write time.
+    pub fn with_scoring_weights(mut self, weights: ScoringWeights) -> Self {
+        self.scoring_weights = weights;
         self
     }
 
@@ -85,7 +132,7 @@ impl Memoire {
             }
             let max_sim = self.store.max_similarity(embedding)?;
             let novelty = (1.0 - max_sim).clamp(0.0, 1.0);
-            let (meta, decision) = build_quality_meta(chunk, novelty, source_kind);
+            let (meta, decision) = build_quality_meta(chunk, novelty, source_kind, &self.scoring_weights);
 
             match decision {
                 IngestDecision::Reject => continue,
@@ -124,6 +171,39 @@ impl Memoire {
         let mut results = self.recall(query, top_k)?;
         results.retain(|m| m.score >= min_score);
         Ok(results)
+    }
+
+    /// Recall but only consider memories created within the last `max_age_days` days.
+    ///
+    /// Addresses **semantic drift**: a memory accurate for an older library
+    /// version should not surface when the API has since changed. This is a
+    /// read-only recency gate — stale memories are skipped but their trust
+    /// scores are NOT modified. Use `penalize_if_used` only when the memory
+    /// was genuinely wrong, not merely outdated.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use memoire::Memoire;
+    /// # let m = Memoire::in_memory().unwrap();
+    /// // Surface only the last 30 days of lessons about the pandas API.
+    /// let mems = m.recall_within_days("pandas pivot API", 5, 30.0)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn recall_within_days(
+        &self,
+        query: &str,
+        top_k: usize,
+        max_age_days: f32,
+    ) -> Result<Vec<Memory>> {
+        if self.store.count()? == 0 {
+            return Ok(vec![]);
+        }
+        let query_vec = self
+            .embedder
+            .embed_one(query)
+            .map_err(MemoireError::Embedding)?;
+        self.store.search_within_days(&query_vec, top_k, max_age_days)
     }
 
     /// Reinforce a memory only when it was actually used by the agent.
