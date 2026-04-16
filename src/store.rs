@@ -131,8 +131,7 @@ impl Store {
         };
 
         // Path 1: Jaccard token overlap
-        let memory_tokens: std::collections::HashSet<&str> =
-            content.split_whitespace().collect();
+        let memory_tokens: std::collections::HashSet<&str> = content.split_whitespace().collect();
         let output_tokens: std::collections::HashSet<&str> =
             agent_output.split_whitespace().collect();
         let intersection = memory_tokens.intersection(&output_tokens).count();
@@ -264,9 +263,11 @@ impl Store {
              ORDER BY created_at DESC",
         )?;
 
-        let now: i64 = self
-            .conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| r.get(0))?;
+        let now: i64 =
+            self.conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
 
         // (score, trust, contradiction_group, Memory)
         let mut scored: Vec<(f32, f32, Option<String>, Memory)> = stmt
@@ -284,47 +285,56 @@ impl Store {
                 ))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(
-                id, content, blob, created_at,
-                importance_base, reinforcement_count, confidence,
-                store_state, contradiction_group,
-            )| {
-                let embedding = blob_to_vec(&blob)?;
-                let sim = cosine_similarity(query_vec, &embedding);
-                let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
-                let weight = effective_weight(importance_base, age_days, reinforcement_count);
-                let final_score = 0.75 * sim + 0.20 * weight + 0.05 * recency_bonus(created_at, now);
-                // contradiction_survived: active + has a claim group = won at least one check
-                let contradiction_survived = contradiction_group.is_some()
-                    && store_state == "active";
-                let trust_base = compute_trust(
-                    reinforcement_count,
-                    contradiction_survived,
-                    &store_state,
+            .filter_map(
+                |(
+                    id,
+                    content,
+                    blob,
+                    created_at,
                     importance_base,
+                    reinforcement_count,
                     confidence,
-                    age_days,
-                );
-                // Context-aware trust: a memory highly relevant to this specific
-                // query gets a boost; tangentially retrieved memories are dampened.
-                // trust_final = trust_base * (0.6 + 0.4 * similarity)
-                // Range: trust_base*0.6 (orthogonal query) → trust_base (perfect match)
-                let sim_clamped = sim.clamp(0.0, 1.0);
-                let trust = (trust_base * (0.6 + 0.4 * sim_clamped)).clamp(0.0, 1.0);
-                Some((
-                    final_score,
-                    trust,
+                    store_state,
                     contradiction_group,
-                    Memory {
-                        id,
-                        content,
-                        score: final_score,
+                )| {
+                    let embedding = blob_to_vec(&blob)?;
+                    let sim = cosine_similarity(query_vec, &embedding);
+                    let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
+                    let weight = effective_weight(importance_base, age_days, reinforcement_count);
+                    let final_score =
+                        0.75 * sim + 0.20 * weight + 0.05 * recency_bonus(created_at, now);
+                    // contradiction_survived: active + has a claim group = won at least one check
+                    let contradiction_survived =
+                        contradiction_group.is_some() && store_state == "active";
+                    let trust_base = compute_trust(
+                        reinforcement_count,
+                        contradiction_survived,
+                        &store_state,
+                        importance_base,
+                        confidence,
+                        age_days,
+                    );
+                    // Context-aware trust: a memory highly relevant to this specific
+                    // query gets a boost; tangentially retrieved memories are dampened.
+                    // trust_final = trust_base * (0.6 + 0.4 * similarity)
+                    // Range: trust_base*0.6 (orthogonal query) → trust_base (perfect match)
+                    let sim_clamped = sim.clamp(0.0, 1.0);
+                    let trust = (trust_base * (0.6 + 0.4 * sim_clamped)).clamp(0.0, 1.0);
+                    Some((
+                        final_score,
                         trust,
-                        state: store_state,
-                        created_at,
-                    },
-                ))
-            })
+                        contradiction_group,
+                        Memory {
+                            id,
+                            content,
+                            score: final_score,
+                            trust,
+                            state: store_state,
+                            created_at,
+                        },
+                    ))
+                },
+            )
             .collect();
 
         scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -357,7 +367,10 @@ impl Store {
                     if weak_groups.contains(cg) {
                         return false; // drop entire weak group
                     }
-                    group_winner.get(cg).map(|best| best == idx).unwrap_or(false)
+                    group_winner
+                        .get(cg)
+                        .map(|best| best == idx)
+                        .unwrap_or(false)
                 } else {
                     true
                 }
@@ -406,9 +419,11 @@ impl Store {
                AND id != ?3",
         )?;
 
-        let now: i64 = self
-            .conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| r.get(0))?;
+        let now: i64 =
+            self.conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
 
         for row in stmt.query_map(params![key, value, new_id], |row| {
             Ok((
@@ -468,9 +483,11 @@ impl Store {
     /// Return every stored memory ordered by insertion time descending.
     /// Score is set to 1.0 as a sentinel (no query was made).
     pub fn all(&self) -> Result<Vec<Memory>> {
-        let now: i64 = self
-            .conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| r.get(0))?;
+        let now: i64 =
+            self.conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
 
         let mut stmt = self.conn.prepare(
             "SELECT id, content, created_at,
@@ -497,7 +514,14 @@ impl Store {
                 let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
                 let contradiction_survived = cg.is_some() && state == "active";
                 let trust = compute_trust(rc, contradiction_survived, &state, imp, conf, age_days);
-                Memory { id, content, score: 1.0, trust, state, created_at }
+                Memory {
+                    id,
+                    content,
+                    score: 1.0,
+                    trust,
+                    state,
+                    created_at,
+                }
             })
             .collect();
         Ok(rows)
@@ -531,7 +555,8 @@ impl Store {
         let has = |name: &str| existing.iter().any(|c| c == name);
         let mut alter = Vec::new();
         if !has("importance_base") {
-            alter.push("ALTER TABLE memories ADD COLUMN importance_base REAL NOT NULL DEFAULT 0.5;");
+            alter
+                .push("ALTER TABLE memories ADD COLUMN importance_base REAL NOT NULL DEFAULT 0.5;");
         }
         if !has("confidence") {
             alter.push("ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 0.5;");
@@ -552,13 +577,18 @@ impl Store {
             alter.push("ALTER TABLE memories ADD COLUMN reusability REAL NOT NULL DEFAULT 0.5;");
         }
         if !has("source_kind") {
-            alter.push("ALTER TABLE memories ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'agent';");
+            alter
+                .push("ALTER TABLE memories ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'agent';");
         }
         if !has("store_state") {
-            alter.push("ALTER TABLE memories ADD COLUMN store_state TEXT NOT NULL DEFAULT 'active';");
+            alter.push(
+                "ALTER TABLE memories ADD COLUMN store_state TEXT NOT NULL DEFAULT 'active';",
+            );
         }
         if !has("reinforcement_count") {
-            alter.push("ALTER TABLE memories ADD COLUMN reinforcement_count INTEGER NOT NULL DEFAULT 0;");
+            alter.push(
+                "ALTER TABLE memories ADD COLUMN reinforcement_count INTEGER NOT NULL DEFAULT 0;",
+            );
         }
         if !has("last_accessed_at") {
             alter.push("ALTER TABLE memories ADD COLUMN last_accessed_at INTEGER;");
@@ -573,7 +603,9 @@ impl Store {
             alter.push("ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
         }
         if !has("effective_weight") {
-            alter.push("ALTER TABLE memories ADD COLUMN effective_weight REAL NOT NULL DEFAULT 1.0;");
+            alter.push(
+                "ALTER TABLE memories ADD COLUMN effective_weight REAL NOT NULL DEFAULT 1.0;",
+            );
         }
         if !has("fingerprint") {
             alter.push("ALTER TABLE memories ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';");

@@ -131,10 +131,7 @@ pub fn extract_claim(text: &str) -> Option<(String, String)> {
     }
 
     if t.contains("bcrypt") && t.contains("argon2") {
-        return Some((
-            "auth.password.hashing".to_string(),
-            "argon2id".to_string(),
-        ));
+        return Some(("auth.password.hashing".to_string(), "argon2id".to_string()));
     }
 
     if t.contains("rate limiting") || t.contains("rate limit") {
@@ -149,7 +146,10 @@ pub fn extract_claim(text: &str) -> Option<(String, String)> {
     }
 
     if t.contains("float") && t.contains("money") {
-        return Some(("billing.money.numeric_type".to_string(), "decimal".to_string()));
+        return Some((
+            "billing.money.numeric_type".to_string(),
+            "decimal".to_string(),
+        ));
     }
 
     None
@@ -282,7 +282,11 @@ pub fn compute_trust(
     (base_trust + fast_track).clamp(0.0, 1.0)
 }
 
-pub fn build_quality_meta(content: &str, novelty: f32, source_kind: &str) -> (QualityMeta, IngestDecision) {
+pub fn build_quality_meta(
+    content: &str,
+    novelty: f32,
+    source_kind: &str,
+) -> (QualityMeta, IngestDecision) {
     let features = extract_features(content, novelty);
     let score = score_importance(&features);
     let decision = decide_store(score, 1.0 - novelty);
@@ -297,7 +301,8 @@ pub fn build_quality_meta(content: &str, novelty: f32, source_kind: &str) -> (Qu
 
     let meta = QualityMeta {
         importance_base: score,
-        confidence: (0.50 + 0.30 * features.evidence + 0.20 * features.actionability).clamp(0.0, 1.0),
+        confidence: (0.50 + 0.30 * features.evidence + 0.20 * features.actionability)
+            .clamp(0.0, 1.0),
         novelty: features.novelty,
         actionability: features.actionability,
         evidence: features.evidence,

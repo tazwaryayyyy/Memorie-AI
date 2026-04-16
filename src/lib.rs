@@ -142,10 +142,7 @@ impl Memoire {
         task_succeeded: bool,
     ) -> Result<bool> {
         // Embed the agent output so the cosine path can fire on paraphrase
-        let output_embedding = self
-            .embedder
-            .embed_one(agent_output)
-            .ok();
+        let output_embedding = self.embedder.embed_one(agent_output).ok();
         self.store.reinforce_if_used(
             memory_id,
             agent_output,
