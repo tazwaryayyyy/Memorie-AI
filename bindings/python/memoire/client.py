@@ -18,15 +18,21 @@ class MemoireError(Exception):
 
 @dataclass
 class Memory:
-    """A stored memory chunk with its similarity score."""
+    """A stored memory chunk with its similarity score and trust level."""
     id: int
     content: str
     score: float
+    trust: float
+    state: str
     created_at: int
 
     def __repr__(self) -> str:
-        preview = self.content[:60] + "…" if len(self.content) > 60 else self.content
-        return f"Memory(id={self.id}, score={self.score:.4f}, content={preview!r})"
+        preview = self.content[:60] + \
+            "…" if len(self.content) > 60 else self.content
+        return (
+            f"Memory(id={self.id}, score={self.score:.3f}, "
+            f"trust={self.trust:.3f}, state={self.state!r}, content={preview!r})"
+        )
 
 
 # ─── Library loader ───────────────────────────────────────────────────────────
@@ -50,7 +56,8 @@ def _find_lib() -> str:
 
     # Walk up from this file to find the repo root and the Cargo output
     candidates = [
-        Path(__file__).parent.parent.parent.parent / "target" / "release" / lib_name,
+        Path(__file__).parent.parent.parent.parent /
+        "target" / "release" / lib_name,
         Path(lib_name),  # system path / LD_LIBRARY_PATH
     ]
     for p in candidates:
@@ -67,40 +74,45 @@ def _find_lib() -> str:
 def _load_lib() -> ctypes.CDLL:
     lib = ctypes.CDLL(_find_lib())
 
-    lib.memoire_new.argtypes      = [ctypes.c_char_p]
-    lib.memoire_new.restype       = ctypes.c_void_p
+    lib.memoire_new.argtypes = [ctypes.c_char_p]
+    lib.memoire_new.restype = ctypes.c_void_p
 
-    lib.memoire_free.argtypes     = [ctypes.c_void_p]
-    lib.memoire_free.restype      = None
+    lib.memoire_free.argtypes = [ctypes.c_void_p]
+    lib.memoire_free.restype = None
 
     lib.memoire_remember.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    lib.memoire_remember.restype  = ctypes.c_int
+    lib.memoire_remember.restype = ctypes.c_int
 
-    lib.memoire_recall.argtypes   = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
-    lib.memoire_recall.restype    = ctypes.c_char_p
+    lib.memoire_recall.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    lib.memoire_recall.restype = ctypes.c_char_p
 
-    lib.memoire_forget.argtypes   = [ctypes.c_void_p, ctypes.c_int64]
-    lib.memoire_forget.restype    = ctypes.c_int
+    lib.memoire_forget.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+    lib.memoire_forget.restype = ctypes.c_int
 
-    lib.memoire_count.argtypes    = [ctypes.c_void_p]
-    lib.memoire_count.restype     = ctypes.c_int64
+    lib.memoire_count.argtypes = [ctypes.c_void_p]
+    lib.memoire_count.restype = ctypes.c_int64
 
-    lib.memoire_clear.argtypes    = [ctypes.c_void_p]
-    lib.memoire_clear.restype     = ctypes.c_int
+    lib.memoire_clear.argtypes = [ctypes.c_void_p]
+    lib.memoire_clear.restype = ctypes.c_int
 
     lib.memoire_free_string.argtypes = [ctypes.c_char_p]
-    lib.memoire_free_string.restype  = None
+    lib.memoire_free_string.restype = None
+
+    lib.memoire_reinforce_if_used.argtypes = [
+        ctypes.c_void_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_int]
+    lib.memoire_reinforce_if_used.restype = ctypes.c_int
 
     return lib
 
 
-_lib: Optional[ctypes.CDLL] = None
+_lib_cache: list = []
+
 
 def _get_lib() -> ctypes.CDLL:
-    global _lib
-    if _lib is None:
-        _lib = _load_lib()
-    return _lib
+    if not _lib_cache:
+        _lib_cache.append(_load_lib())
+    return _lib_cache[0]
 
 
 # ─── Main class ───────────────────────────────────────────────────────────────
@@ -169,7 +181,8 @@ class Memoire:
         """
         self._check_open()
         if not isinstance(content, str):
-            raise TypeError(f"content must be str, got {type(content).__name__}")
+            raise TypeError(
+                f"content must be str, got {type(content).__name__}")
         n = self._lib.memoire_remember(self._handle, content.encode("utf-8"))
         if n < 0:
             raise MemoireError("remember() failed internally")
@@ -211,10 +224,39 @@ class Memoire:
                 id=item["id"],
                 content=item["content"],
                 score=item["score"],
+                trust=item.get("trust", 0.0),
+                state=item.get("state", "active"),
                 created_at=item["created_at"],
             )
             for item in data
         ]
+
+    def reinforce_if_used(
+        self,
+        memory_id: int,
+        agent_output: str,
+        task_succeeded: bool,
+    ) -> bool:
+        """
+        Conditionally reinforce a memory based on actual use.
+
+        Fires only when `task_succeeded` is True AND the token overlap
+        between the memory content and `agent_output` exceeds 15%.
+
+        Returns:
+            True if reinforcement was applied.
+        """
+        self._check_open()
+        r = self._lib.memoire_reinforce_if_used(
+            self._handle,
+            ctypes.c_int64(memory_id),
+            agent_output.encode("utf-8"),
+            ctypes.c_int(1 if task_succeeded else 0),
+        )
+        if r < 0:
+            raise MemoireError(
+                f"reinforce_if_used({memory_id}) failed internally")
+        return r == 1
 
     def forget(self, memory_id: int) -> bool:
         """
@@ -279,3 +321,107 @@ class Memoire:
     def _check_open(self) -> None:
         if self._handle is None:
             raise MemoireError("This Memoire instance has been closed.")
+
+
+# ─── Agent Decision Policy ────────────────────────────────────────────────────
+
+@dataclass
+class PolicyDecision:
+    """The policy verdict for a single recalled memory."""
+    memory: Memory
+    action: str   # "follow" | "hint" | "ignore"
+    reason: str
+    # ready-to-inject string, or None when ignored
+    prompt_injection: Optional[str]
+
+
+class MemoryPolicy:
+    """
+    Thin agent-side policy layer that turns trust scores into actionable decisions.
+
+    Args:
+        strict: When True, raises the bar for FOLLOW and HINT actions.
+                Use for security-critical or high-consequence tasks.
+
+    Thresholds:
+        strict=False (default): FOLLOW >= 0.70, HINT >= 0.40
+        strict=True:            FOLLOW >= 0.80, HINT >= 0.50
+
+    Usage::
+
+        policy = MemoryPolicy()                  # default
+        policy = MemoryPolicy(strict=True)       # security tasks
+
+        decisions = policy.evaluate(memories)
+        for d in decisions:
+            if d.action == "follow":
+                system_prompt += d.prompt_injection
+            elif d.action == "hint":
+                system_prompt += d.prompt_injection
+    """
+
+    def __init__(self, strict: bool = False) -> None:
+        self.strict = strict
+        if strict:
+            self.FOLLOW_THRESHOLD: float = 0.80
+            self.HINT_THRESHOLD: float = 0.50
+        else:
+            self.FOLLOW_THRESHOLD = 0.70
+            self.HINT_THRESHOLD = 0.40
+
+    def evaluate(self, memories: List[Memory]) -> List[PolicyDecision]:
+        """
+        Evaluate a list of recalled memories and return policy decisions.
+
+        Args:
+            memories: List of Memory objects from Memoire.recall().
+
+        Returns:
+            List of PolicyDecision, one per memory, in the same order.
+        """
+        decisions = []
+        for mem in memories:
+            action, reason, injection = self._decide(mem)
+            decisions.append(PolicyDecision(
+                memory=mem,
+                action=action,
+                reason=reason,
+                prompt_injection=injection,
+            ))
+        return decisions
+
+    def _decide(self, mem: Memory) -> tuple:
+        trust = mem.trust
+        state = mem.state
+
+        if trust >= self.FOLLOW_THRESHOLD:
+            reason = f"trust={trust:.2f} {state} reinforced"
+            injection = f"[MEMORY - HIGH TRUST]: {mem.content}"
+            return "follow", reason, injection
+
+        if trust >= self.HINT_THRESHOLD:
+            reason = f"trust={trust:.2f} {state} low-confidence"
+            injection = f"[MEMORY - HINT ONLY, verify before acting]: {mem.content}"
+            return "hint", reason, injection
+
+        # Below hint threshold — classify why
+        if state == "shadow":
+            reason = f"trust={trust:.2f} shadow unreinforced"
+        elif trust < 0.20:
+            reason = f"trust={trust:.2f} very low trust"
+        else:
+            reason = f"trust={trust:.2f} below hint threshold"
+
+        return "ignore", reason, None
+
+    def inject_context(self, decisions: List[PolicyDecision]) -> str:
+        """
+        Build a ready-to-prepend context block from all follow/hint decisions.
+
+        Returns an empty string if no memories pass the threshold.
+        """
+        lines = []
+        for d in decisions:
+            if d.prompt_injection is not None:
+                lines.append(d.prompt_injection)
+        return "\n".join(lines)

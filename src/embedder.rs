@@ -25,7 +25,7 @@ impl Embedder {
             .model
             .lock()
             .map_err(|_| anyhow::anyhow!("embedder mutex poisoned"))?;
-        Ok(model.embed(texts, None)?)
+        model.embed(texts, None)
     }
 
     pub fn embed_one(&self, text: &str) -> Result<Vec<f32>> {

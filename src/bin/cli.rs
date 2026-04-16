@@ -121,7 +121,7 @@ fn parse_args() -> Result<Args, String> {
                 stdin
                     .lock()
                     .lines()
-                    .filter_map(|l| l.ok())
+                    .map_while(|l| l.ok())
                     .collect::<Vec<_>>()
                     .join("\n")
             } else {

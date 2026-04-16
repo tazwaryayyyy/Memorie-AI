@@ -39,8 +39,12 @@ pub extern "C" fn memoire_new(db_path: *const c_char) -> *mut MemoireHandle {
 }
 
 /// Destroy a Memoire handle. Safe to call on NULL.
+///
+/// # Safety
+/// `handle` must be either NULL or a pointer previously returned by
+/// `memoire_new` that has not already been freed.
 #[no_mangle]
-pub extern "C" fn memoire_free(handle: *mut MemoireHandle) {
+pub unsafe extern "C" fn memoire_free(handle: *mut MemoireHandle) {
     if !handle.is_null() {
         unsafe { drop(Box::from_raw(handle)) }
     }
@@ -105,6 +109,35 @@ pub extern "C" fn memoire_recall(
     }
 }
 
+/// Conditionally reinforce a memory based on whether the agent actually used it.
+///
+/// `task_succeeded`: non-zero = succeeded.
+/// Returns 1=reinforced, 0=not reinforced, -1=error.
+#[no_mangle]
+pub extern "C" fn memoire_reinforce_if_used(
+    handle: *mut MemoireHandle,
+    memory_id: c_longlong,
+    agent_output: *const c_char,
+    task_succeeded: c_int,
+) -> c_int {
+    let m = match mut_ref(handle) {
+        Some(h) => h,
+        None => return -1,
+    };
+    let output = match to_str(agent_output) {
+        Some(s) => s,
+        None => return -1,
+    };
+    match m.reinforce_if_used(memory_id, output, task_succeeded != 0) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            log::error!("memoire_reinforce_if_used: {e}");
+            -1
+        }
+    }
+}
+
 /// Delete memory by id. Returns 1=deleted, 0=not found, -1=error.
 #[no_mangle]
 pub extern "C" fn memoire_forget(handle: *mut MemoireHandle, id: c_longlong) -> c_int {
@@ -143,8 +176,12 @@ pub extern "C" fn memoire_clear(handle: *mut MemoireHandle) -> c_int {
 }
 
 /// Free a string returned by `memoire_recall`. Safe to call on NULL.
+///
+/// # Safety
+/// `s` must be either NULL or a pointer previously returned by
+/// `memoire_recall` that has not already been freed.
 #[no_mangle]
-pub extern "C" fn memoire_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn memoire_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe { drop(CString::from_raw(s)) }
     }

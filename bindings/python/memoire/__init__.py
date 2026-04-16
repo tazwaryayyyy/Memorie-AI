@@ -17,7 +17,7 @@ Usage:
             print(f"[{r.score:.3f}] {r.content}")
 """
 
-from .client import Memoire, Memory, MemoireError
+from .client import Memoire, Memory, MemoireError, MemoryPolicy, PolicyDecision
 
 __all__ = ["Memoire", "Memory", "MemoireError"]
 __version__ = "0.1.0"
