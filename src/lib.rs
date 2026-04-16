@@ -132,7 +132,8 @@ impl Memoire {
             }
             let max_sim = self.store.max_similarity(embedding)?;
             let novelty = (1.0 - max_sim).clamp(0.0, 1.0);
-            let (meta, decision) = build_quality_meta(chunk, novelty, source_kind, &self.scoring_weights);
+            let (meta, decision) =
+                build_quality_meta(chunk, novelty, source_kind, &self.scoring_weights);
 
             match decision {
                 IngestDecision::Reject => continue,
@@ -203,7 +204,8 @@ impl Memoire {
             .embedder
             .embed_one(query)
             .map_err(MemoireError::Embedding)?;
-        self.store.search_within_days(&query_vec, top_k, max_age_days)
+        self.store
+            .search_within_days(&query_vec, top_k, max_age_days)
     }
 
     /// Reinforce a memory only when it was actually used by the agent.

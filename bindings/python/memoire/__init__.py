@@ -19,5 +19,13 @@ Usage:
 
 from .client import Memoire, Memory, MemoireError, MemoryPolicy, PolicyDecision
 
-__all__ = ["Memoire", "Memory", "MemoireError"]
+__all__ = [
+    "Memoire",
+    "Memory",
+    "MemoireError",
+    "MemoryPolicy",
+    "PolicyDecision",
+    # Framework adapters (opt-in — requires langchain or llama-index-core)
+    # from memoire.adapters import MemoireRetriever, MemoireIndex
+]
 __version__ = "0.1.0"

@@ -102,6 +102,31 @@ If you're building agents that make the same mistakes across sessions, or that c
 5. **Decide** — score ≥ 0.50 → Active; else → Shadow (retrieved as backfill, penalized); duplicate claim with conflicting value → contradiction resolution
 6. **Resolve** — if a claim key already exists with a different value, the lower-quality memory is archived
 
+### Memory Lifecycle
+
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> Shadow : score < 0.50\n(low quality at ingestion)
+    [*] --> Active : score ≥ 0.50\n(quality gate passed)
+
+    Shadow --> Active : reinforce_if_used()\ntask_succeeded=true
+    Shadow --> Archived : penalize_if_used()\nor maintenance_pass()
+
+    Active --> Active : reinforce_if_used()\ntrust ↑  rc ↑  EMA updates
+    Active --> Archived : contradiction resolved\n(lower effective_weight loses)
+    Active --> Shadow : penalize_if_used()\nrepeated failures
+
+    Archived --> [*] : pruned after 7 days
+
+    note right of Active
+        trust ≥ 0.75 → FOLLOW
+        trust ≥ 0.45 → HINT
+        trust < 0.45 → IGNORE
+    end note
+```
+
 ### What happens at recall
 
 1. **Embed** query
@@ -129,6 +154,20 @@ state_weight: active=1.0, shadow=0.6, other=0.0
 ```
 
 A brand-new memory (rc=0) can reach trust ≈ 0.41–0.48 at best. FOLLOW threshold is 0.75. The EMA prevents sharp trust swings when a memory oscillates between reinforce and penalize cycles.
+
+### Trust Curve: from HINT to FOLLOW
+
+How a single high-quality corrective memory climbs from its starting trust toward the FOLLOW threshold across three successful task uses (EMA-smoothed, confidence=0.62, importance=0.71, age≈0):
+
+```mermaid
+xychart-beta
+    title "Trust Score vs. Reinforcement Count (EMA-smoothed)"
+    x-axis ["rc=0\n(stored)", "rc=1\n(+1 task)", "rc=2\n(+2 tasks)", "rc=3\n(+3 tasks)", "rc=6\n(+6 tasks)", "rc=9\n(+9 tasks)"]
+    y-axis "Trust Score" 0.0 --> 1.0
+    line [0.41, 0.56, 0.64, 0.69, 0.75, 0.79]
+```
+
+> **Reading the curve:** `rc=0` is the ingestion baseline (Quality only). Each `reinforce_if_used()` call adds Experience. The EMA flattens the curve — a single outlier success or failure cannot spike trust. By `rc=3` the memory crosses the FOLLOW threshold (0.75) for the first time.
 
 ### Uncertainty
 
@@ -445,6 +484,77 @@ Memory quality thresholds and scoring weights are intentionally not exposed as c
 
 ---
 
+## Ecosystem Integrations
+
+### MCP (Claude Desktop / any MCP-compatible host)
+
+The bundled MCP server exposes two trust-aware tools — `save_lesson` and `get_lessons` — plus four low-level passthrough tools.
+
+```bash
+pip install mcp
+python examples/mcp_server.py
+```
+
+Add to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "memoire": {
+      "command": "python",
+      "args": ["examples/mcp_server.py"]
+    }
+  }
+}
+```
+
+| Tool | Purpose |
+|---|---|
+| `save_lesson` | Store a lesson; trust starts low and grows with use |
+| `get_lessons` | Recall top-k, apply `MemoryPolicy`, return FOLLOW/HINT context |
+| `memoire_remember` | Low-level: raw store with no policy |
+| `memoire_recall` | Low-level: raw recall with no policy |
+| `memoire_forget` | Delete by id |
+| `memoire_status` | DB stats |
+
+### LangChain
+
+```python
+from memoire.adapters import MemoireRetriever
+
+retriever = MemoireRetriever(db_path="agent.db", top_k=5)
+
+# Use anywhere LangChain expects a retriever
+from langchain.chains import RetrievalQA
+from langchain_openai import ChatOpenAI
+
+qa = RetrievalQA.from_chain_type(llm=ChatOpenAI(), retriever=retriever)
+answer = qa.invoke({"query": "how do we handle billing precision?"})
+```
+
+`MemoryPolicy` is applied internally — only FOLLOW/HINT memories reach the chain. IGNORE-ranked memories are filtered before the LLM sees them.
+
+Install: `pip install langchain langchain-core`
+
+### LlamaIndex
+
+```python
+from memoire.adapters import MemoireIndex
+
+index = MemoireIndex(db_path="agent.db")
+
+# As a query engine
+engine = index.as_query_engine()
+response = engine.query("what patterns caused billing regressions?")
+
+# As a bare retriever inside a pipeline
+nodes = index.as_retriever(top_k=5).retrieve("billing precision bug")
+```
+
+Install: `pip install llama-index-core`
+
+---
+
 ## Roadmap
 
 This is a research agenda, not a feature checklist. Each item is a thesis:
@@ -711,9 +821,11 @@ RUST_LOG=debug cargo test -- --nocapture
 | Version | Feature |
 |---|---|
 | v0.1 | Core API, SQLite, MiniLM, C FFI ✅ |
-| v0.2 | Metadata tagging (`project`, `session_id`), filtered recall |
-| v0.2 | HNSW index via `usearch` for large corpora |
-| v0.3 | MCP (Model Context Protocol) server mode |
+| v0.2 | Trust scoring, MemoryPolicy, MQCL feedback loop ✅ |
+| v0.2 | MCP server — `save_lesson` / `get_lessons` tools ✅ |
+| v0.2 | LangChain + LlamaIndex zero-config adapters ✅ |
+| v0.3 | Metadata tagging (`project`, `session_id`), filtered recall |
+| v0.3 | HNSW index via `usearch` for large corpora |
 | v0.3 | Node.js (`ffi-napi`) and Go (`cgo`) binding packages |
 | v1.0 | `wasm32-wasi` target, `no_std` compatibility |
 

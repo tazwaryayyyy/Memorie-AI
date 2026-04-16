@@ -9,11 +9,27 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **MCP server** (`examples/mcp_server.py`) — trust-aware `save_lesson` and `get_lessons` tools,
+  plus low-level passthrough tools (`memoire_remember`, `memoire_recall`, `memoire_forget`,
+  `memoire_status`). Requires `pip install mcp`.
+- **Framework adapters** (`bindings/python/memoire/adapters.py`)
+  - `MemoireRetriever` — LangChain `BaseRetriever`-compatible; policy-filtered, works with
+    LCEL pipes and `RetrievalQA`. Requires `pip install langchain langchain-core`.
+  - `MemoireIndex` — LlamaIndex-compatible index with `as_retriever()` and `as_query_engine()`.
+    Requires `pip install llama-index-core`.
+  - Both adapters apply `MemoryPolicy` internally — IGNORE-ranked memories never reach the LLM.
+- **`EmbedProvider` trait** (`src/embedder.rs`) — pluggable embedding backend; swap out
+  `fastembed` without changing call sites.
+- **`new_with_embedder`** / **`with_scoring_weights`** builder methods on `Memoire`.
+- **`recall_within_days`** — time-bounded recall (stale ≠ wrong; no trust penalty applied).
+- **`ScoringWeights`** struct — scoring constants surfaced for testing and custom calibration;
+  default weights are frozen for reproducibility.
+
 ### Planned
 - Metadata tagging (`project`, `session_id`, `language`) on stored memories
 - Filtered recall: `recall_where(query, project="my-api")`
 - HNSW approximate nearest-neighbour index via `usearch` for 100k+ memory stores
-- MCP (Model Context Protocol) server mode — `examples/mcp_server.py` prototype already included
 - Node.js native addon via `napi-rs` (faster than ffi-napi)
 - `wasm32-wasi` target for browser/edge deployment
 
