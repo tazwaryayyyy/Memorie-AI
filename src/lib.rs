@@ -151,6 +151,19 @@ impl Memoire {
         )
     }
 
+    /// Penalize memories that contributed to a failed task outcome.
+    ///
+    /// `failure_severity` ∈ [0.0, 1.0] — scales how harshly the memories are
+    /// penalized. Use 1.0 for a direct failure, 0.5 for a partial miss.
+    /// Symmetric with `reinforce_if_used`. Returns the trust delta per memory.
+    pub fn penalize_if_used(
+        &self,
+        memory_ids: &[i64],
+        failure_severity: f32,
+    ) -> Result<Vec<store::PenaltyOutcome>> {
+        self.store.penalize_if_used(memory_ids, failure_severity)
+    }
+
     /// Delete a memory by id. Returns true if it existed.
     pub fn forget(&self, id: i64) -> Result<bool> {
         self.store.forget(id)

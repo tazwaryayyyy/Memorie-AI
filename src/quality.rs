@@ -87,6 +87,8 @@ pub fn fingerprint(text: &str) -> String {
     format!("{:x}", hasher.finish())
 }
 
+// SCORING FROZEN — weights and thresholds are fixed for reproducibility.
+// Do not adjust without forking the quality module.
 pub fn score_importance(features: &QualityFeatures) -> f32 {
     (0.30 * features.actionability
         + 0.25 * features.consequence
@@ -232,6 +234,7 @@ pub fn extract_features(content: &str, novelty: f32) -> QualityFeatures {
 ///   - rc=0 (brand new): reinforcement_term=0, trust comes from confidence/age/importance only
 ///   - shadow state: all terms multiplied by 0.6 — low trust backfill
 ///   - rejected/superseded: state_weight=0.0, returns 0.0 immediately
+// SCORING FROZEN — trust formula is immutable after calibration.
 pub fn compute_trust(
     reinforcement_count: i64,
     contradiction_survived: bool,

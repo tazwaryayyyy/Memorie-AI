@@ -12,8 +12,23 @@ pub struct Memory {
     pub content: String,
     pub score: f32,
     pub trust: f32,
+    /// Uncertainty ∈ [0, 1]: high when little reinforcement or when the memory
+    /// has been both reinforced and penalized (oscillation). Agents may use this
+    /// to modulate how strongly they act on a recall result.
+    pub uncertainty: f32,
     pub state: String,
     pub created_at: i64,
+}
+
+/// Trust and uncertainty delta produced by a single call to `penalize_if_used`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PenaltyOutcome {
+    pub id: i64,
+    pub trust_before: f32,
+    pub trust_after: f32,
+    /// Uncertainty of this memory after the penalty, ∈ [0, 1].
+    /// Increases as failure_count rises relative to reinforcement_count.
+    pub uncertainty_after: f32,
 }
 
 pub struct Store {
@@ -43,7 +58,9 @@ const SCHEMA: &str = "
         effective_weight REAL NOT NULL DEFAULT 1.0,
         fingerprint TEXT NOT NULL DEFAULT '',
         claim_key TEXT,
-        claim_value TEXT
+        claim_value TEXT,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        trust_ema     REAL
     );
     CREATE INDEX IF NOT EXISTS idx_memories_created_at
         ON memories (created_at DESC);
@@ -108,8 +125,11 @@ impl Store {
     ///   cosine(memory_embedding, output_embedding) >= 0.75
     /// )
     ///
-    /// The cosine path handles semantic paraphrase: "use fixed-point arithmetic"
-    /// vs "use Decimal for money" — different words, same lesson.
+    /// Recovery acceleration: if the memory was previously penalized
+    /// (`failure_count > 0`), confidence is boosted by 10% (capped at 1.0)
+    /// to allow correct memories to bounce back faster than fresh ones.
+    ///
+    /// Trust EMA is updated each time to smooth out oscillation.
     pub fn reinforce_if_used(
         &self,
         memory_id: i64,
@@ -121,11 +141,41 @@ impl Store {
             return Ok(false);
         }
 
-        let (content, mem_blob): (String, Vec<u8>) = match self.conn.query_row(
-            "SELECT content, embedding FROM memories WHERE id = ?1",
+        let row = self.conn.query_row(
+            "SELECT content, embedding,
+                    reinforcement_count, confidence, importance_base,
+                    created_at, store_state, contradiction_group,
+                    failure_count, trust_ema
+             FROM memories WHERE id = ?1",
             params![memory_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ) {
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, f32>(3)?,
+                    r.get::<_, f32>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, Option<f32>>(9)?,
+                ))
+            },
+        );
+
+        let (
+            content,
+            mem_blob,
+            rc,
+            conf,
+            imp,
+            created_at,
+            store_state,
+            cg,
+            failure_count,
+            trust_ema_stored,
+        ) = match row {
             Ok(v) => v,
             Err(_) => return Ok(false),
         };
@@ -148,17 +198,153 @@ impl Store {
         };
 
         if jaccard_ok || cosine_ok {
+            let new_rc = rc + 1;
+            // Recovery acceleration: a previously penalized memory earns confidence
+            // back faster than one that has never been wrong.
+            let new_conf = if failure_count > 0 {
+                (conf * 1.1_f32).clamp(0.0, 1.0)
+            } else {
+                conf
+            };
+            let now: i64 =
+                self.conn
+                    .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                        r.get(0)
+                    })?;
+            let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
+            let contradiction_survived = cg.is_some() && store_state == "active";
+            let trust_after = compute_trust(
+                new_rc,
+                contradiction_survived,
+                &store_state,
+                imp,
+                new_conf,
+                age_days,
+            );
+            let new_ema = match trust_ema_stored {
+                Some(ema) => (0.7 * ema + 0.3 * trust_after).clamp(0.0, 1.0),
+                None => trust_after,
+            };
             self.conn.execute(
                 "UPDATE memories
-                 SET reinforcement_count = reinforcement_count + 1,
+                 SET reinforcement_count = ?1,
+                     confidence = ?2,
+                     trust_ema = ?3,
                      last_accessed_at = CAST(strftime('%s', 'now') AS INTEGER)
-                 WHERE id = ?1",
-                params![memory_id],
+                 WHERE id = ?4",
+                params![new_rc, new_conf, new_ema, memory_id],
             )?;
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    /// Penalize memories that contributed to a failed task outcome.
+    ///
+    /// `failure_severity` ∈ [0.0, 1.0] scales the penalty proportionally:
+    /// - 0.0 → no-op (trivial miss, no signal)
+    /// - 0.5 → moderate: wrong direction but partially useful
+    /// - 1.0 → full: bad guidance led directly to failure
+    ///
+    /// For each memory id:
+    /// - `confidence      *= 1.0 - 0.2 × severity`
+    /// - `importance_base *= 1.0 - 0.1 × severity`
+    /// - `reinforcement_count` decremented by 1 when severity > 0 (floor 0)
+    /// - `failure_count` incremented — used for uncertainty and recovery tracking
+    /// - `trust_ema` updated via EMA: `0.7 × old + 0.3 × new`
+    ///
+    /// Trust degrades organically through `compute_trust()` — no penalty flags.
+    /// Returns the trust and uncertainty delta per penalized memory.
+    pub fn penalize_if_used(
+        &self,
+        memory_ids: &[i64],
+        failure_severity: f32,
+    ) -> Result<Vec<PenaltyOutcome>> {
+        if memory_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let severity = failure_severity.clamp(0.0, 1.0);
+        let now: i64 =
+            self.conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
+        let mut outcomes = Vec::with_capacity(memory_ids.len());
+        for &id in memory_ids {
+            let row = self.conn.query_row(
+                "SELECT reinforcement_count, confidence, importance_base,
+                        created_at, store_state, contradiction_group,
+                        failure_count, trust_ema
+                 FROM memories WHERE id = ?1 AND archived = 0",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, f32>(1)?,
+                        r.get::<_, f32>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, i64>(6)?,
+                        r.get::<_, Option<f32>>(7)?,
+                    ))
+                },
+            );
+            let (rc, conf, imp, created_at, state, cg, failure_count, trust_ema_stored) = match row
+            {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
+            let contradiction_survived = cg.is_some() && state == "active";
+            let trust_before =
+                compute_trust(rc, contradiction_survived, &state, imp, conf, age_days);
+
+            let new_rc = (rc - if severity > 0.0 { 1 } else { 0 }).max(0);
+            let new_conf = (conf * (1.0 - 0.2 * severity)).clamp(0.0, 1.0);
+            let new_imp = (imp * (1.0 - 0.1 * severity)).clamp(0.0, 1.0);
+            let new_fc = failure_count + 1;
+
+            let trust_after = compute_trust(
+                new_rc,
+                contradiction_survived,
+                &state,
+                new_imp,
+                new_conf,
+                age_days,
+            );
+            let new_ema = match trust_ema_stored {
+                Some(ema) => (0.7 * ema + 0.3 * trust_after).clamp(0.0, 1.0),
+                None => trust_after,
+            };
+
+            // Uncertainty: rises with more failures relative to reinforcements.
+            // High oscillation (many both reinforce + penalize) → higher uncertainty.
+            let rc_f = new_rc as f32;
+            let fc_f = new_fc as f32;
+            let uncertainty_after =
+                (0.5 / (1.0 + rc_f) + 0.5 * fc_f / (fc_f + rc_f + 1.0)).clamp(0.0, 1.0);
+
+            self.conn.execute(
+                "UPDATE memories
+                 SET reinforcement_count = ?1,
+                     confidence = ?2,
+                     importance_base = ?3,
+                     failure_count = ?4,
+                     trust_ema = ?5
+                 WHERE id = ?6",
+                params![new_rc, new_conf, new_imp, new_fc, new_ema, id],
+            )?;
+
+            outcomes.push(PenaltyOutcome {
+                id,
+                trust_before,
+                trust_after,
+                uncertainty_after,
+            });
+        }
+        Ok(outcomes)
     }
 
     pub fn insert_with_quality(
@@ -255,7 +441,8 @@ impl Store {
             "SELECT
                 id, content, embedding, created_at,
                 importance_base, reinforcement_count, confidence,
-                store_state, contradiction_group
+                store_state, contradiction_group,
+                failure_count, trust_ema
              FROM memories
              WHERE archived = 0
                AND superseded_by IS NULL
@@ -282,6 +469,8 @@ impl Store {
                     row.get::<_, f32>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<f32>>(10)?,
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -296,6 +485,8 @@ impl Store {
                     confidence,
                     store_state,
                     contradiction_group,
+                    failure_count,
+                    trust_ema_stored,
                 )| {
                     let embedding = blob_to_vec(&blob)?;
                     let sim = cosine_similarity(query_vec, &embedding);
@@ -319,7 +510,18 @@ impl Store {
                     // trust_final = trust_base * (0.6 + 0.4 * similarity)
                     // Range: trust_base*0.6 (orthogonal query) → trust_base (perfect match)
                     let sim_clamped = sim.clamp(0.0, 1.0);
-                    let trust = (trust_base * (0.6 + 0.4 * sim_clamped)).clamp(0.0, 1.0);
+                    let trust_computed = (trust_base * (0.6 + 0.4 * sim_clamped)).clamp(0.0, 1.0);
+                    // EMA smoothing: damps sharp trust swings when the same
+                    // memory oscillates between reinforce and penalize cycles.
+                    let trust = match trust_ema_stored {
+                        Some(ema) => (0.7 * ema + 0.3 * trust_computed).clamp(0.0, 1.0),
+                        None => trust_computed,
+                    };
+                    // Uncertainty: low reinforcement or high oscillation → less certain.
+                    let rc_f = reinforcement_count as f32;
+                    let fc_f = failure_count as f32;
+                    let uncertainty =
+                        (0.5 / (1.0 + rc_f) + 0.5 * fc_f / (fc_f + rc_f + 1.0)).clamp(0.0, 1.0);
                     Some((
                         final_score,
                         trust,
@@ -329,6 +531,7 @@ impl Store {
                             content,
                             score: final_score,
                             trust,
+                            uncertainty,
                             state: store_state,
                             created_at,
                         },
@@ -492,7 +695,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, content, created_at,
                     importance_base, reinforcement_count, confidence,
-                    store_state, contradiction_group
+                    store_state, contradiction_group,
+                    failure_count, trust_ema
              FROM memories ORDER BY created_at DESC",
         )?;
 
@@ -507,22 +711,47 @@ impl Store {
                     row.get::<_, f32>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<f32>>(9)?,
                 ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(id, content, created_at, imp, rc, conf, state, cg)| {
-                let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
-                let contradiction_survived = cg.is_some() && state == "active";
-                let trust = compute_trust(rc, contradiction_survived, &state, imp, conf, age_days);
-                Memory {
+            .map(
+                |(
                     id,
                     content,
-                    score: 1.0,
-                    trust,
-                    state,
                     created_at,
-                }
-            })
+                    imp,
+                    rc,
+                    conf,
+                    state,
+                    cg,
+                    failure_count,
+                    trust_ema_stored,
+                )| {
+                    let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
+                    let contradiction_survived = cg.is_some() && state == "active";
+                    let trust_computed =
+                        compute_trust(rc, contradiction_survived, &state, imp, conf, age_days);
+                    let trust = match trust_ema_stored {
+                        Some(ema) => (0.7 * ema + 0.3 * trust_computed).clamp(0.0, 1.0),
+                        None => trust_computed,
+                    };
+                    let rc_f = rc as f32;
+                    let fc_f = failure_count as f32;
+                    let uncertainty =
+                        (0.5 / (1.0 + rc_f) + 0.5 * fc_f / (fc_f + rc_f + 1.0)).clamp(0.0, 1.0);
+                    Memory {
+                        id,
+                        content,
+                        score: 1.0,
+                        trust,
+                        uncertainty,
+                        state,
+                        created_at,
+                    }
+                },
+            )
             .collect();
         Ok(rows)
     }
@@ -616,6 +845,12 @@ impl Store {
         if !has("claim_value") {
             alter.push("ALTER TABLE memories ADD COLUMN claim_value TEXT;");
         }
+        if !has("failure_count") {
+            alter.push("ALTER TABLE memories ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0;");
+        }
+        if !has("trust_ema") {
+            alter.push("ALTER TABLE memories ADD COLUMN trust_ema REAL;");
+        }
 
         for sql in alter {
             conn.execute_batch(sql)?;
@@ -698,5 +933,129 @@ mod tests {
         assert_eq!(store.count().unwrap(), 2);
         store.clear().unwrap();
         assert_eq!(store.count().unwrap(), 0);
+    }
+
+    // ─── Failure-feedback / penalize_if_used tests ────────────────────────────
+
+    #[test]
+    fn test_penalty_reduces_trust() {
+        let store = Store::in_memory().unwrap();
+        let mut meta = QualityMeta::default_active("fixed billing replaced float production");
+        meta.importance_base = 0.8;
+        meta.confidence = 0.8;
+        meta.reinforcement_count = 3;
+        let id = store
+            .insert_with_quality(
+                "fixed billing replaced float production",
+                &[1.0, 0.0, 0.0],
+                &meta,
+            )
+            .unwrap();
+        let outcomes = store.penalize_if_used(&[id], 1.0).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].trust_after < outcomes[0].trust_before,
+            "trust must decrease after penalty: before={:.4} after={:.4}",
+            outcomes[0].trust_before,
+            outcomes[0].trust_after,
+        );
+    }
+
+    #[test]
+    fn test_repeated_penalty_drops_below_hint_threshold() {
+        // HINT threshold in default MemoryPolicy is 0.40
+        let store = Store::in_memory().unwrap();
+        let mut meta = QualityMeta::default_active("always use float for money calculations");
+        meta.importance_base = 0.7;
+        meta.confidence = 0.7;
+        meta.reinforcement_count = 2;
+        let id = store
+            .insert_with_quality(
+                "always use float for money calculations",
+                &[1.0, 0.0, 0.0],
+                &meta,
+            )
+            .unwrap();
+        for _ in 0..5 {
+            store.penalize_if_used(&[id], 1.0).unwrap();
+        }
+        let all = store.all().unwrap();
+        let mem = all.iter().find(|m| m.id == id).expect("memory must exist");
+        assert!(
+            mem.trust < 0.40,
+            "trust {:.4} should drop below HINT threshold (0.40) after 5 failures",
+            mem.trust,
+        );
+    }
+
+    #[test]
+    fn test_recovery_after_penalty() {
+        let store = Store::in_memory().unwrap();
+        let mut meta = QualityMeta::default_active("decimal money correct precision");
+        meta.importance_base = 0.8;
+        meta.confidence = 0.8;
+        meta.reinforcement_count = 2;
+        let id = store
+            .insert_with_quality("decimal money correct precision", &[1.0, 0.0, 0.0], &meta)
+            .unwrap();
+        store.penalize_if_used(&[id], 1.0).unwrap();
+        store.penalize_if_used(&[id], 1.0).unwrap();
+        let trust_penalized = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .trust;
+        // Reinforce via Jaccard token overlap (>= 0.15)
+        store
+            .reinforce_if_used(id, "decimal money correct precision usage", true, None)
+            .unwrap();
+        let trust_recovered = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .trust;
+        assert!(
+            trust_recovered > trust_penalized,
+            "trust must recover after reinforcement: penalized={:.4} recovered={:.4}",
+            trust_penalized,
+            trust_recovered,
+        );
+    }
+
+    #[test]
+    fn test_ranking_improves_after_penalizing_bad_memory() {
+        let store = Store::in_memory().unwrap();
+        // Same embedding so cosine sim is equal — ranking separates via effective_weight
+        let mut bad_meta = QualityMeta::default_active("float is fine for money");
+        bad_meta.importance_base = 0.7;
+        bad_meta.confidence = 0.7;
+        bad_meta.reinforcement_count = 3;
+        let bad_id = store
+            .insert_with_quality("float is fine for money", &[1.0, 0.0, 0.0], &bad_meta)
+            .unwrap();
+
+        let mut good_meta = QualityMeta::default_active("decimal is correct for money");
+        good_meta.importance_base = 0.7;
+        good_meta.confidence = 0.7;
+        good_meta.reinforcement_count = 3;
+        store
+            .insert_with_quality("decimal is correct for money", &[1.0, 0.0, 0.0], &good_meta)
+            .unwrap();
+
+        // Apply 3 failures to the bad memory — rc: 3→2→1→0, conf/imp decay each round
+        for _ in 0..3 {
+            store.penalize_if_used(&[bad_id], 1.0).unwrap();
+        }
+
+        let results = store.search(&[1.0, 0.0, 0.0], 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].content, "decimal is correct for money",
+            "good memory must outrank penalized bad memory after 3 failures"
+        );
     }
 }

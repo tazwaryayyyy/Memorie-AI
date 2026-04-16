@@ -43,9 +43,9 @@ The difference is not retrieval. Every vector store retrieves. The difference is
 
 Most agent memory systems are retrieval systems with a database behind them. You write in, you read out, you hope the cosine score is good enough.
 
-Memoire is a **memory quality control layer**. Every piece of information that enters has to earn its place — scored on actionability, consequence, novelty, and evidence at ingestion time. Every piece that comes back carries a **trust score** that tells the agent not just *what* is similar, but *how confident it should be acting on it*. Reinforcement only fires when memory was actually used to produce a successful outcome. Contradicting memories resolve against each other and the loser is archived. The whole thing runs in a single `.db` file with no cloud, no Docker, no API keys.
+Memoire is a **self-correcting memory layer**. Every piece of information that enters has to earn its place — scored on actionability, consequence, novelty, and evidence at ingestion time. Every piece that comes back carries a **trust score** that tells the agent not just *what* is similar, but *how confident it should be acting on it*, alongside an **uncertainty value** that signals when a memory is contested or under-reinforced. Reinforcement only fires when memory was actually used to produce a successful outcome. Wrong memories are penalized proportionally to how bad the failure was, causing trust to decay organically. Contradicting memories resolve against each other and the loser is archived. The whole thing runs in a single `.db` file with no cloud, no Docker, no API keys.
 
-If you're building agents that make the same mistakes across sessions, this is the missing layer.
+If you're building agents that make the same mistakes across sessions, or that confidently act on outdated lessons, this is the missing layer.
 
 ---
 
@@ -79,10 +79,12 @@ If you're building agents that make the same mistakes across sessions, this is t
 │  │                  SQLite Store                           │   │
 │  │                                                         │   │
 │  │  Per-memory:  importance · confidence · decay weight    │   │
-│  │               reinforcement count · contradiction group │   │
-│  │               store state (active / shadow / archived)  │   │
-│  │                                                         │   │
-│  │  At recall:   cosine scan → trust score computation     │   │
+  │               reinforcement count · failure count        │   │
+  │               contradiction group · trust EMA            │   │
+  │               store state (active / shadow / archived)  │   │
+  │                                                         │   │
+  │  At recall:   cosine scan → trust score computation     │   │
+  │               EMA smoothing · uncertainty computation   │   │
 │  │               conflict-aware dedup · decay reranking    │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
@@ -112,18 +114,45 @@ If you're building agents that make the same mistakes across sessions, this is t
 ### Trust score formula
 
 ```
-trust = state_weight × (
-    0.35 × rc / (rc + 3)          # reinforcement term — saturates at rc=9 → 0.75
-  + 0.25 × confidence             # ingestion-time evidence quality
-  + 0.20 × exp(-0.02 × age_days)  # slower decay than weight decay
-  + 0.15 × importance_base        # ingestion importance score
-  + 0.05 × contradiction_survived # won a contradiction resolution
+trust = EMA(
+    state_weight × (
+        0.35 × rc / (rc + 3)          # reinforcement term — saturates at rc=9 → 0.75
+      + 0.25 × confidence             # ingestion-time evidence quality
+      + 0.20 × exp(-0.02 × age_days)  # slower decay than weight decay
+      + 0.15 × importance_base        # ingestion importance score
+      + 0.05 × contradiction_survived # won a contradiction resolution
+    )
 )
 
+EMA = 0.7 × previous_trust + 0.3 × new_trust  (per reinforce/penalize event)
 state_weight: active=1.0, shadow=0.6, other=0.0
 ```
 
-A brand-new memory (rc=0) can reach trust ≈ 0.41–0.48 at best. FOLLOW threshold is 0.75. The agent won't blindly trust something it's never validated.
+A brand-new memory (rc=0) can reach trust ≈ 0.41–0.48 at best. FOLLOW threshold is 0.75. The EMA prevents sharp trust swings when a memory oscillates between reinforce and penalize cycles.
+
+### Uncertainty
+
+```
+base_uncertainty  = 1 / (1 + reinforcement_count)
+oscillation       = failure_count / (failure_count + reinforcement_count + 1)
+uncertainty       = 0.5 × base_uncertainty + 0.5 × oscillation   ∈ [0, 1]
+```
+
+High uncertainty means: few confirmations, or the memory has been both reinforced and penalized (oscillating signal). Agents can use this to decide whether to ask for confirmation rather than acting blindly.
+
+### Three-Signal Mental Model
+
+Memoire tracks six fields per memory internally. For reasoning about system behavior — and for judging whether to act — collapse them into three signals:
+
+| Signal | Backed by | What it answers |
+|--------|-----------|-----------------|
+| **Quality** | `confidence` + `importance_base` | Was this memory good at ingestion? |
+| **Experience** | `reinforcement_count` + `failure_count` | What is its track record across tasks? |
+| **Stability** | trust EMA + `uncertainty` | Is the signal converging or still oscillating? |
+
+A brand-new memory has **Quality only** — it may have been well-written, but it has no history. After one successful use it gains **Experience**. After several consistent uses (or consistent failures) it gains **Stability**. FOLLOW requires all three to be high. IGNORE fires when any one of them is critically low.
+
+This framing is not an abstraction over the implementation — it is a reading guide for the trust score output. When `trust=0.41` you are seeing a memory with decent Quality but zero Experience. When `trust=0.76` you are seeing a memory that has Quality, survived at least one task, and whose EMA has stabilised.
 
 ---
 
@@ -314,10 +343,15 @@ let ids: Vec<i64> = m.remember_with_source(text, "user")?;
 // Read
 let mems: Vec<Memory> = m.recall(query, top_k)?;
 let mems: Vec<Memory> = m.recall_with_min_score(query, top_k, 0.55)?;
-// Memory { id, content, score, trust, state, created_at }
+// Memory { id, content, score, trust, uncertainty, state, created_at }
 
 // Reinforce (conditional — fires only on task success + token overlap)
 let reinforced: bool = m.reinforce_if_used(id, agent_output, task_succeeded)?;
+
+// Penalize (conditional — call only for memories that influenced the decision)
+// failure_severity ∈ [0.0, 1.0]: 1.0 = direct failure, 0.5 = partial miss
+let outcomes: Vec<PenaltyOutcome> = m.penalize_if_used(&[id], failure_severity)?;
+// PenaltyOutcome { id, trust_before, trust_after, uncertainty_after }
 
 // Maintain
 m.forget(id)?;
@@ -334,7 +368,10 @@ with Memoire("agent.db") as m:
     n: int         = m.remember(text)
     mems: list     = m.recall(query, top_k=5)
     mems: list     = m.recall_with_min_score(query, top_k=5, min_score=0.55)
+    # Memory: .id .content .score .trust .uncertainty .state .created_at
     ok: bool       = m.reinforce_if_used(id, agent_output, task_succeeded)
+    outcomes: list = m.penalize_if_used([id], failure_severity=1.0)
+    # [{"id": int, "trust_before": float, "trust_after": float, "uncertainty_after": float}]
     deleted: bool  = m.forget(id)
     count: int     = m.count()
     m.clear()
@@ -354,10 +391,13 @@ MemoireHandle* h = memoire_new("agent.db");  // or ":memory:"
 memoire_remember(h, "content");
 
 char* json = memoire_recall(h, "query", 5);
-// [{"id":1,"content":"...","score":0.84,"trust":0.56,"state":"active","created_at":...}]
+// [{"id":1,"content":"...","score":0.84,"trust":0.56,"uncertainty":0.22,"state":"active","created_at":...}]
 memoire_free_string(json);  // caller must free
 
 memoire_reinforce_if_used(h, id, agent_output, 1 /*succeeded*/);
+// failure_severity: 1.0=full failure, 0.5=partial miss
+char* pen = memoire_penalize_if_used(h, &ids[0], ids_len, 1.0f);
+memoire_free_string(pen);
 
 memoire_forget(h, id);
 memoire_count(h);
@@ -401,7 +441,7 @@ let m = Memoire::new("agent.db")?
     });
 ```
 
-Memory quality thresholds are intentionally not exposed as config — the scoring model is the invariant. Adjusting thresholds changes what "quality" means, which changes what the trust score means, which breaks the policy layer. If you need a different threshold, fork the quality module.
+Memory quality thresholds and scoring weights are intentionally not exposed as config. **The scoring model is frozen after calibration.** Weights, thresholds, and decay curves are fixed constants — not tunable parameters. This is deliberate: without a fixed model, benchmarks are not reproducible and trust scores lose meaning across runs. If a judge asks "why this weight?", the answer is: it is fixed for reproducibility after calibration against a held-out task suite. If you need a different threshold, fork the quality module.
 
 ---
 

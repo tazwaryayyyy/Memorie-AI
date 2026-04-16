@@ -18,11 +18,12 @@ class MemoireError(Exception):
 
 @dataclass
 class Memory:
-    """A stored memory chunk with its similarity score and trust level."""
+    """A stored memory chunk with its similarity score, trust level, and uncertainty."""
     id: int
     content: str
     score: float
     trust: float
+    uncertainty: float
     state: str
     created_at: int
 
@@ -31,7 +32,8 @@ class Memory:
             "…" if len(self.content) > 60 else self.content
         return (
             f"Memory(id={self.id}, score={self.score:.3f}, "
-            f"trust={self.trust:.3f}, state={self.state!r}, content={preview!r})"
+            f"trust={self.trust:.3f}, uncertainty={self.uncertainty:.3f}, "
+            f"state={self.state!r}, content={preview!r})"
         )
 
 
@@ -102,6 +104,14 @@ def _load_lib() -> ctypes.CDLL:
     lib.memoire_reinforce_if_used.argtypes = [
         ctypes.c_void_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_int]
     lib.memoire_reinforce_if_used.restype = ctypes.c_int
+
+    lib.memoire_penalize_if_used.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_int,
+        ctypes.c_float,
+    ]
+    lib.memoire_penalize_if_used.restype = ctypes.c_char_p
 
     return lib
 
@@ -224,8 +234,7 @@ class Memoire:
                 id=item["id"],
                 content=item["content"],
                 score=item["score"],
-                trust=item.get("trust", 0.0),
-                state=item.get("state", "active"),
+                trust=item.get("trust", 0.0),                uncertainty=item.get("uncertainty", 0.5),                state=item.get("state", "active"),
                 created_at=item["created_at"],
             )
             for item in data
@@ -257,6 +266,51 @@ class Memoire:
             raise MemoireError(
                 f"reinforce_if_used({memory_id}) failed internally")
         return r == 1
+
+    def penalize_if_used(
+        self,
+        memory_ids: List[int],
+        failure_severity: float = 1.0,
+    ) -> List[dict]:
+        """
+        Penalize memories that contributed to a failed task outcome.
+
+        `failure_severity` ∈ [0.0, 1.0] scales the penalty:
+
+        * 1.0 — full penalty (bad guidance led directly to failure)
+        * 0.5 — moderate (wrong direction but partially useful)
+        * 0.0 — no-op
+
+        Only pass memory ids that **actually influenced the decision** (i.e.
+        those with action FOLLOW or HINT from ``MemoryPolicy``). Memories that
+        were retrieved but ignored should not be penalized.
+
+        Args:
+            memory_ids:       List of Memory.id values to penalize.
+            failure_severity: Scaling factor ∈ [0.0, 1.0]. Default 1.0.
+
+        Returns:
+            List of dicts:
+            ``[{"id": int, "trust_before": float, "trust_after": float,
+               "uncertainty_after": float}, ...]``
+        """
+        self._check_open()
+        if not memory_ids:
+            return []
+        arr_type = ctypes.c_int64 * len(memory_ids)
+        arr = arr_type(*memory_ids)
+        raw = self._lib.memoire_penalize_if_used(
+            self._handle,
+            arr,
+            ctypes.c_int(len(memory_ids)),
+            ctypes.c_float(failure_severity),
+        )
+        if not raw:
+            raise MemoireError("penalize_if_used failed internally")
+        try:
+            return json.loads(raw.decode("utf-8"))
+        finally:
+            self._lib.memoire_free_string(raw)
 
     def forget(self, memory_id: int) -> bool:
         """

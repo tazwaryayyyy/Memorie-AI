@@ -138,6 +138,52 @@ pub extern "C" fn memoire_reinforce_if_used(
     }
 }
 
+/// Penalize memories that contributed to a failed task outcome.
+///
+/// `ids`:              pointer to an array of `c_longlong` memory ids.
+/// `ids_len`:          number of elements in `ids`.
+/// `failure_severity`: ∈ [0.0, 1.0] — 1.0 = direct failure, 0.5 = partial miss.
+///
+/// Returns a heap-allocated JSON string of `PenaltyOutcome` objects, or NULL
+/// on error.  **Caller MUST free it with `memoire_free_string`.**
+///
+/// JSON: `[{"id":1,"trust_before":0.62,"trust_after":0.41,"uncertainty_after":0.72}, ...]`
+///
+/// # Safety
+/// `handle` must be a valid, non-freed `MemoireHandle`.  `ids` must be either
+/// NULL or a valid pointer to an array of at least `ids_len` `c_longlong`
+/// elements.
+#[no_mangle]
+pub unsafe extern "C" fn memoire_penalize_if_used(
+    handle: *mut MemoireHandle,
+    ids: *const c_longlong,
+    ids_len: c_int,
+    failure_severity: f32,
+) -> *mut c_char {
+    let m = match mut_ref(handle) {
+        Some(h) => h,
+        None => return ptr::null_mut(),
+    };
+    if ids.is_null() || ids_len <= 0 {
+        return CString::new("[]")
+            .map(|s| s.into_raw())
+            .unwrap_or(ptr::null_mut());
+    }
+    let ids_slice = unsafe { std::slice::from_raw_parts(ids, ids_len as usize) };
+    match m.penalize_if_used(ids_slice, failure_severity) {
+        Ok(outcomes) => {
+            let json = serde_json::to_string(&outcomes).unwrap_or_else(|_| "[]".to_string());
+            CString::new(json)
+                .map(|s| s.into_raw())
+                .unwrap_or(ptr::null_mut())
+        }
+        Err(e) => {
+            log::error!("memoire_penalize_if_used: {e}");
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Delete memory by id. Returns 1=deleted, 0=not found, -1=error.
 #[no_mangle]
 pub extern "C" fn memoire_forget(handle: *mut MemoireHandle, id: c_longlong) -> c_int {
