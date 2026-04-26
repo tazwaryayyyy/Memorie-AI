@@ -200,6 +200,21 @@ pub extern "C" fn memoire_forget(handle: *mut MemoireHandle, id: c_longlong) -> 
     }
 }
 
+/// Resolve contradictions for a specific memory id. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn memoire_resolve_contradictions(handle: *mut MemoireHandle, id: c_longlong) -> c_int {
+    match mut_ref(handle) {
+        Some(m) => match m.store.resolve_contradictions_for_id(id) {
+            Ok(()) => 0,
+            Err(e) => {
+                log::error!("memoire_resolve_contradictions: {e}");
+                -1
+            }
+        },
+        None => -1,
+    }
+}
+
 /// Total stored chunks, or -1 on error.
 #[no_mangle]
 pub extern "C" fn memoire_count(handle: *const MemoireHandle) -> c_longlong {
