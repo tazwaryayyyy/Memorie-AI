@@ -1,0 +1,15 @@
+[project]
+name = "memoire-mcp"
+version = "0.1.0"
+description = "MCP Server for the Memoire semantic memory engine"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "memoire",
+]
+
+[project.scripts]
+memoire-mcp = "server:main"
+
+[tool.uv.sources]
+memoire = { path = "../bindings/python", editable = true }

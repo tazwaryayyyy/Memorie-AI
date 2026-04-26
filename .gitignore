@@ -7,3 +7,10 @@
 *.dylib
 *.dll
 .fastembed_cache/
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+mcp-server/venv/
+mcp-server/__pycache__/
+dump.py
