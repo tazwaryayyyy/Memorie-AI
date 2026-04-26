@@ -115,6 +115,9 @@ def _load_lib() -> ctypes.CDLL:
     ]
     lib.memoire_penalize_if_used.restype = ctypes.c_char_p
 
+    lib.memoire_resolve_contradictions.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+    lib.memoire_resolve_contradictions.restype = ctypes.c_int
+
     return lib
 
 
@@ -326,6 +329,19 @@ class Memoire:
         if r < 0:
             raise MemoireError(f"forget({memory_id}) failed internally")
         return r == 1
+
+    def resolve_contradictions(self, memory_id: int) -> bool:
+        """
+        Resolve contradictions for a specific memory id.
+
+        Returns:
+            True on success.
+        """
+        self._check_open()
+        r = self._lib.memoire_resolve_contradictions(self._handle, ctypes.c_int64(memory_id))
+        if r < 0:
+            raise MemoireError(f"resolve_contradictions({memory_id}) failed internally")
+        return True
 
     def count(self) -> int:
         """Total number of stored memory chunks."""
