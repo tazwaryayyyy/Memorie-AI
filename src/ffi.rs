@@ -202,7 +202,10 @@ pub extern "C" fn memoire_forget(handle: *mut MemoireHandle, id: c_longlong) -> 
 
 /// Resolve contradictions for a specific memory id. Returns 0 on success, -1 on error.
 #[no_mangle]
-pub extern "C" fn memoire_resolve_contradictions(handle: *mut MemoireHandle, id: c_longlong) -> c_int {
+pub extern "C" fn memoire_resolve_contradictions(
+    handle: *mut MemoireHandle,
+    id: c_longlong,
+) -> c_int {
     match mut_ref(handle) {
         Some(m) => match m.store.resolve_contradictions_for_id(id) {
             Ok(()) => 0,
