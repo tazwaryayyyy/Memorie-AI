@@ -79,12 +79,12 @@ If you're building agents that make the same mistakes across sessions, or that c
 │  │                  SQLite Store                           │   │
 │  │                                                         │   │
 │  │  Per-memory:  importance · confidence · decay weight    │   │
-  │               reinforcement count · failure count        │   │
-  │               contradiction group · trust EMA            │   │
-  │               store state (active / shadow / archived)  │   │
-  │                                                         │   │
-  │  At recall:   cosine scan → trust score computation     │   │
-  │               EMA smoothing · uncertainty computation   │   │
+│  │               reinforcement count · failure count       │   │
+│  │               contradiction group · trust EMA           │   │
+│  │               store state (active / shadow / archived)  │   │
+│  │                                                         │   │
+│  │  At recall:   HNSW ANN (>500) / linear cosine scan     │   │
+│  │               trust score · EMA · uncertainty           │   │
 │  │               conflict-aware dedup · decay reranking    │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
@@ -130,7 +130,7 @@ stateDiagram-v2
 ### What happens at recall
 
 1. **Embed** query
-2. **Cosine scan** across all active + shadow memories
+2. **Candidate retrieval** — HNSW approximate nearest-neighbour search above 500 memories; linear cosine scan below that threshold
 3. **Rerank** by `0.75×similarity + 0.20×decay_weight + 0.05×recency`
 4. **Trust score** computed fresh for each result: state weight × (reinforcement + confidence + age + importance + contradiction_survived)
 5. **Conflict dedup** — if two memories share a contradiction group, only the higher-trust one surfaces
@@ -471,16 +471,20 @@ cd bindings/go/demo && go run main.go
 ## Configuration
 
 ```rust
-use memoire::{Memoire, chunker::ChunkerConfig};
+use memoire::{Memoire, quality::ScoringConfig, chunker::ChunkerConfig};
 
 let m = Memoire::new("agent.db")?
     .with_chunker_config(ChunkerConfig {
         chunk_size: 64,   // words per chunk  (default: 128)
         overlap:    10,   // word overlap      (default: 20)
+    })
+    .with_scoring_config(ScoringConfig {
+        hnsw_threshold: 1000,  // switch from linear scan to ANN above this (default: 500)
+        ..ScoringConfig::default()
     });
 ```
 
-Memory quality thresholds and scoring weights are intentionally not exposed as config. **The scoring model is frozen after calibration.** Weights, thresholds, and decay curves are fixed constants — not tunable parameters. This is deliberate: without a fixed model, benchmarks are not reproducible and trust scores lose meaning across runs. If a judge asks "why this weight?", the answer is: it is fixed for reproducibility after calibration against a held-out task suite. If you need a different threshold, fork the quality module.
+The scoring weights (actionability, consequence, novelty, reusability, evidence) and trust decay curves are **fixed constants** — not tunable parameters. This is deliberate: without a fixed model, benchmarks are not reproducible and trust scores lose meaning across runs. `ScoringConfig` exposes only the operational knobs (EMA weight, RC saturation, Jaccard threshold, HNSW threshold) that do not affect the scoring model's semantics.
 
 ---
 
