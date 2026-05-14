@@ -8,7 +8,7 @@ pub mod store;
 use chunker::{chunk_text, ChunkerConfig};
 use embedder::{EmbedProvider, Embedder};
 use error::{MemoireError, Result};
-use quality::{build_quality_meta, fingerprint, IngestDecision, ScoringWeights};
+use quality::{build_quality_meta, fingerprint, IngestDecision, ScoringConfig, ScoringPrototypes, ScoringWeights};
 use store::{Memory, Store};
 
 /// The central Memoire instance.
@@ -31,6 +31,7 @@ pub struct Memoire {
     embedder: Box<dyn EmbedProvider>,
     chunker_config: ChunkerConfig,
     scoring_weights: ScoringWeights,
+    prototypes: ScoringPrototypes,
 }
 
 impl Memoire {
@@ -66,23 +67,95 @@ impl Memoire {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn new_with_embedder(db_path: &str, embedder: Box<dyn EmbedProvider>) -> Result<Self> {
+        let prototypes = Self::compute_prototypes(&*embedder);
         Ok(Self {
-            store: Store::open(db_path)?,
+            store: Store::open_with_config(db_path, ScoringConfig::default())?,
             embedder,
             chunker_config: ChunkerConfig::default(),
             scoring_weights: ScoringWeights::default(),
+            prototypes,
         })
+    }
+
+    fn compute_prototypes(embedder: &dyn EmbedProvider) -> ScoringPrototypes {
+        let consequence_sents = vec![
+            "Critical security breach in production database exposing user data".to_string(),
+            "System outage caused data loss for all users".to_string(),
+            "Race condition in payment processing leads to double charges".to_string(),
+            "Authentication bypass vulnerability allows unauthorized access".to_string(),
+            "Production database corrupted during migration".to_string(),
+        ];
+        let actionability_sents = vec![
+            "Fixed the bug by replacing the function with the corrected version".to_string(),
+            "Replaced deprecated API call with the new stable endpoint".to_string(),
+            "Patched the vulnerability by updating the dependency to latest version".to_string(),
+            "Refactored the module to remove dead code and reduce coupling".to_string(),
+            "Disabled the feature flag after rollback to restore stable behavior".to_string(),
+        ];
+        let reusability_sents = vec![
+            "Always use Decimal for financial calculations never use float".to_string(),
+            "Never store passwords in plain text always hash with bcrypt".to_string(),
+            "API rate limit policy must enforce maximum requests per hour".to_string(),
+            "Rule: all database queries must use parameterized statements".to_string(),
+            "Mandatory: all external inputs must be validated and sanitized".to_string(),
+        ];
+
+        let all: Vec<String> = consequence_sents
+            .iter()
+            .chain(actionability_sents.iter())
+            .chain(reusability_sents.iter())
+            .cloned()
+            .collect();
+
+        match embedder.embed(all) {
+            Ok(vecs) if vecs.len() == 15 => {
+                let avg = |group: &[Vec<f32>]| -> Vec<f32> {
+                    let dim = group[0].len();
+                    let mut acc = vec![0.0_f32; dim];
+                    for v in group {
+                        for (a, b) in acc.iter_mut().zip(v.iter()) {
+                            *a += b;
+                        }
+                    }
+                    acc.iter_mut().for_each(|x| *x /= group.len() as f32);
+                    acc
+                };
+                let consequence = avg(&vecs[0..5]);
+                let actionability = avg(&vecs[5..10]);
+                let reusability = avg(&vecs[10..15]);
+                let is_semantic = true;
+                ScoringPrototypes { consequence, actionability, reusability, is_semantic }
+            }
+            Err(e) => {
+                log::warn!("compute_prototypes failed — falling back to neutral: {e}");
+                ScoringPrototypes::neutral(384)
+            }
+            Ok(_) => {
+                log::warn!("compute_prototypes returned unexpected count — falling back to neutral");
+                ScoringPrototypes::neutral(384)
+            }
+        }
     }
 
     /// In-memory store — not persisted. Useful for tests.
     pub fn in_memory() -> Result<Self> {
         let _ = env_logger::try_init();
+        let embedder: Box<dyn EmbedProvider> =
+            Box::new(Embedder::new().map_err(MemoireError::Embedding)?);
+        let prototypes = Self::compute_prototypes(&*embedder);
         Ok(Self {
-            store: Store::in_memory()?,
-            embedder: Box::new(Embedder::new().map_err(MemoireError::Embedding)?),
+            store: Store::in_memory_with_config(ScoringConfig::default())?,
+            embedder,
             chunker_config: ChunkerConfig::default(),
             scoring_weights: ScoringWeights::default(),
+            prototypes,
         })
+    }
+
+    /// Builder: override the scoring config used by the store.
+    pub fn with_scoring_config(mut self, config: ScoringConfig) -> Self {
+        self.store.config = config;
+        self
     }
 
     pub fn with_chunker_config(mut self, config: ChunkerConfig) -> Self {
@@ -133,7 +206,7 @@ impl Memoire {
             let max_sim = self.store.max_similarity(embedding)?;
             let novelty = (1.0 - max_sim).clamp(0.0, 1.0);
             let (meta, decision) =
-                build_quality_meta(chunk, novelty, source_kind, &self.scoring_weights);
+                build_quality_meta(chunk, embedding, novelty, source_kind, &self.scoring_weights, &self.prototypes);
 
             match decision {
                 IngestDecision::Reject => continue,
