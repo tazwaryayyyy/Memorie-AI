@@ -105,11 +105,9 @@ impl StoreInner {
             "SELECT id, embedding FROM memories
              WHERE archived = 0 AND superseded_by IS NULL",
         )?;
-        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))? {
-            if let Ok((id, blob)) = row {
-                if let Some(emb) = blob_to_vec(&blob) {
-                    self.embedding_cache.push((id, emb));
-                }
+        for (id, blob) in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?.flatten() {
+            if let Some(emb) = blob_to_vec(&blob) {
+                self.embedding_cache.push((id, emb));
             }
         }
         self.embedding_cache_loaded = true;
@@ -169,7 +167,7 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn blob_to_vec(blob: &[u8]) -> Option<Vec<f32>> {
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return None;
     }
     Some(
