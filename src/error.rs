@@ -19,6 +19,9 @@ pub enum MemoireError {
 
     #[error("empty store — nothing to recall from")]
     EmptyStore,
+
+    #[error("store mutex poisoned — a thread panicked while holding the lock")]
+    LockPoisoned,
 }
 
 pub type Result<T> = std::result::Result<T, MemoireError>;

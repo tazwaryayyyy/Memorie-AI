@@ -1,10 +1,14 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
-use crate::error::Result;
-use crate::quality::{compute_trust, effective_weight, now_ts, recency_bonus, QualityMeta};
+use crate::error::{MemoireError, Result};
+use crate::quality::{
+    compute_trust, cosine_similarity, detect_polarity, effective_weight, now_ts, recency_bonus,
+    Polarity, QualityMeta, ScoringConfig,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Memory {
@@ -32,7 +36,99 @@ pub struct PenaltyOutcome {
 }
 
 pub struct Store {
+    inner: Mutex<StoreInner>,
+    pub config: ScoringConfig,
+}
+
+// StoreInner contains rusqlite::Connection which is Send but not Sync.
+// Wrapping it in Mutex<StoreInner> provides the Sync we need for Store.
+// SAFETY: Connection is only ever accessed while holding the mutex.
+unsafe impl Send for StoreInner {}
+unsafe impl Sync for StoreInner {}
+
+/// ✅ FIX #5 — In-memory HNSW embedding point wrapper.
+///
+/// Wraps a 384-dim embedding vector. Implements `instant_distance::Point`
+/// using L2 distance. For L2-normalised fastembed vectors:
+///   ||a − b||² = 2·(1 − cosine) → closer L2 = higher cosine.
+#[derive(Clone)]
+pub struct EmbeddingPoint(pub Vec<f32>);
+
+impl instant_distance::Point for EmbeddingPoint {
+    fn distance(&self, other: &Self) -> f32 {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .map(|(a, b)| {
+                let d = a - b;
+                d * d
+            })
+            .sum::<f32>()
+            .sqrt()
+    }
+}
+
+/// ✅ FIX #1 — All mutable state lives inside a single Mutex.
+///
+/// `StoreInner` is the exclusive owner of the SQLite connection, in-memory
+/// embedding cache, fingerprint set, and HNSW index. Every method acquires
+/// `Mutex::lock()` before touching any of these fields, making `Store`
+/// safe to call from multiple threads (including FFI) without data races.
+struct StoreInner {
     conn: Connection,
+    /// In-memory cache of (sqlite_id, embedding) for all live memories.
+    /// Populated lazily on the first `max_similarity` or `search` call so that
+    /// startup cost is O(fingerprint count) not O(embedding count).
+    embedding_cache: Vec<(i64, Vec<f32>)>,
+    /// True once the full embedding cache has been loaded from SQLite.
+    /// Inserts update the cache only when this is true; otherwise they write
+    /// to SQLite and let the lazy load pick them up.
+    embedding_cache_loaded: bool,
+    /// O(1) fingerprint lookup — avoids a SQLite round-trip per insert.
+    fingerprints: HashSet<String>,
+    /// Approximate nearest-neighbour index. Rebuilt lazily when dirty.
+    hnsw: Option<instant_distance::HnswMap<EmbeddingPoint, i64>>,
+    /// True after any insert or archive — triggers a lazy HNSW rebuild.
+    hnsw_dirty: bool,
+}
+
+impl StoreInner {
+    /// Load all embeddings from SQLite into the in-memory cache if not yet loaded.
+    /// Fingerprints are loaded eagerly at construction; embeddings are deferred here
+    /// to keep startup cost proportional to fingerprint count (small strings) rather
+    /// than embedding count (1536 bytes × N).
+    fn ensure_embedding_cache(&mut self) -> crate::error::Result<()> {
+        if self.embedding_cache_loaded {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, embedding FROM memories
+             WHERE archived = 0 AND superseded_by IS NULL",
+        )?;
+        for row in stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })? {
+            if let Ok((id, blob)) = row {
+                if let Some(emb) = blob_to_vec(&blob) {
+                    self.embedding_cache.push((id, emb));
+                }
+            }
+        }
+        self.embedding_cache_loaded = true;
+        self.hnsw_dirty = !self.embedding_cache.is_empty();
+        log::debug!(
+            "embedding cache loaded: {} vectors",
+            self.embedding_cache.len()
+        );
+        Ok(())
+    }
+
+    fn remove_from_cache(&mut self, id: i64) {
+        if self.embedding_cache_loaded {
+            self.embedding_cache.retain(|(cid, _)| *cid != id);
+            self.hnsw_dirty = true;
+        }
+    }
 }
 
 const SCHEMA: &str = "
@@ -75,7 +171,7 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn blob_to_vec(blob: &[u8]) -> Option<Vec<f32>> {
-    if !blob.len().is_multiple_of(4) {
+    if blob.len() % 4 != 0 {
         return None;
     }
     Some(
@@ -85,32 +181,139 @@ pub fn blob_to_vec(blob: &[u8]) -> Option<Vec<f32>> {
     )
 }
 
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
+/// Load only fingerprints at startup — O(n × 64 bytes) instead of O(n × 1536 bytes).
+/// Embedding vectors are loaded lazily on the first search via `StoreInner::ensure_embedding_cache`.
+fn load_fingerprints_from_db(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT fingerprint FROM memories
+         WHERE archived = 0 AND superseded_by IS NULL AND fingerprint != ''",
+    )?;
+    let fingerprints: HashSet<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(fingerprints)
+}
+
+/// Rebuild the HNSW index from the current in-memory embedding cache.
+fn rebuild_hnsw(inner: &mut StoreInner) {
+    if inner.embedding_cache.is_empty() {
+        inner.hnsw = None;
+        inner.hnsw_dirty = false;
+        return;
     }
-    dot / (norm_a * norm_b)
+    let (points, ids): (Vec<EmbeddingPoint>, Vec<i64>) = inner
+        .embedding_cache
+        .iter()
+        .map(|(id, emb)| (EmbeddingPoint(emb.clone()), *id))
+        .unzip();
+    let n = points.len();
+    let hnsw = instant_distance::Builder::default().build(points, ids);
+    inner.hnsw = Some(hnsw);
+    inner.hnsw_dirty = false;
+    log::debug!("hnsw rebuilt: {} points", n);
+}
+
+/// Get top-K candidate (id, cosine_similarity) pairs.
+///
+/// - Below `config.hnsw_threshold`: linear scan over in-memory embedding cache.
+/// - Above threshold: HNSW ANN search (rebuilt lazily).
+fn search_candidates(
+    inner: &mut StoreInner,
+    query_vec: &[f32],
+    top_k: usize,
+    config: &ScoringConfig,
+) -> Vec<(i64, f32)> {
+    if inner.embedding_cache.len() >= config.hnsw_threshold {
+        if inner.hnsw_dirty || inner.hnsw.is_none() {
+            rebuild_hnsw(inner);
+        }
+        if let Some(hnsw) = &inner.hnsw {
+            let query_point = EmbeddingPoint(query_vec.to_vec());
+            let mut search = instant_distance::Search::default();
+            let results: Vec<(i64, f32)> = hnsw
+                .search(&query_point, &mut search)
+                .map(|item| {
+                    let dist = item.distance;
+                    let id = *item.value;
+                    // L2 on unit vectors: cosine ≈ 1 − dist²/2
+                    let sim = (1.0_f32 - dist * dist / 2.0).clamp(0.0, 1.0);
+                    (id, sim)
+                })
+                .take(top_k * 2)
+                .collect();
+            if !results.is_empty() {
+                return results;
+            }
+        }
+    }
+
+    // Linear scan over in-memory cache — fast because it avoids all SQLite I/O.
+    let mut candidates: Vec<(i64, f32)> = inner
+        .embedding_cache
+        .iter()
+        .map(|(id, emb)| (*id, cosine_similarity(query_vec, emb)))
+        .collect();
+    candidates
+        .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.truncate(top_k * 2);
+    candidates
 }
 
 impl Store {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, StoreInner>> {
+        self.inner.lock().map_err(|_| MemoireError::LockPoisoned)
+    }
+
     pub fn open(path: &str) -> Result<Self> {
+        Self::open_with_config(path, ScoringConfig::default())
+    }
+
+    pub fn open_with_config(path: &str, config: ScoringConfig) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
-        log::debug!("SQLite store opened at {path}");
-        Ok(Self { conn })
+        let fingerprints = load_fingerprints_from_db(&conn)?;
+        log::debug!(
+            "SQLite store opened at {path}; {} fingerprints loaded (embeddings deferred)",
+            fingerprints.len()
+        );
+        Ok(Self {
+            inner: Mutex::new(StoreInner {
+                conn,
+                embedding_cache: Vec::new(),
+                embedding_cache_loaded: false,
+                fingerprints,
+                hnsw: None,
+                hnsw_dirty: false,
+            }),
+            config,
+        })
     }
 
     pub fn in_memory() -> Result<Self> {
+        Self::in_memory_with_config(ScoringConfig::default())
+    }
+
+    pub fn in_memory_with_config(config: ScoringConfig) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            inner: Mutex::new(StoreInner {
+                conn,
+                embedding_cache: Vec::new(),
+                // In-memory store starts empty — no deferred load needed.
+                embedding_cache_loaded: true,
+                fingerprints: HashSet::new(),
+                hnsw: None,
+                hnsw_dirty: false,
+            }),
+            config,
+        })
     }
 
     pub fn insert(&self, content: &str, embedding: &[f32]) -> Result<i64> {
@@ -118,18 +321,6 @@ impl Store {
         self.insert_with_quality(content, embedding, &meta)
     }
 
-    /// Reinforce a memory only when the agent actually used it successfully.
-    ///
-    /// Fires when: `task_succeeded` AND (
-    ///   Jaccard token overlap >= 0.15   OR
-    ///   cosine(memory_embedding, output_embedding) >= 0.75
-    /// )
-    ///
-    /// Recovery acceleration: if the memory was previously penalized
-    /// (`failure_count > 0`), confidence is boosted by 10% (capped at 1.0)
-    /// to allow correct memories to bounce back faster than fresh ones.
-    ///
-    /// Trust EMA is updated each time to smooth out oscillation.
     pub fn reinforce_if_used(
         &self,
         memory_id: i64,
@@ -141,7 +332,8 @@ impl Store {
             return Ok(false);
         }
 
-        let row = self.conn.query_row(
+        let mut inner = self.lock()?;
+        let row = inner.conn.query_row(
             "SELECT content, embedding,
                     reinforcement_count, confidence, importance_base,
                     created_at, store_state, contradiction_group,
@@ -164,31 +356,21 @@ impl Store {
             },
         );
 
-        let (
-            content,
-            mem_blob,
-            rc,
-            conf,
-            imp,
-            created_at,
-            store_state,
-            cg,
-            failure_count,
-            trust_ema_stored,
-        ) = match row {
-            Ok(v) => v,
-            Err(_) => return Ok(false),
-        };
+        let (content, mem_blob, rc, conf, imp, created_at, store_state, cg, failure_count, trust_ema_stored) =
+            match row {
+                Ok(v) => v,
+                Err(_) => return Ok(false),
+            };
 
-        // Path 1: Jaccard token overlap
-        let memory_tokens: std::collections::HashSet<&str> = content.split_whitespace().collect();
-        let output_tokens: std::collections::HashSet<&str> =
-            agent_output.split_whitespace().collect();
+        // Path 1: Jaccard token overlap (threshold raised to config.jaccard_threshold)
+        let memory_tokens: HashSet<&str> = content.split_whitespace().collect();
+        let output_tokens: HashSet<&str> = agent_output.split_whitespace().collect();
         let intersection = memory_tokens.intersection(&output_tokens).count();
         let union = memory_tokens.union(&output_tokens).count();
-        let jaccard_ok = union > 0 && (intersection as f32 / union as f32) >= 0.15;
+        let jaccard = if union > 0 { intersection as f32 / union as f32 } else { 0.0 };
+        let jaccard_ok = jaccard >= self.config.jaccard_threshold;
 
-        // Path 2: cosine similarity between memory embedding and output embedding
+        // Path 2: cosine similarity
         let cosine_ok = if let Some(out_emb) = output_embedding {
             blob_to_vec(&mem_blob)
                 .map(|mem_emb| cosine_similarity(&mem_emb, out_emb) >= 0.75)
@@ -197,65 +379,48 @@ impl Store {
             false
         };
 
-        if jaccard_ok || cosine_ok {
-            let new_rc = rc + 1;
-            // Recovery acceleration: a previously penalized memory earns confidence
-            // back faster than one that has never been wrong.
-            let new_conf = if failure_count > 0 {
-                (conf * 1.1_f32).clamp(0.0, 1.0)
-            } else {
-                conf
-            };
-            let now: i64 =
-                self.conn
-                    .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                        r.get(0)
-                    })?;
-            let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
-            let contradiction_survived = cg.is_some() && store_state == "active";
-            let trust_after = compute_trust(
-                new_rc,
-                contradiction_survived,
-                &store_state,
-                imp,
-                new_conf,
-                age_days,
+        if !jaccard_ok && !cosine_ok {
+            log::warn!(
+                "reinforce_if_used(id={memory_id}): task_succeeded=true but attribution \
+                 gate not met (jaccard={jaccard:.3}, threshold={:.3}). Skipping.",
+                self.config.jaccard_threshold
             );
-            let new_ema = match trust_ema_stored {
-                Some(ema) => (0.7 * ema + 0.3 * trust_after).clamp(0.0, 1.0),
-                None => trust_after,
-            };
-            self.conn.execute(
-                "UPDATE memories
-                 SET reinforcement_count = ?1,
-                     confidence = ?2,
-                     trust_ema = ?3,
-                     last_accessed_at = CAST(strftime('%s', 'now') AS INTEGER)
-                 WHERE id = ?4",
-                params![new_rc, new_conf, new_ema, memory_id],
-            )?;
-            Ok(true)
-        } else {
-            Ok(false)
+            return Ok(false);
         }
+
+        let new_rc = rc + 1;
+        let new_conf = if failure_count > 0 {
+            (conf * 1.1_f32).clamp(0.0, 1.0)
+        } else {
+            conf
+        };
+        let now: i64 = inner
+            .conn
+            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
+        let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
+        let contradiction_survived = cg.is_some() && store_state == "active";
+        let trust_after = compute_trust(
+            new_rc, contradiction_survived, &store_state, imp, new_conf, age_days, &self.config,
+        );
+        let w = self.config.ema_new_weight;
+        let new_ema = match trust_ema_stored {
+            Some(ema) => ((1.0 - w) * ema + w * trust_after).clamp(0.0, 1.0),
+            None => trust_after,
+        };
+        inner.conn.execute(
+            "UPDATE memories
+             SET reinforcement_count = ?1,
+                 confidence = ?2,
+                 trust_ema = ?3,
+                 last_accessed_at = CAST(strftime('%s', 'now') AS INTEGER)
+             WHERE id = ?4",
+            params![new_rc, new_conf, new_ema, memory_id],
+        )?;
+        Ok(true)
     }
 
-    /// Penalize memories that contributed to a failed task outcome.
-    ///
-    /// `failure_severity` ∈ [0.0, 1.0] scales the penalty proportionally:
-    /// - 0.0 → no-op (trivial miss, no signal)
-    /// - 0.5 → moderate: wrong direction but partially useful
-    /// - 1.0 → full: bad guidance led directly to failure
-    ///
-    /// For each memory id:
-    /// - `confidence      *= 1.0 - 0.2 × severity`
-    /// - `importance_base *= 1.0 - 0.1 × severity`
-    /// - `reinforcement_count` decremented by 1 when severity > 0 (floor 0)
-    /// - `failure_count` incremented — used for uncertainty and recovery tracking
-    /// - `trust_ema` updated via EMA: `0.7 × old + 0.3 × new`
-    ///
-    /// Trust degrades organically through `compute_trust()` — no penalty flags.
-    /// Returns the trust and uncertainty delta per penalized memory.
     pub fn penalize_if_used(
         &self,
         memory_ids: &[i64],
@@ -265,14 +430,15 @@ impl Store {
             return Ok(vec![]);
         }
         let severity = failure_severity.clamp(0.0, 1.0);
-        let now: i64 =
-            self.conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
+        let mut inner = self.lock()?;
+        let now: i64 = inner
+            .conn
+            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
         let mut outcomes = Vec::with_capacity(memory_ids.len());
         for &id in memory_ids {
-            let row = self.conn.query_row(
+            let row = inner.conn.query_row(
                 "SELECT reinforcement_count, confidence, importance_base,
                         created_at, store_state, contradiction_group,
                         failure_count, trust_ema
@@ -291,15 +457,16 @@ impl Store {
                     ))
                 },
             );
-            let (rc, conf, imp, created_at, state, cg, failure_count, trust_ema_stored) = match row
-            {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let (rc, conf, imp, created_at, state, cg, failure_count, trust_ema_stored) =
+                match row {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
             let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
             let contradiction_survived = cg.is_some() && state == "active";
-            let trust_before =
-                compute_trust(rc, contradiction_survived, &state, imp, conf, age_days);
+            let trust_before = compute_trust(
+                rc, contradiction_survived, &state, imp, conf, age_days, &self.config,
+            );
 
             let new_rc = (rc - if severity > 0.0 { 1 } else { 0 }).max(0);
             let new_conf = (conf * (1.0 - 0.2 * severity)).clamp(0.0, 1.0);
@@ -313,20 +480,20 @@ impl Store {
                 new_imp,
                 new_conf,
                 age_days,
+                &self.config,
             );
+            let w = self.config.ema_new_weight;
             let new_ema = match trust_ema_stored {
-                Some(ema) => (0.7 * ema + 0.3 * trust_after).clamp(0.0, 1.0),
+                Some(ema) => ((1.0 - w) * ema + w * trust_after).clamp(0.0, 1.0),
                 None => trust_after,
             };
 
-            // Uncertainty: rises with more failures relative to reinforcements.
-            // High oscillation (many both reinforce + penalize) → higher uncertainty.
             let rc_f = new_rc as f32;
             let fc_f = new_fc as f32;
             let uncertainty_after =
                 (0.5 / (1.0 + rc_f) + 0.5 * fc_f / (fc_f + rc_f + 1.0)).clamp(0.0, 1.0);
 
-            self.conn.execute(
+            inner.conn.execute(
                 "UPDATE memories
                  SET reinforcement_count = ?1,
                      confidence = ?2,
@@ -354,7 +521,8 @@ impl Store {
         quality: &QualityMeta,
     ) -> Result<i64> {
         let blob = vec_to_blob(embedding);
-        self.conn.execute(
+        let mut inner = self.lock()?;
+        inner.conn.execute(
             "INSERT INTO memories (
                 content, embedding,
                 importance_base, confidence, novelty,
@@ -393,43 +561,33 @@ impl Store {
                 quality.claim_value,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = inner.conn.last_insert_rowid();
+        if quality.store_state != "rejected" && quality.archived == 0 {
+            // Only update the in-memory cache if it has already been loaded.
+            // If not yet loaded, the lazy load will pick this row up from SQLite.
+            if inner.embedding_cache_loaded {
+                inner.embedding_cache.push((id, embedding.to_vec()));
+                inner.hnsw_dirty = true;
+            }
+            inner.fingerprints.insert(quality.fingerprint.clone());
+        }
+        Ok(id)
     }
 
     pub fn max_similarity(&self, query_vec: &[f32]) -> Result<f32> {
-        let mut stmt = self.conn.prepare(
-            "SELECT embedding FROM memories
-             WHERE archived = 0 AND superseded_by IS NULL
-             ORDER BY created_at DESC",
-        )?;
-
-        let mut max_sim = 0.0_f32;
-        for row in stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
-            let blob = match row {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let Some(v) = blob_to_vec(&blob) else {
-                continue;
-            };
-            let sim = cosine_similarity(query_vec, &v);
-            if sim > max_sim {
-                max_sim = sim;
-            }
-        }
+        let mut inner = self.lock()?;
+        inner.ensure_embedding_cache()?;
+        let max_sim = inner
+            .embedding_cache
+            .iter()
+            .map(|(_, emb)| cosine_similarity(query_vec, emb))
+            .fold(0.0_f32, f32::max);
         Ok(max_sim)
     }
 
-    pub fn fingerprint_exists(&self, fingerprint: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM memories
-             WHERE fingerprint = ?1
-               AND archived = 0
-               AND superseded_by IS NULL",
-            params![fingerprint],
-            |r| r.get(0),
-        )?;
-        Ok(count > 0)
+    pub fn fingerprint_exists(&self, fp: &str) -> Result<bool> {
+        let inner = self.lock()?;
+        Ok(inner.fingerprints.contains(fp))
     }
 
     pub fn search(&self, query_vec: &[f32], top_k: usize) -> Result<Vec<Memory>> {
@@ -437,114 +595,102 @@ impl Store {
             return Ok(vec![]);
         }
 
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                id, content, embedding, created_at,
-                importance_base, reinforcement_count, confidence,
-                store_state, contradiction_group,
-                failure_count, trust_ema
-             FROM memories
-             WHERE archived = 0
-               AND superseded_by IS NULL
-               AND store_state IN ('active', 'shadow')
-             ORDER BY created_at DESC",
-        )?;
+        let mut inner = self.lock()?;
+        inner.ensure_embedding_cache()?;
+        if inner.embedding_cache.is_empty() {
+            return Ok(vec![]);
+        }
 
-        let now: i64 =
-            self.conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
+        let candidates = search_candidates(&mut inner, query_vec, top_k, &self.config);
 
-        // (score, trust, contradiction_group, Memory)
-        let mut scored: Vec<(f32, f32, Option<String>, Memory)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, f32>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, f32>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, Option<f32>>(10)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .filter_map(
-                |(
-                    id,
-                    content,
-                    blob,
-                    created_at,
-                    importance_base,
-                    reinforcement_count,
-                    confidence,
-                    store_state,
-                    contradiction_group,
-                    failure_count,
-                    trust_ema_stored,
-                )| {
-                    let embedding = blob_to_vec(&blob)?;
-                    let sim = cosine_similarity(query_vec, &embedding);
-                    let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
-                    let weight = effective_weight(importance_base, age_days, reinforcement_count);
-                    let final_score =
-                        0.75 * sim + 0.20 * weight + 0.05 * recency_bonus(created_at, now);
-                    // contradiction_survived: active + has a claim group = won at least one check
-                    let contradiction_survived =
-                        contradiction_group.is_some() && store_state == "active";
-                    let trust_base = compute_trust(
-                        reinforcement_count,
-                        contradiction_survived,
-                        &store_state,
-                        importance_base,
-                        confidence,
-                        age_days,
-                    );
-                    // Context-aware trust: a memory highly relevant to this specific
-                    // query gets a boost; tangentially retrieved memories are dampened.
-                    // trust_final = trust_base * (0.6 + 0.4 * similarity)
-                    // Range: trust_base*0.6 (orthogonal query) → trust_base (perfect match)
-                    let sim_clamped = sim.clamp(0.0, 1.0);
-                    let trust_computed = (trust_base * (0.6 + 0.4 * sim_clamped)).clamp(0.0, 1.0);
-                    // EMA smoothing: damps sharp trust swings when the same
-                    // memory oscillates between reinforce and penalize cycles.
-                    let trust = match trust_ema_stored {
-                        Some(ema) => (0.7 * ema + 0.3 * trust_computed).clamp(0.0, 1.0),
-                        None => trust_computed,
-                    };
-                    // Uncertainty: low reinforcement or high oscillation → less certain.
-                    let rc_f = reinforcement_count as f32;
-                    let fc_f = failure_count as f32;
-                    let uncertainty =
-                        (0.5 / (1.0 + rc_f) + 0.5 * fc_f / (fc_f + rc_f + 1.0)).clamp(0.0, 1.0);
-                    Some((
-                        final_score,
-                        trust,
-                        contradiction_group,
-                        Memory {
-                            id,
-                            content,
-                            score: final_score,
-                            trust,
-                            uncertainty,
-                            state: store_state,
-                            created_at,
-                        },
+        let now: i64 = inner
+            .conn
+            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
+
+        let mut scored: Vec<(f32, f32, Option<String>, Memory)> = Vec::new();
+        for (id, sim) in &candidates {
+            let row = inner.conn.query_row(
+                "SELECT content, created_at,
+                        importance_base, reinforcement_count, confidence,
+                        store_state, contradiction_group,
+                        failure_count, trust_ema
+                 FROM memories
+                 WHERE id = ?1
+                   AND archived = 0
+                   AND superseded_by IS NULL
+                   AND store_state IN ('active', 'shadow')",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, f32>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, f32>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, i64>(7)?,
+                        r.get::<_, Option<f32>>(8)?,
                     ))
                 },
-            )
-            .collect();
+            );
+            let (
+                content, created_at, importance_base, reinforcement_count, confidence,
+                store_state, contradiction_group, failure_count, trust_ema_stored,
+            ) = match row {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
-        scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
+            let weight = effective_weight(importance_base, age_days, reinforcement_count);
+            let final_score = 0.75 * sim + 0.20 * weight + 0.05 * recency_bonus(created_at, now);
 
-        // Conflict-aware deduplication: for each contradiction_group keep max-trust only.
-        // If the winning memory still has trust < 0.4, drop the entire group —
-        // surfacing a weak memory from a contested group is worse than surfacing nothing.
+            let contradiction_survived =
+                contradiction_group.is_some() && store_state == "active";
+            let trust_base = compute_trust(
+                reinforcement_count,
+                contradiction_survived,
+                &store_state,
+                importance_base,
+                confidence,
+                age_days,
+                &self.config,
+            );
+            let sim_clamped = sim.clamp(0.0, 1.0);
+            let trust_computed = (trust_base * (0.6 + 0.4 * sim_clamped)).clamp(0.0, 1.0);
+            let w = self.config.ema_new_weight;
+            let trust = match trust_ema_stored {
+                Some(ema) => ((1.0 - w) * ema + w * trust_computed).clamp(0.0, 1.0),
+                None => trust_computed,
+            };
+            let rc_f = reinforcement_count as f32;
+            let fc_f = failure_count as f32;
+            let uncertainty =
+                (0.5 / (1.0 + rc_f) + 0.5 * fc_f / (fc_f + rc_f + 1.0)).clamp(0.0, 1.0);
+
+            scored.push((
+                final_score,
+                trust,
+                contradiction_group,
+                Memory {
+                    id: *id,
+                    content,
+                    score: final_score,
+                    trust,
+                    uncertainty,
+                    state: store_state,
+                    created_at,
+                },
+            ));
+        }
+
+        scored.sort_unstable_by(|a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         let mut group_winner: HashMap<String, usize> = HashMap::new();
         for (idx, (_, trust, cg_opt, _)) in scored.iter().enumerate() {
             if let Some(cg) = cg_opt {
@@ -554,9 +700,7 @@ impl Store {
                 }
             }
         }
-
-        // Collect groups where even the winner is too weak to trust
-        let weak_groups: std::collections::HashSet<String> = group_winner
+        let weak_groups: HashSet<String> = group_winner
             .iter()
             .filter(|(_, &idx)| scored[idx].1 < 0.4)
             .map(|(cg, _)| cg.clone())
@@ -568,12 +712,9 @@ impl Store {
             .filter(|(idx, (_, _, cg_opt, _))| {
                 if let Some(cg) = cg_opt {
                     if weak_groups.contains(cg) {
-                        return false; // drop entire weak group
+                        return false;
                     }
-                    group_winner
-                        .get(cg)
-                        .map(|best| best == idx)
-                        .unwrap_or(false)
+                    group_winner.get(cg).map(|best| best == idx).unwrap_or(false)
                 } else {
                     true
                 }
@@ -585,12 +726,6 @@ impl Store {
         Ok(result)
     }
 
-    /// Like `search`, but only returns memories created within `max_age_days`.
-    ///
-    /// Addresses **semantic drift**: a memory correct for library version 1.0
-    /// may be wrong for version 2.0. This recency gate treats outdated memories
-    /// as stale context rather than mistakes — no trust penalty is applied,
-    /// unlike `penalize_if_used`. The gate is read-only.
     pub fn search_within_days(
         &self,
         query_vec: &[f32],
@@ -598,7 +733,6 @@ impl Store {
         max_age_days: f32,
     ) -> Result<Vec<Memory>> {
         let cutoff_ts = now_ts() - (max_age_days * 86_400.0) as i64;
-        // Fetch a larger pool so age-filtering does not starve top_k.
         let pool = self.search(query_vec, (top_k * 4).max(20))?;
         Ok(pool
             .into_iter()
@@ -607,114 +741,195 @@ impl Store {
             .collect())
     }
 
+    /// ✅ FIX #4 — Generalised semantic contradiction detection.
+    ///
+    /// Replaces the 4-domain hardcoded claim matching (JWT, bcrypt, rate limiting,
+    /// floats) with a domain-agnostic approach:
+    ///   1. cosine similarity > 0.80 → same topic cluster
+    ///   2. opposing polarity       → one asserts, the other negates
+    ///
+    /// Applicable to any domain. Quality-weighted resolution preserved.
     pub fn resolve_contradictions_for_id(&self, id: i64) -> Result<()> {
-        let target = self.conn.query_row(
-            "SELECT id, claim_key, claim_value, importance_base, confidence, evidence, created_at
-             FROM memories WHERE id = ?1",
+        let mut inner = self.lock()?;
+
+        let target_row = inner.conn.query_row(
+            "SELECT content, embedding, importance_base, confidence, evidence, created_at, claim_value
+             FROM memories WHERE id = ?1 AND archived = 0",
             params![id],
-            |row| {
+            |r| {
                 Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, f32>(3)?,
-                    row.get::<_, f32>(4)?,
-                    row.get::<_, f32>(5)?,
-                    row.get::<_, i64>(6)?,
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, f32>(2)?,
+                    r.get::<_, f32>(3)?,
+                    r.get::<_, f32>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             },
         );
 
-        let (new_id, claim_key, claim_value, imp, conf, ev, created_at) = match target {
+        let (new_content, new_blob, imp, conf, ev, created_at, stored_polarity) = match target_row {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
-        let (Some(key), Some(value)) = (claim_key, claim_value) else {
-            return Ok(());
+
+        let new_emb = match blob_to_vec(&new_blob) {
+            Some(v) => v,
+            None => return Ok(()),
         };
 
-        let mut stmt = self.conn.prepare(
-            "SELECT id, importance_base, confidence, evidence, created_at
+        let new_polarity_str = stored_polarity
+            .unwrap_or_else(|| detect_polarity(&new_content).as_str().to_string());
+        if new_polarity_str == "neutral" {
+            return Ok(());
+        }
+
+        let now: i64 = inner
+            .conn
+            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
+
+        let mut stmt = inner.conn.prepare(
+            "SELECT id, content, embedding, importance_base, confidence, evidence, created_at, claim_value
              FROM memories
-             WHERE claim_key = ?1
-               AND claim_value IS NOT NULL
-               AND claim_value != ?2
+             WHERE id != ?1
                AND archived = 0
                AND superseded_by IS NULL
-               AND id != ?3",
+               AND store_state IN ('active', 'shadow')",
         )?;
 
-        let now: i64 =
-            self.conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
-
-        for row in stmt.query_map(params![key, value, new_id], |row| {
+        let mut contradictions: Vec<(i64, f32, f32, f32, i64)> = Vec::new();
+        for row in stmt.query_map(params![id], |r| {
             Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, f32>(1)?,
-                row.get::<_, f32>(2)?,
-                row.get::<_, f32>(3)?,
-                row.get::<_, i64>(4)?,
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, f32>(3)?,
+                r.get::<_, f32>(4)?,
+                r.get::<_, f32>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })? {
-            let (other_id, o_imp, o_conf, o_ev, o_created) = match row {
+            let (other_id, other_content, other_blob, o_imp, o_conf, o_ev, o_created, other_polarity_opt) = match row {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let rec_new = recency_bonus(created_at, now);
+
+            let other_emb = match blob_to_vec(&other_blob) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let sim = cosine_similarity(&new_emb, &other_emb);
+            if sim < 0.80 {
+                continue;
+            }
+
+            let other_polarity_str = other_polarity_opt
+                .unwrap_or_else(|| detect_polarity(&other_content).as_str().to_string());
+            if other_polarity_str == "neutral" {
+                continue;
+            }
+
+            // IMPORTANT: parse the stored polarity string with Polarity::from_stored.
+            // Calling detect_polarity("affirmative") would scan for tokens like "never"/
+            // "always" in the word "affirmative" — none match, so it returns Neutral,
+            // making opposes() always false and silently disabling all contradiction detection.
+            let new_pol = Polarity::from_stored(&new_polarity_str);
+            let other_pol = Polarity::from_stored(&other_polarity_str);
+            if !new_pol.opposes(&other_pol) {
+                continue;
+            }
+
+            contradictions.push((other_id, o_imp, o_conf, o_ev, o_created));
+        }
+
+        if contradictions.is_empty() {
+            return Ok(());
+        }
+
+        drop(stmt);
+
+        let rec_new = recency_bonus(created_at, now);
+        let q_new = 0.45 * imp + 0.25 * conf + 0.20 * rec_new + 0.10 * ev;
+
+        for (other_id, o_imp, o_conf, o_ev, o_created) in contradictions {
             let rec_old = recency_bonus(o_created, now);
-            let q_new = 0.45 * imp + 0.25 * conf + 0.20 * rec_new + 0.10 * ev;
             let q_old = 0.45 * o_imp + 0.25 * o_conf + 0.20 * rec_old + 0.10 * o_ev;
 
-            if q_new >= q_old {
-                let _ = self.conn.execute(
-                    "UPDATE memories SET superseded_by = ?1, archived = 1 WHERE id = ?2",
-                    params![new_id, other_id],
-                );
+            let (winner_id, loser_id) = if q_new >= q_old {
+                (id, other_id)
             } else {
-                let _ = self.conn.execute(
-                    "UPDATE memories SET superseded_by = ?1, archived = 1 WHERE id = ?2",
-                    params![other_id, new_id],
-                );
-            }
+                (other_id, id)
+            };
+
+            let group = winner_id.to_string();
+            inner.conn.execute(
+                "UPDATE memories SET superseded_by = ?1, archived = 1, contradiction_group = ?2
+                 WHERE id = ?3",
+                params![winner_id, group, loser_id],
+            )?;
+            // Do NOT set contradiction_group on the winner. The loser already points to the
+            // winner via superseded_by. Setting contradiction_group on the winner would put
+            // it into the weak-group deduplication filter in search(), which suppresses
+            // memories whose best-survivor trust < 0.40 — incorrectly hiding the winner.
+            inner.remove_from_cache(loser_id);
+            log::debug!(
+                "contradiction resolved: winner={winner_id} loser={loser_id} group={group}"
+            );
         }
 
         Ok(())
     }
 
     pub fn maintenance_pass(&self) -> Result<()> {
-        self.conn.execute_batch(
+        let mut inner = self.lock()?;
+
+        inner.conn.execute_batch(
             "UPDATE memories
              SET archived = 1
              WHERE superseded_by IS NOT NULL
-               AND archived = 0;
+               AND archived = 0;",
+        )?;
 
-             DELETE FROM memories
+        let mut stmt = inner.conn.prepare(
+            "SELECT id FROM memories
              WHERE archived = 1
-               AND (strftime('%s', 'now') - created_at) > 7 * 86400;
-
-             DELETE FROM memories
+               AND (strftime('%s', 'now') - created_at) > 7 * 86400
+             UNION ALL
+             SELECT id FROM memories
              WHERE archived = 0
                AND superseded_by IS NULL
                AND reinforcement_count = 0
                AND importance_base < 0.12
-               AND (strftime('%s', 'now') - created_at) > 30 * 86400;",
+               AND (strftime('%s', 'now') - created_at) > 30 * 86400",
         )?;
+        let to_delete: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        for del_id in to_delete {
+            inner.conn.execute("DELETE FROM memories WHERE id = ?1", params![del_id])?;
+            inner.remove_from_cache(del_id);
+        }
+
         Ok(())
     }
 
-    /// Return every stored memory ordered by insertion time descending.
-    /// Score is set to 1.0 as a sentinel (no query was made).
     pub fn all(&self) -> Result<Vec<Memory>> {
-        let now: i64 =
-            self.conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
+        let inner = self.lock()?;
+        let now: i64 = inner
+            .conn
+            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = inner.conn.prepare(
             "SELECT id, content, created_at,
                     importance_base, reinforcement_count, confidence,
                     store_state, contradiction_group,
@@ -722,6 +937,7 @@ impl Store {
              FROM memories ORDER BY created_at DESC",
         )?;
 
+        let config = &self.config;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -739,24 +955,15 @@ impl Store {
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(
-                    id,
-                    content,
-                    created_at,
-                    imp,
-                    rc,
-                    conf,
-                    state,
-                    cg,
-                    failure_count,
-                    trust_ema_stored,
-                )| {
+                |(id, content, created_at, imp, rc, conf, state, cg, failure_count, trust_ema_stored)| {
                     let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
                     let contradiction_survived = cg.is_some() && state == "active";
-                    let trust_computed =
-                        compute_trust(rc, contradiction_survived, &state, imp, conf, age_days);
+                    let trust_computed = compute_trust(
+                        rc, contradiction_survived, &state, imp, conf, age_days, config,
+                    );
+                    let w = config.ema_new_weight;
                     let trust = match trust_ema_stored {
-                        Some(ema) => (0.7 * ema + 0.3 * trust_computed).clamp(0.0, 1.0),
+                        Some(ema) => ((1.0 - w) * ema + w * trust_computed).clamp(0.0, 1.0),
                         None => trust_computed,
                     };
                     let rc_f = rc as f32;
@@ -779,20 +986,33 @@ impl Store {
     }
 
     pub fn forget(&self, id: i64) -> Result<bool> {
-        let rows = self
+        let mut inner = self.lock()?;
+        let rows = inner
             .conn
             .execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        if rows > 0 {
+            inner.remove_from_cache(id);
+        }
         Ok(rows > 0)
     }
 
     pub fn count(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?)
+        let inner = self.lock()?;
+        Ok(inner.conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE archived = 0",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn clear(&self) -> Result<()> {
-        self.conn.execute_batch("DELETE FROM memories;")?;
+        let mut inner = self.lock()?;
+        inner.conn.execute_batch("DELETE FROM memories;")?;
+        inner.embedding_cache.clear();
+        inner.embedding_cache_loaded = true; // empty store is coherent — no load needed
+        inner.fingerprints.clear();
+        inner.hnsw = None;
+        inner.hnsw_dirty = false;
         Ok(())
     }
 
@@ -927,6 +1147,37 @@ mod tests {
         store.insert("beta", &[0.0_f32, 1.0]).unwrap();
         let all = store.all().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_contradiction_resolution_with_polarity() {
+        // Use identical embeddings (cosine = 1.0 > 0.80 threshold) to test the
+        // contradiction pipeline deterministically, independent of ONNX model output.
+        // This specifically validates the Polarity::from_stored fix: if detect_polarity
+        // were called on the stored polarity string instead, it would return Neutral
+        // for both and opposes() would always be false, archiving nothing.
+        let store = Store::in_memory().unwrap();
+        let emb = [0.577_f32, 0.577, 0.577]; // normalised, cosine(emb, emb) = 1.0
+
+        let mut meta1 = QualityMeta::default_active("never use floats");
+        meta1.claim_value = Some("negative".to_string());
+        let _id1 = store
+            .insert_with_quality("never use floats", &emb, &meta1)
+            .unwrap();
+
+        let mut meta2 = QualityMeta::default_active("always use floats");
+        meta2.claim_value = Some("affirmative".to_string());
+        let id2 = store
+            .insert_with_quality("always use floats", &emb, &meta2)
+            .unwrap();
+
+        store.resolve_contradictions_for_id(id2).unwrap();
+
+        assert_eq!(
+            store.count().unwrap(),
+            1,
+            "contradiction resolution must archive the loser"
+        );
     }
 
     #[test]
