@@ -81,21 +81,21 @@ impl Memoire {
     }
 
     fn compute_prototypes(embedder: &dyn EmbedProvider) -> ScoringPrototypes {
-        let consequence_sents = vec![
+        let consequence_sents = [
             "Critical security breach in production database exposing user data".to_string(),
             "System outage caused data loss for all users".to_string(),
             "Race condition in payment processing leads to double charges".to_string(),
             "Authentication bypass vulnerability allows unauthorized access".to_string(),
             "Production database corrupted during migration".to_string(),
         ];
-        let actionability_sents = vec![
+        let actionability_sents = [
             "Fixed the bug by replacing the function with the corrected version".to_string(),
             "Replaced deprecated API call with the new stable endpoint".to_string(),
             "Patched the vulnerability by updating the dependency to latest version".to_string(),
             "Refactored the module to remove dead code and reduce coupling".to_string(),
             "Disabled the feature flag after rollback to restore stable behavior".to_string(),
         ];
-        let reusability_sents = vec![
+        let reusability_sents = [
             "Always use Decimal for financial calculations never use float".to_string(),
             "Never store passwords in plain text always hash with bcrypt".to_string(),
             "API rate limit policy must enforce maximum requests per hour".to_string(),
