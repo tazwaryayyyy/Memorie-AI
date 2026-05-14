@@ -254,10 +254,11 @@ fn test_semantic_contradiction_detection() {
     );
 
     // Recall must still work and return valid scores
-    let results = mem
-        .recall("authentication token cache storage", 5)
-        .unwrap();
-    assert!(!results.is_empty(), "at least one memory must be recallable");
+    let results = mem.recall("authentication token cache storage", 5).unwrap();
+    assert!(
+        !results.is_empty(),
+        "at least one memory must be recallable"
+    );
     for m in &results {
         assert!(
             (0.0..=1.0).contains(&m.score),
