@@ -105,9 +105,7 @@ impl StoreInner {
             "SELECT id, embedding FROM memories
              WHERE archived = 0 AND superseded_by IS NULL",
         )?;
-        for row in stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })? {
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))? {
             if let Ok((id, blob)) = row {
                 if let Some(emb) = blob_to_vec(&blob) {
                     self.embedding_cache.push((id, emb));
@@ -254,8 +252,7 @@ fn search_candidates(
         .iter()
         .map(|(id, emb)| (*id, cosine_similarity(query_vec, emb)))
         .collect();
-    candidates
-        .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     candidates.truncate(top_k * 2);
     candidates
 }
@@ -332,7 +329,7 @@ impl Store {
             return Ok(false);
         }
 
-        let mut inner = self.lock()?;
+        let inner = self.lock()?;
         let row = inner.conn.query_row(
             "SELECT content, embedding,
                     reinforcement_count, confidence, importance_base,
@@ -356,18 +353,32 @@ impl Store {
             },
         );
 
-        let (content, mem_blob, rc, conf, imp, created_at, store_state, cg, failure_count, trust_ema_stored) =
-            match row {
-                Ok(v) => v,
-                Err(_) => return Ok(false),
-            };
+        let (
+            content,
+            mem_blob,
+            rc,
+            conf,
+            imp,
+            created_at,
+            store_state,
+            cg,
+            failure_count,
+            trust_ema_stored,
+        ) = match row {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
 
         // Path 1: Jaccard token overlap (threshold raised to config.jaccard_threshold)
         let memory_tokens: HashSet<&str> = content.split_whitespace().collect();
         let output_tokens: HashSet<&str> = agent_output.split_whitespace().collect();
         let intersection = memory_tokens.intersection(&output_tokens).count();
         let union = memory_tokens.union(&output_tokens).count();
-        let jaccard = if union > 0 { intersection as f32 / union as f32 } else { 0.0 };
+        let jaccard = if union > 0 {
+            intersection as f32 / union as f32
+        } else {
+            0.0
+        };
         let jaccard_ok = jaccard >= self.config.jaccard_threshold;
 
         // Path 2: cosine similarity
@@ -394,15 +405,22 @@ impl Store {
         } else {
             conf
         };
-        let now: i64 = inner
-            .conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                r.get(0)
-            })?;
+        let now: i64 =
+            inner
+                .conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
         let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
         let contradiction_survived = cg.is_some() && store_state == "active";
         let trust_after = compute_trust(
-            new_rc, contradiction_survived, &store_state, imp, new_conf, age_days, &self.config,
+            new_rc,
+            contradiction_survived,
+            &store_state,
+            imp,
+            new_conf,
+            age_days,
+            &self.config,
         );
         let w = self.config.ema_new_weight;
         let new_ema = match trust_ema_stored {
@@ -430,12 +448,13 @@ impl Store {
             return Ok(vec![]);
         }
         let severity = failure_severity.clamp(0.0, 1.0);
-        let mut inner = self.lock()?;
-        let now: i64 = inner
-            .conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                r.get(0)
-            })?;
+        let inner = self.lock()?;
+        let now: i64 =
+            inner
+                .conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
         let mut outcomes = Vec::with_capacity(memory_ids.len());
         for &id in memory_ids {
             let row = inner.conn.query_row(
@@ -457,15 +476,21 @@ impl Store {
                     ))
                 },
             );
-            let (rc, conf, imp, created_at, state, cg, failure_count, trust_ema_stored) =
-                match row {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+            let (rc, conf, imp, created_at, state, cg, failure_count, trust_ema_stored) = match row
+            {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
             let contradiction_survived = cg.is_some() && state == "active";
             let trust_before = compute_trust(
-                rc, contradiction_survived, &state, imp, conf, age_days, &self.config,
+                rc,
+                contradiction_survived,
+                &state,
+                imp,
+                conf,
+                age_days,
+                &self.config,
             );
 
             let new_rc = (rc - if severity > 0.0 { 1 } else { 0 }).max(0);
@@ -603,11 +628,12 @@ impl Store {
 
         let candidates = search_candidates(&mut inner, query_vec, top_k, &self.config);
 
-        let now: i64 = inner
-            .conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                r.get(0)
-            })?;
+        let now: i64 =
+            inner
+                .conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
 
         let mut scored: Vec<(f32, f32, Option<String>, Memory)> = Vec::new();
         for (id, sim) in &candidates {
@@ -637,8 +663,15 @@ impl Store {
                 },
             );
             let (
-                content, created_at, importance_base, reinforcement_count, confidence,
-                store_state, contradiction_group, failure_count, trust_ema_stored,
+                content,
+                created_at,
+                importance_base,
+                reinforcement_count,
+                confidence,
+                store_state,
+                contradiction_group,
+                failure_count,
+                trust_ema_stored,
             ) = match row {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -648,8 +681,7 @@ impl Store {
             let weight = effective_weight(importance_base, age_days, reinforcement_count);
             let final_score = 0.75 * sim + 0.20 * weight + 0.05 * recency_bonus(created_at, now);
 
-            let contradiction_survived =
-                contradiction_group.is_some() && store_state == "active";
+            let contradiction_survived = contradiction_group.is_some() && store_state == "active";
             let trust_base = compute_trust(
                 reinforcement_count,
                 contradiction_survived,
@@ -678,7 +710,7 @@ impl Store {
                 Memory {
                     id: *id,
                     content,
-                    score: final_score,
+                    score: final_score.clamp(0.0, 1.0),
                     trust,
                     uncertainty,
                     state: store_state,
@@ -687,9 +719,7 @@ impl Store {
             ));
         }
 
-        scored.sort_unstable_by(|a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut group_winner: HashMap<String, usize> = HashMap::new();
         for (idx, (_, trust, cg_opt, _)) in scored.iter().enumerate() {
@@ -714,7 +744,10 @@ impl Store {
                     if weak_groups.contains(cg) {
                         return false;
                     }
-                    group_winner.get(cg).map(|best| best == idx).unwrap_or(false)
+                    group_winner
+                        .get(cg)
+                        .map(|best| best == idx)
+                        .unwrap_or(false)
                 } else {
                     true
                 }
@@ -779,17 +812,18 @@ impl Store {
             None => return Ok(()),
         };
 
-        let new_polarity_str = stored_polarity
-            .unwrap_or_else(|| detect_polarity(&new_content).as_str().to_string());
+        let new_polarity_str =
+            stored_polarity.unwrap_or_else(|| detect_polarity(&new_content).as_str().to_string());
         if new_polarity_str == "neutral" {
             return Ok(());
         }
 
-        let now: i64 = inner
-            .conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                r.get(0)
-            })?;
+        let now: i64 =
+            inner
+                .conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
 
         let mut stmt = inner.conn.prepare(
             "SELECT id, content, embedding, importance_base, confidence, evidence, created_at, claim_value
@@ -813,7 +847,16 @@ impl Store {
                 r.get::<_, Option<String>>(7)?,
             ))
         })? {
-            let (other_id, other_content, other_blob, o_imp, o_conf, o_ev, o_created, other_polarity_opt) = match row {
+            let (
+                other_id,
+                other_content,
+                other_blob,
+                o_imp,
+                o_conf,
+                o_ev,
+                o_created,
+                other_polarity_opt,
+            ) = match row {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -914,7 +957,9 @@ impl Store {
         drop(stmt);
 
         for del_id in to_delete {
-            inner.conn.execute("DELETE FROM memories WHERE id = ?1", params![del_id])?;
+            inner
+                .conn
+                .execute("DELETE FROM memories WHERE id = ?1", params![del_id])?;
             inner.remove_from_cache(del_id);
         }
 
@@ -923,11 +968,12 @@ impl Store {
 
     pub fn all(&self) -> Result<Vec<Memory>> {
         let inner = self.lock()?;
-        let now: i64 = inner
-            .conn
-            .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                r.get(0)
-            })?;
+        let now: i64 =
+            inner
+                .conn
+                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                    r.get(0)
+                })?;
 
         let mut stmt = inner.conn.prepare(
             "SELECT id, content, created_at,
@@ -955,11 +1001,28 @@ impl Store {
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(id, content, created_at, imp, rc, conf, state, cg, failure_count, trust_ema_stored)| {
+                |(
+                    id,
+                    content,
+                    created_at,
+                    imp,
+                    rc,
+                    conf,
+                    state,
+                    cg,
+                    failure_count,
+                    trust_ema_stored,
+                )| {
                     let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
                     let contradiction_survived = cg.is_some() && state == "active";
                     let trust_computed = compute_trust(
-                        rc, contradiction_survived, &state, imp, conf, age_days, config,
+                        rc,
+                        contradiction_survived,
+                        &state,
+                        imp,
+                        conf,
+                        age_days,
+                        config,
                     );
                     let w = config.ema_new_weight;
                     let trust = match trust_ema_stored {

@@ -179,11 +179,23 @@ pub fn detect_polarity(text: &str) -> Polarity {
     // Check multi-word tokens against the full normalised text (handles "do not", "must not").
     let neg_hits = NEGATIVE
         .iter()
-        .filter(|&&t| if t.contains(' ') { norm.contains(t) } else { words.contains(&t) })
+        .filter(|&&t| {
+            if t.contains(' ') {
+                norm.contains(t)
+            } else {
+                words.contains(&t)
+            }
+        })
         .count();
     let aff_hits = AFFIRMATIVE
         .iter()
-        .filter(|&&t| if t.contains(' ') { norm.contains(t) } else { words.contains(&t) })
+        .filter(|&&t| {
+            if t.contains(' ') {
+                norm.contains(t)
+            } else {
+                words.contains(&t)
+            }
+        })
         .count();
 
     if neg_hits > aff_hits {
@@ -377,16 +389,18 @@ pub fn extract_features(
     prototypes: &ScoringPrototypes,
     novelty: f32,
 ) -> QualityFeatures {
-    let (consequence, actionability, reusability) =
-        if prototypes.is_semantic && !prototypes.consequence.is_empty() && embedding.len() == prototypes.consequence.len() {
-            (
-                cosine_similarity(embedding, &prototypes.consequence).clamp(0.0, 1.0),
-                cosine_similarity(embedding, &prototypes.actionability).clamp(0.0, 1.0),
-                cosine_similarity(embedding, &prototypes.reusability).clamp(0.0, 1.0),
-            )
-        } else {
-            (0.5, 0.5, 0.5)
-        };
+    let (consequence, actionability, reusability) = if prototypes.is_semantic
+        && !prototypes.consequence.is_empty()
+        && embedding.len() == prototypes.consequence.len()
+    {
+        (
+            cosine_similarity(embedding, &prototypes.consequence).clamp(0.0, 1.0),
+            cosine_similarity(embedding, &prototypes.actionability).clamp(0.0, 1.0),
+            cosine_similarity(embedding, &prototypes.reusability).clamp(0.0, 1.0),
+        )
+    } else {
+        (0.5, 0.5, 0.5)
+    };
 
     // Evidence: high-precision structural signals that complement semantic scoring.
     // Presence of measurement data is a reliable indicator of empirical grounding.
@@ -402,12 +416,8 @@ pub fn extract_features(
         "tested",
         "verified",
     ];
-    let evidence_hits = evidence_terms
-        .iter()
-        .filter(|&&t| norm.contains(t))
-        .count() as f32;
-    let evidence =
-        (evidence_hits / 3.0 + if has_number { 0.15 } else { 0.0 }).clamp(0.0, 1.0);
+    let evidence_hits = evidence_terms.iter().filter(|&&t| norm.contains(t)).count() as f32;
+    let evidence = (evidence_hits / 3.0 + if has_number { 0.15 } else { 0.0 }).clamp(0.0, 1.0);
 
     QualityFeatures {
         actionability,
