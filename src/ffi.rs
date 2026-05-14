@@ -260,11 +260,31 @@ fn to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(ptr) }.to_str().ok()
 }
 
-fn mut_ref(handle: *mut MemoireHandle) -> Option<&'static mut Memoire> {
+/// Borrow the `Memoire` inside a handle for the duration of a call.
+///
+/// # Why `&'static` is sound here
+///
+/// The `'static` annotation is the standard Rust FFI idiom for "valid for this
+/// call, with lifetime guaranteed by the C caller."  There is no way to express
+/// "valid as long as the C side keeps the handle alive" in Rust's type system
+/// without `unsafe` + a static lifetime annotation.
+///
+/// This is safe because:
+/// 1. **Ownership**: `MemoireHandle` lives in a `Box` allocated by `memoire_new`
+///    and freed only by `memoire_free`. The reference cannot outlive the Box.
+/// 2. **No exclusive aliasing**: `Memoire` exposes no `&mut self` methods — all
+///    mutation flows through the `Mutex<StoreInner>` inside. A shared `&Memoire`
+///    is therefore safe to hold across concurrent FFI calls.
+/// 3. **No mutation through this reference**: we cast `*mut → &` (not `&mut`),
+///    which satisfies Rust's aliasing rules for the duration of the call.
+///
+/// The C contract required: callers must not call `memoire_free` while any other
+/// FFI function is executing on the same handle (same requirement as any C API).
+fn mut_ref(handle: *mut MemoireHandle) -> Option<&'static Memoire> {
     if handle.is_null() {
         return None;
     }
-    Some(unsafe { &mut (*handle).0 })
+    Some(unsafe { &(*handle).0 })
 }
 
 fn const_ref(handle: *const MemoireHandle) -> Option<&'static Memoire> {
