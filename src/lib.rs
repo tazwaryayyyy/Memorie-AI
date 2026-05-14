@@ -8,7 +8,10 @@ pub mod store;
 use chunker::{chunk_text, ChunkerConfig};
 use embedder::{EmbedProvider, Embedder};
 use error::{MemoireError, Result};
-use quality::{build_quality_meta, fingerprint, IngestDecision, ScoringConfig, ScoringPrototypes, ScoringWeights};
+use quality::{
+    build_quality_meta, fingerprint, IngestDecision, ScoringConfig, ScoringPrototypes,
+    ScoringWeights,
+};
 use store::{Memory, Store};
 
 /// The central Memoire instance.
@@ -124,14 +127,21 @@ impl Memoire {
                 let actionability = avg(&vecs[5..10]);
                 let reusability = avg(&vecs[10..15]);
                 let is_semantic = true;
-                ScoringPrototypes { consequence, actionability, reusability, is_semantic }
+                ScoringPrototypes {
+                    consequence,
+                    actionability,
+                    reusability,
+                    is_semantic,
+                }
             }
             Err(e) => {
                 log::warn!("compute_prototypes failed — falling back to neutral: {e}");
                 ScoringPrototypes::neutral(384)
             }
             Ok(_) => {
-                log::warn!("compute_prototypes returned unexpected count — falling back to neutral");
+                log::warn!(
+                    "compute_prototypes returned unexpected count — falling back to neutral"
+                );
                 ScoringPrototypes::neutral(384)
             }
         }
@@ -205,8 +215,14 @@ impl Memoire {
             }
             let max_sim = self.store.max_similarity(embedding)?;
             let novelty = (1.0 - max_sim).clamp(0.0, 1.0);
-            let (meta, decision) =
-                build_quality_meta(chunk, embedding, novelty, source_kind, &self.scoring_weights, &self.prototypes);
+            let (meta, decision) = build_quality_meta(
+                chunk,
+                embedding,
+                novelty,
+                source_kind,
+                &self.scoring_weights,
+                &self.prototypes,
+            );
 
             match decision {
                 IngestDecision::Reject => continue,
