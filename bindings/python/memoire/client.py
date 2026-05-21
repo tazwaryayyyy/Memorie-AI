@@ -89,7 +89,7 @@ def _load_lib() -> ctypes.CDLL:
 
     lib.memoire_recall.argtypes = [
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
-    lib.memoire_recall.restype = ctypes.c_char_p
+    lib.memoire_recall.restype = ctypes.c_void_p
 
     lib.memoire_forget.argtypes = [ctypes.c_void_p, ctypes.c_int64]
     lib.memoire_forget.restype = ctypes.c_int
@@ -100,7 +100,7 @@ def _load_lib() -> ctypes.CDLL:
     lib.memoire_clear.argtypes = [ctypes.c_void_p]
     lib.memoire_clear.restype = ctypes.c_int
 
-    lib.memoire_free_string.argtypes = [ctypes.c_char_p]
+    lib.memoire_free_string.argtypes = [ctypes.c_void_p]
     lib.memoire_free_string.restype = None
 
     lib.memoire_reinforce_if_used.argtypes = [
@@ -113,7 +113,7 @@ def _load_lib() -> ctypes.CDLL:
         ctypes.c_int,
         ctypes.c_float,
     ]
-    lib.memoire_penalize_if_used.restype = ctypes.c_char_p
+    lib.memoire_penalize_if_used.restype = ctypes.c_void_p
 
     lib.memoire_resolve_contradictions.argtypes = [ctypes.c_void_p, ctypes.c_int64]
     lib.memoire_resolve_contradictions.restype = ctypes.c_int
@@ -230,7 +230,8 @@ class Memoire:
             raise MemoireError("recall() failed internally")
 
         try:
-            data = json.loads(raw.decode("utf-8"))
+            raw_bytes = ctypes.string_at(raw)
+            data = json.loads(raw_bytes.decode("utf-8"))
         finally:
             self._lib.memoire_free_string(raw)
 
@@ -313,7 +314,8 @@ class Memoire:
         if not raw:
             raise MemoireError("penalize_if_used failed internally")
         try:
-            return json.loads(raw.decode("utf-8"))
+            raw_bytes = ctypes.string_at(raw)
+            return json.loads(raw_bytes.decode("utf-8"))
         finally:
             self._lib.memoire_free_string(raw)
 
