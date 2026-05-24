@@ -7,10 +7,14 @@
 *.dylib
 *.dll
 .fastembed_cache/
+.pytest_cache/
+pytest-cache-files-*/
 __pycache__/
 *.egg-info/
 .venv/
 venv/
 mcp-server/venv/
+mcp-server/target/
 mcp-server/__pycache__/
 dump.py
+rustup-init.exe

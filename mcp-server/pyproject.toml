@@ -1,15 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "memoire-mcp"
 version = "0.1.0"
 description = "MCP Server for the Memoire semantic memory engine"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "mcp[cli]==1.27.1",
     "memoire",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
 ]
 
 [project.scripts]
 memoire-mcp = "server:main"
 
+[tool.setuptools]
+py-modules = ["server"]
+
 [tool.uv.sources]
 memoire = { path = "../bindings/python", editable = true }
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
+testpaths = ["tests"]
