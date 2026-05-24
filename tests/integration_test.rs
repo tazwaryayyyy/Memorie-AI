@@ -1,11 +1,76 @@
-use memoire::Memoire;
+use memoire::{embedder::EmbedProvider, Memoire};
 use std::sync::Arc;
 
 // Verify polarity detection is real logic, not random floats.
 // Imported directly from the public quality module.
 use memoire::quality::{detect_polarity, Polarity};
+
+struct TestEmbedder;
+
+impl TestEmbedder {
+    const DIM: usize = 384;
+
+    fn tokenize(text: &str) -> Vec<String> {
+        let mut tokens: Vec<String> = text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter_map(|raw| {
+                let token = raw.to_ascii_lowercase();
+                let normalized = match token.as_str() {
+                    "auth" => "authentication".to_string(),
+                    "inputs" => "input".to_string(),
+                    "tokens" => "token".to_string(),
+                    "queries" => "query".to_string(),
+                    "calculations" => "calculation".to_string(),
+                    "always" | "never" | "do" | "not" | "must" | "should" | "for" | "in"
+                    | "the" | "a" | "an" | "to" | "of" | "and" | "or" | "under" | "any" | "all"
+                    | "by" | "with" => return None,
+                    _ => token,
+                };
+                Some(normalized)
+            })
+            .collect();
+
+        if tokens.is_empty() {
+            tokens.push(text.to_ascii_lowercase());
+        }
+        tokens
+    }
+
+    fn hash(token: &str) -> usize {
+        token.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        }) as usize
+    }
+
+    fn embed_text(text: &str) -> Vec<f32> {
+        let mut vector = vec![0.0_f32; Self::DIM];
+        for token in Self::tokenize(text) {
+            vector[Self::hash(&token) % Self::DIM] += 1.0;
+        }
+
+        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut vector {
+                *value /= norm;
+            }
+        }
+        vector
+    }
+}
+
+impl EmbedProvider for TestEmbedder {
+    fn embed(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|text| Self::embed_text(text)).collect())
+    }
+
+    fn dim(&self) -> usize {
+        Self::DIM
+    }
+}
+
 fn m() -> Memoire {
-    Memoire::in_memory().expect("failed to create in-memory Memoire")
+    Memoire::in_memory_with_embedder(Box::new(TestEmbedder))
+        .expect("failed to create in-memory Memoire")
 }
 
 #[test]
@@ -111,7 +176,7 @@ fn test_long_input_is_chunked() {
 
 #[test]
 fn test_concurrent_remember_recall() {
-    let mem = Arc::new(Memoire::in_memory().expect("in_memory"));
+    let mem = Arc::new(m());
     let mut handles = Vec::new();
     for t in 0..10 {
         let m = Arc::clone(&mem);
@@ -138,7 +203,7 @@ fn test_concurrent_remember_recall() {
 #[test]
 fn test_fingerprint_stability() {
     let content = "Always use parameterized queries to prevent SQL injection";
-    let mem = Memoire::in_memory().unwrap();
+    let mem = m();
     let ids1 = mem.remember(content).unwrap();
     assert!(!ids1.is_empty(), "first insert should succeed");
     // Second insert of identical content must be deduplicated by BLAKE3 fingerprint
@@ -157,7 +222,7 @@ fn test_fingerprint_stability() {
 
 #[test]
 fn test_reinforcement_gate_rejects_low_overlap() {
-    let mem = Memoire::in_memory().unwrap();
+    let mem = m();
     let ids = mem
         .remember("Always use Decimal for financial calculations, never float")
         .unwrap();
@@ -228,7 +293,7 @@ fn test_semantic_contradiction_detection() {
     assert_eq!(Polarity::from_stored(""), Polarity::Neutral);
 
     // ── Part 3: end-to-end contradiction resolution pipeline ─────────────────
-    let mem = Memoire::in_memory().unwrap();
+    let mem = m();
 
     // Near-paraphrase pair: differ only in polarity word, share all other tokens.
     // MiniLM cosine similarity for such pairs is typically ≥ 0.90, well above the 0.80 gate.
