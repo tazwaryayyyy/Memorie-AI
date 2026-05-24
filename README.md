@@ -274,6 +274,7 @@ export HF_HOME=/path/to/huggingface/cache
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [FFI guide](docs/FFI_GUIDE.md)
+- [Release guide](docs/RELEASE.md)
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 

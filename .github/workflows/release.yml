@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  native-artifacts:
+    name: Native artifact (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            lib: libmemoire.so
+            artifact: memoire-linux-x86_64
+          - os: macos-latest
+            lib: libmemoire.dylib
+            artifact: memoire-macos
+          - os: windows-latest
+            lib: memoire.dll
+            artifact: memoire-windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release library
+        run: cargo build --release
+
+      - name: Package native artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item "target/release/${{ matrix.lib }}" "dist/package/${{ matrix.lib }}"
+          Copy-Item "README.md" "dist/package/README.md"
+          Copy-Item "LICENSE" "dist/package/LICENSE"
+          Copy-Item "include/memoire.h" "dist/package/memoire.h"
+          Copy-Item "docs/RELEASE.md" "dist/package/RELEASE.md"
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/${{ matrix.artifact }}-${{ github.ref_name }}.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-${{ github.ref_name }}
+          path: dist/*.zip
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip

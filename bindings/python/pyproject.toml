@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "memoire"
 version = "0.1.0"
 description = "Local-first semantic memory engine for AI coding agents"
+readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 keywords = ["ai", "memory", "embeddings", "semantic-search", "llm", "agents"]
@@ -25,9 +26,10 @@ classifiers = [
 dev = ["pytest>=7", "pytest-cov"]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/memoire"
-Repository = "https://github.com/yourusername/memoire"
-Issues = "https://github.com/yourusername/memoire/issues"
+Homepage = "https://github.com/tazwaryayyyy/Memorie-AI"
+Repository = "https://github.com/tazwaryayyyy/Memorie-AI"
+Issues = "https://github.com/tazwaryayyyy/Memorie-AI/issues"
+Changelog = "https://github.com/tazwaryayyyy/Memorie-AI/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]

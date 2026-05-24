@@ -4,9 +4,22 @@ version = "0.1.0"
 edition = "2021"
 description = "A local-first, embeddable long-term memory engine for AI coding agents"
 license = "MIT"
-repository = "https://github.com/yourusername/memoire"
+repository = "https://github.com/tazwaryayyyy/Memorie-AI"
+homepage = "https://github.com/tazwaryayyyy/Memorie-AI"
+readme = "README.md"
 keywords = ["ai", "memory", "embeddings", "sqlite", "ffi"]
 categories = ["database", "science::ml"]
+include = [
+    "/src/**",
+    "/examples/basic_usage.rs",
+    "/benches/**",
+    "/include/memoire.h",
+    "/README.md",
+    "/LICENSE",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/build.rs",
+]
 
 [lib]
 name = "memoire"

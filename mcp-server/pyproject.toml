@@ -6,10 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "memoire-mcp"
 version = "0.1.0"
 description = "MCP Server for the Memoire semantic memory engine"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]==1.27.1",
-    "memoire",
+    "memoire==0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +21,12 @@ dev = [
 
 [project.scripts]
 memoire-mcp = "server:main"
+
+[project.urls]
+Homepage = "https://github.com/tazwaryayyyy/Memorie-AI"
+Repository = "https://github.com/tazwaryayyyy/Memorie-AI"
+Issues = "https://github.com/tazwaryayyyy/Memorie-AI/issues"
+Changelog = "https://github.com/tazwaryayyyy/Memorie-AI/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 py-modules = ["server"]
