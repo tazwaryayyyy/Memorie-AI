@@ -76,3 +76,27 @@ jobs:
       - name: Check exported symbols
         run: |
           nm -D target/release/libmemoire.so | grep memoire_
+
+  mcp-server:
+    name: MCP server smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install locked MCP environment
+        working-directory: mcp-server
+        run: uv sync --locked --extra dev
+
+      - name: Compile MCP server
+        working-directory: mcp-server
+        run: uv run python -m py_compile server.py tests/test_server.py
+
+      - name: Run MCP server tests
+        working-directory: mcp-server
+        run: uv run pytest
