@@ -47,6 +47,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Check crate package contents
+        run: cargo package --list
+
       - name: Build (debug)
         run: cargo build --all-targets
 
@@ -100,3 +103,36 @@ jobs:
       - name: Run MCP server tests
         working-directory: mcp-server
         run: uv run pytest
+
+  package-smoke:
+    name: Clean package install smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build native library
+        run: cargo build --release
+
+      - name: Install packages in clean venv
+        run: |
+          python -m venv /tmp/memoire-smoke
+          . /tmp/memoire-smoke/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install ./bindings/python
+          python -m pip install "mcp[cli]==1.27.1"
+          python -m pip install --no-deps ./mcp-server
+
+      - name: Verify native discovery and MCP health
+        env:
+          MEMOIRE_LIB: ${{ github.workspace }}/target/release/libmemoire.so
+        run: |
+          . /tmp/memoire-smoke/bin/activate
+          python -c "from memoire.client import _get_lib; print(_get_lib())"
+          python -c "import memoire; print(memoire.__version__)"
+          python -c "import server; health = server.startup_health_check(); print(health); assert health['ok']"

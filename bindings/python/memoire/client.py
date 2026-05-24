@@ -41,10 +41,12 @@ class Memory:
 
 def _find_lib() -> str:
     """Search for the compiled shared library."""
-    # Allow override via environment variable
     env = os.environ.get("MEMOIRE_LIB")
     if env:
-        return env
+        path = Path(env)
+        if path.exists():
+            return str(path)
+        raise MemoireError(f"MEMOIRE_LIB is set but does not exist: {env}")
 
     names = {
         "linux":  "libmemoire.so",
@@ -56,9 +58,22 @@ def _find_lib() -> str:
     if lib_name is None:
         raise MemoireError(f"Unsupported platform: {platform!r}")
 
-    # Walk up from this file to find the repo root and the Cargo output
+    memoire_home = os.environ.get("MEMOIRE_HOME")
+    home_candidates = []
+    if memoire_home:
+        home = Path(memoire_home)
+        home_candidates = [
+            home / lib_name,
+            home / "lib" / lib_name,
+            home / "target" / "release" / lib_name,
+        ]
+
+    # Walk up from this file to find the repo root and the Cargo output.
+    # Installed packages should usually use MEMOIRE_LIB or MEMOIRE_HOME; these
+    # candidates keep source-tree development ergonomic.
     repo_root = Path(__file__).parent.parent.parent.parent
     candidates = [
+        *home_candidates,
         repo_root / "target" / "release" / lib_name,
         repo_root / "target" / "debug" / lib_name,
         Path(__file__).parent / lib_name,  # installed alongside the package
@@ -70,8 +85,9 @@ def _find_lib() -> str:
 
     raise MemoireError(
         f"Could not find {lib_name}.\n"
-        "Build it first:  cargo build --release\n"
-        f"Or set MEMOIRE_LIB=/full/path/to/{lib_name}"
+        "Build it first with `cargo build --release`, download the matching "
+        "GitHub Release native-library artifact, or set "
+        f"MEMOIRE_LIB=/full/path/to/{lib_name}."
     )
 
 
