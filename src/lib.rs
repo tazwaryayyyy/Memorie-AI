@@ -152,6 +152,15 @@ impl Memoire {
         let _ = env_logger::try_init();
         let embedder: Box<dyn EmbedProvider> =
             Box::new(Embedder::new().map_err(MemoireError::Embedding)?);
+        Self::in_memory_with_embedder(embedder)
+    }
+
+    /// In-memory store with a custom embedding backend.
+    ///
+    /// This is useful for deterministic tests and for callers that want an
+    /// ephemeral store without initialising the default ONNX model.
+    pub fn in_memory_with_embedder(embedder: Box<dyn EmbedProvider>) -> Result<Self> {
+        let _ = env_logger::try_init();
         let prototypes = Self::compute_prototypes(&*embedder);
         Ok(Self {
             store: Store::in_memory_with_config(ScoringConfig::default())?,
