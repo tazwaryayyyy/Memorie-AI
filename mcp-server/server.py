@@ -13,12 +13,46 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "b
 from memoire import Memoire
 from memoire.client import _get_lib
 
-logging.basicConfig(
-    level=os.environ.get("MEMOIRE_LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    stream=sys.stderr,
-)
+import json
+from pathlib import Path
+
+# Setup structured logging
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_data = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%fZ"),
+            "level": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            log_data["exception"] = self.formatException(record.exc_info)
+        for key, val in record.__dict__.items():
+            if key not in {"args", "asctime", "created", "exc_info", "exc_text", "filename", "funcName", "levelname", "levelno", "lineno", "module", "msecs", "msg", "name", "pathname", "process", "processName", "relativeCreated", "stack_info", "thread", "threadName"}:
+                log_data[key] = val
+        return json.dumps(log_data)
+
 logger = logging.getLogger("memoire.mcp")
+logger.setLevel(os.environ.get("MEMOIRE_LOG_LEVEL", "INFO"))
+
+# Console handler logging raw messages to stderr for immediate agent visibility
+console_handler = logging.StreamHandler(sys.stderr)
+console_formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
+logger.propagate = False
+
+# File handler logging structured JSON lines under user directory
+try:
+    log_dir = Path.home() / ".memoire" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "mcp-server.jsonl"
+    
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(JsonFormatter())
+    logger.addHandler(file_handler)
+except Exception as _exc:
+    logger.warning("Could not initialize file logging: %r", _exc)
 
 # Initialize FastMCP server
 mcp = FastMCP("Memoire MCP Server")
