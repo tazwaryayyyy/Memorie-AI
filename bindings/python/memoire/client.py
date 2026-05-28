@@ -7,6 +7,7 @@ import ctypes
 import json
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -137,13 +138,16 @@ def _load_lib() -> ctypes.CDLL:
     return lib
 
 
-_lib_cache: list = []
+_local_storage = threading.local()
 
 
 def _get_lib() -> ctypes.CDLL:
-    if not _lib_cache:
-        _lib_cache.append(_load_lib())
-    return _lib_cache[0]
+    """Thread-local and fork-safe CDLL loader."""
+    pid = os.getpid()
+    if not hasattr(_local_storage, "lib") or getattr(_local_storage, "pid", None) != pid:
+        _local_storage.lib = _load_lib()
+        _local_storage.pid = pid
+    return _local_storage.lib
 
 
 # ─── Main class ───────────────────────────────────────────────────────────────
