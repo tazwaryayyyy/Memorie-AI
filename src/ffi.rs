@@ -15,24 +15,41 @@ pub struct MemoireHandle(Memoire);
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
-/// Create a new Memoire instance at `db_path`.
+/// Create a new Memoire instance at `db_path` in the default namespace.
 /// Pass `":memory:"` for an ephemeral in-memory store.
 /// Returns NULL on failure.
 #[no_mangle]
 pub extern "C" fn memoire_new(db_path: *const c_char) -> *mut MemoireHandle {
+    memoire_new_ns(db_path, ptr::null())
+}
+
+/// Create a new Memoire instance scoped to `namespace`.
+///
+/// `namespace` may be NULL, in which case `"default"` is used.
+/// Multiple handles sharing the same `db_path` but different namespaces
+/// are fully isolated — recall from one namespace never surfaces memories
+/// written by another.
+///
+/// Returns NULL on failure.
+#[no_mangle]
+pub extern "C" fn memoire_new_ns(
+    db_path: *const c_char,
+    namespace: *const c_char,
+) -> *mut MemoireHandle {
     let path = match to_str(db_path) {
         Some(s) => s,
         None => return ptr::null_mut(),
     };
+    let ns = to_str(namespace).unwrap_or("default");
     let instance = if path == ":memory:" {
-        Memoire::in_memory()
+        Memoire::in_memory_ns(ns)
     } else {
-        Memoire::new(path)
+        Memoire::new_ns(path, ns)
     };
     match instance {
         Ok(m) => Box::into_raw(Box::new(MemoireHandle(m))),
         Err(e) => {
-            log::error!("memoire_new failed: {e}");
+            log::error!("memoire_new_ns failed: {e}");
             ptr::null_mut()
         }
     }
