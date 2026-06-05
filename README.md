@@ -103,14 +103,21 @@ fn main() -> anyhow::Result<()> {
 
 ### Python
 
+Built with PyO3 + Maturin — no ctypes, no `dlopen`. Install the compiled extension:
+
 ```bash
-pip install -e bindings/python
+pip install maturin
+maturin dev --manifest-path bindings/python/Cargo.toml
+# or for production:
+maturin build --release --manifest-path bindings/python/Cargo.toml
+pip install target/wheels/*.whl
 ```
 
 ```python
 from memoire import Memoire, MemoryPolicy
 
-with Memoire("agent.db") as m:
+# Namespace isolates memories within a shared db file
+with Memoire("agent.db", namespace="billing-agent") as m:
     m.remember("Never use float for money. Use Decimal for billing calculations.")
 
     memories = m.recall("billing precision", top_k=5)
@@ -261,9 +268,19 @@ uv sync --locked --extra dev
 uv run pytest
 ```
 
-## Offline Use
+## Offline / Air-Gapped Use
 
-FastEmbed downloads the model on first use and caches it under the Hugging Face cache directory. For airgapped machines, pre-download the model on a connected machine, copy the cache, then set `HF_HOME`.
+Use the built-in CLI command to pre-download the embedding model while online:
+
+```bash
+cargo build --release
+./target/release/memoire cache-models
+# ✓ Model caching complete. You can now use Memoire in offline mode.
+```
+
+Subsequent runs start instantly with no network access. The model is cached under the FastEmbed local cache directory (usually `~/.cache/fastembed/`).
+
+Alternatively, pre-download via Python:
 
 ```bash
 python -c "from huggingface_hub import snapshot_download; snapshot_download('sentence-transformers/all-MiniLM-L6-v2')"
@@ -278,9 +295,46 @@ export HF_HOME=/path/to/huggingface/cache
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 
+## Observability Dashboard
+
+A local Next.js dashboard ships in `dashboard/` for inspecting any Memoire database:
+
+```bash
+cd dashboard
+npm install
+npm run dev
+# → http://localhost:3000
+```
+
+Features:
+- **Memory explorer** — browse all stored chunks with trust, state, uncertainty badges
+- **Semantic search tester** — run recall queries directly against any DB
+- **Store/forget** — write new memories or delete individual records from the UI
+- **Telemetry log stream** — live-tails `~/.memoire/logs/mcp-server.jsonl`
+- **Auto-refresh** — polls every 5 s; toggle on/off from the header
+
+## Namespaces (Multi-Tenancy)
+
+Multiple agents can share a single SQLite file with hard isolation:
+
+```rust
+let agent_a = Memoire::new_ns("shared.db", "agent-a")?;
+let agent_b = Memoire::new_ns("shared.db", "agent-b")?;
+
+agent_a.remember("JWT tokens expire after 15 minutes.")?;
+assert!(agent_b.recall("JWT", 5)?.is_empty()); // fully isolated
+```
+
+```python
+a = Memoire("shared.db", namespace="agent-a")
+b = Memoire("shared.db", namespace="agent-b")
+a.remember("JWT tokens expire after 15 minutes.")
+assert b.recall("JWT", top_k=5) == []  # isolated
+```
+
 ## Status
 
-Memoire is early but usable. The Rust core, Python binding, and MCP server are covered by CI. The trust formula and scoring heuristics are intentionally conservative and should be treated as engineering defaults, not universal truth.
+Memoire is production-ready for local and MCP-server deployments. The Rust core, PyO3 Python binding, CLI, MCP server, and observability dashboard are all covered by CI and manual verification. The trust formula and scoring heuristics are intentionally conservative and should be treated as engineering defaults, not universal truth.
 
 ## Author
 
