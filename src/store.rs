@@ -38,6 +38,9 @@ pub struct PenaltyOutcome {
 pub struct Store {
     inner: Mutex<StoreInner>,
     pub config: ScoringConfig,
+    /// Namespace this store instance is scoped to. All reads/writes are filtered
+    /// by this value. Defaults to `"default"`. Set via `Store::open_ns()`.
+    pub namespace: String,
 }
 
 // StoreInner contains rusqlite::Connection which is Send but not Sync.
@@ -97,16 +100,18 @@ impl StoreInner {
     /// Fingerprints are loaded eagerly at construction; embeddings are deferred here
     /// to keep startup cost proportional to fingerprint count (small strings) rather
     /// than embedding count (1536 bytes × N).
-    fn ensure_embedding_cache(&mut self) -> crate::error::Result<()> {
+    fn ensure_embedding_cache(&mut self, namespace: &str) -> crate::error::Result<()> {
         if self.embedding_cache_loaded {
             return Ok(());
         }
         let mut stmt = self.conn.prepare(
             "SELECT id, embedding FROM memories
-             WHERE archived = 0 AND superseded_by IS NULL",
+             WHERE namespace = ?1 AND archived = 0 AND superseded_by IS NULL",
         )?;
         for (id, blob) in stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+            .query_map(rusqlite::params![namespace], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
             .flatten()
         {
             if let Some(emb) = blob_to_vec(&blob) {
@@ -116,8 +121,9 @@ impl StoreInner {
         self.embedding_cache_loaded = true;
         self.hnsw_dirty = !self.embedding_cache.is_empty();
         log::debug!(
-            "embedding cache loaded: {} vectors",
-            self.embedding_cache.len()
+            "embedding cache loaded: {} vectors (ns={})",
+            self.embedding_cache.len(),
+            namespace
         );
         Ok(())
     }
@@ -133,6 +139,7 @@ impl StoreInner {
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS memories (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        namespace   TEXT    NOT NULL DEFAULT 'default',
         content     TEXT    NOT NULL,
         embedding   BLOB    NOT NULL,
         created_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -163,6 +170,8 @@ const SCHEMA: &str = "
         ON memories (claim_key);
     CREATE INDEX IF NOT EXISTS idx_memories_store_state
         ON memories (store_state, archived, superseded_by);
+    CREATE INDEX IF NOT EXISTS idx_memories_namespace
+        ON memories (namespace, archived, superseded_by);
 ";
 
 pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
@@ -182,13 +191,13 @@ pub fn blob_to_vec(blob: &[u8]) -> Option<Vec<f32>> {
 
 /// Load only fingerprints at startup — O(n × 64 bytes) instead of O(n × 1536 bytes).
 /// Embedding vectors are loaded lazily on the first search via `StoreInner::ensure_embedding_cache`.
-fn load_fingerprints_from_db(conn: &Connection) -> Result<HashSet<String>> {
+fn load_fingerprints_from_db(conn: &Connection, namespace: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(
         "SELECT fingerprint FROM memories
-         WHERE archived = 0 AND superseded_by IS NULL AND fingerprint != ''",
+         WHERE namespace = ?1 AND archived = 0 AND superseded_by IS NULL AND fingerprint != ''",
     )?;
     let fingerprints: HashSet<String> = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+        .query_map(rusqlite::params![namespace], |r| r.get::<_, String>(0))?
         .filter_map(|r| r.ok())
         .collect();
     Ok(fingerprints)
@@ -264,19 +273,29 @@ impl Store {
     }
 
     pub fn open(path: &str) -> Result<Self> {
-        Self::open_with_config(path, ScoringConfig::default())
+        Self::open_ns(path, "default")
+    }
+
+    /// Open a store scoped to `namespace`. All reads/writes are isolated to that namespace.
+    /// Multiple agents sharing one SQLite file use different namespaces for hard isolation.
+    pub fn open_ns(path: &str, namespace: &str) -> Result<Self> {
+        Self::open_ns_with_config(path, namespace, ScoringConfig::default())
     }
 
     pub fn open_with_config(path: &str, config: ScoringConfig) -> Result<Self> {
+        Self::open_ns_with_config(path, "default", config)
+    }
+
+    pub fn open_ns_with_config(path: &str, namespace: &str, config: ScoringConfig) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
-        let fingerprints = load_fingerprints_from_db(&conn)?;
+        let fingerprints = load_fingerprints_from_db(&conn, namespace)?;
         log::debug!(
-            "SQLite store opened at {path}; {} fingerprints loaded (embeddings deferred)",
+            "SQLite store opened at {path} ns={namespace}; {} fingerprints loaded (embeddings deferred)",
             fingerprints.len()
         );
         Ok(Self {
@@ -289,6 +308,7 @@ impl Store {
                 hnsw_dirty: false,
             }),
             config,
+            namespace: namespace.to_string(),
         })
     }
 
@@ -296,7 +316,15 @@ impl Store {
         Self::in_memory_with_config(ScoringConfig::default())
     }
 
+    pub fn in_memory_ns(namespace: &str) -> Result<Self> {
+        Self::in_memory_ns_with_config(namespace, ScoringConfig::default())
+    }
+
     pub fn in_memory_with_config(config: ScoringConfig) -> Result<Self> {
+        Self::in_memory_ns_with_config("default", config)
+    }
+
+    pub fn in_memory_ns_with_config(namespace: &str, config: ScoringConfig) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
@@ -311,6 +339,7 @@ impl Store {
                 hnsw_dirty: false,
             }),
             config,
+            namespace: namespace.to_string(),
         })
     }
 
@@ -550,21 +579,22 @@ impl Store {
         let mut inner = self.lock()?;
         inner.conn.execute(
             "INSERT INTO memories (
-                content, embedding,
+                namespace, content, embedding,
                 importance_base, confidence, novelty,
                 actionability, evidence, consequence, reusability,
                 source_kind, store_state, reinforcement_count,
                 last_accessed_at, superseded_by, contradiction_group,
                 archived, effective_weight, fingerprint, claim_key, claim_value
             ) VALUES (
-                ?1, ?2,
-                ?3, ?4, ?5,
-                ?6, ?7, ?8, ?9,
-                ?10, ?11, ?12,
-                ?13, ?14, ?15,
-                ?16, ?17, ?18, ?19, ?20
+                ?1, ?2, ?3,
+                ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13,
+                ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20, ?21
             )",
             params![
+                self.namespace,
                 content,
                 blob,
                 quality.importance_base,
@@ -602,7 +632,8 @@ impl Store {
 
     pub fn max_similarity(&self, query_vec: &[f32]) -> Result<f32> {
         let mut inner = self.lock()?;
-        inner.ensure_embedding_cache()?;
+        let ns = self.namespace.clone();
+        inner.ensure_embedding_cache(&ns)?;
         let max_sim = inner
             .embedding_cache
             .iter()
@@ -622,7 +653,8 @@ impl Store {
         }
 
         let mut inner = self.lock()?;
-        inner.ensure_embedding_cache()?;
+        let ns = self.namespace.clone();
+        inner.ensure_embedding_cache(&ns)?;
         if inner.embedding_cache.is_empty() {
             return Ok(vec![]);
         }
@@ -645,10 +677,11 @@ impl Store {
                         failure_count, trust_ema
                  FROM memories
                  WHERE id = ?1
+                   AND namespace = ?2
                    AND archived = 0
                    AND superseded_by IS NULL
                    AND store_state IN ('active', 'shadow')",
-                params![id],
+                params![id, ns],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -785,11 +818,12 @@ impl Store {
     /// Applicable to any domain. Quality-weighted resolution preserved.
     pub fn resolve_contradictions_for_id(&self, id: i64) -> Result<()> {
         let mut inner = self.lock()?;
+        let ns = self.namespace.clone();
 
         let target_row = inner.conn.query_row(
             "SELECT content, embedding, importance_base, confidence, evidence, created_at, claim_value
-             FROM memories WHERE id = ?1 AND archived = 0",
-            params![id],
+             FROM memories WHERE id = ?1 AND namespace = ?2 AND archived = 0",
+            params![id, ns],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -830,13 +864,14 @@ impl Store {
             "SELECT id, content, embedding, importance_base, confidence, evidence, created_at, claim_value
              FROM memories
              WHERE id != ?1
+               AND namespace = ?2
                AND archived = 0
                AND superseded_by IS NULL
                AND store_state IN ('active', 'shadow')",
         )?;
 
         let mut contradictions: Vec<(i64, f32, f32, f32, i64)> = Vec::new();
-        for row in stmt.query_map(params![id], |r| {
+        for row in stmt.query_map(params![id, ns], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -969,6 +1004,7 @@ impl Store {
 
     pub fn all(&self) -> Result<Vec<Memory>> {
         let inner = self.lock()?;
+        let ns = &self.namespace;
         let now: i64 =
             inner
                 .conn
@@ -981,12 +1017,12 @@ impl Store {
                     importance_base, reinforcement_count, confidence,
                     store_state, contradiction_group,
                     failure_count, trust_ema
-             FROM memories ORDER BY created_at DESC",
+             FROM memories WHERE namespace = ?1 ORDER BY created_at DESC",
         )?;
 
         let config = &self.config;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params![ns], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1063,8 +1099,8 @@ impl Store {
     pub fn count(&self) -> Result<i64> {
         let inner = self.lock()?;
         Ok(inner.conn.query_row(
-            "SELECT COUNT(*) FROM memories WHERE archived = 0",
-            [],
+            "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND archived = 0",
+            rusqlite::params![self.namespace],
             |r| r.get(0),
         )?)
     }
@@ -1157,13 +1193,19 @@ impl Store {
         if !has("trust_ema") {
             alter.push("ALTER TABLE memories ADD COLUMN trust_ema REAL;");
         }
+        // Namespace column — added in v0.3.0. Existing rows get 'default'.
+        if !has("namespace") {
+            alter
+                .push("ALTER TABLE memories ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';");
+        }
 
         for sql in alter {
             conn.execute_batch(sql)?;
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_claim_key ON memories (claim_key);
-             CREATE INDEX IF NOT EXISTS idx_memories_store_state ON memories (store_state, archived, superseded_by);",
+             CREATE INDEX IF NOT EXISTS idx_memories_store_state ON memories (store_state, archived, superseded_by);
+             CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories (namespace, archived, superseded_by);",
         )?;
         Ok(())
     }
@@ -1394,5 +1436,68 @@ mod tests {
             results[0].content, "decimal is correct for money",
             "good memory must outrank penalized bad memory after 3 failures"
         );
+    }
+
+    // ─── Namespace isolation tests ────────────────────────────────────────────
+
+    /// Two in-memory stores with different namespaces must not see each other's rows.
+    #[test]
+    fn test_namespace_hard_isolation() {
+        let store_a = Store::in_memory_ns("agent_a").unwrap();
+        let store_b = Store::in_memory_ns("agent_b").unwrap();
+
+        assert_eq!(store_a.namespace, "agent_a");
+        assert_eq!(store_b.namespace, "agent_b");
+
+        store_a.insert("only in a", &[1.0_f32, 0.0, 0.0]).unwrap();
+        store_b.insert("only in b", &[0.0_f32, 1.0, 0.0]).unwrap();
+
+        assert_eq!(store_a.count().unwrap(), 1);
+        assert_eq!(store_b.count().unwrap(), 1);
+        assert_eq!(store_a.all().unwrap()[0].content, "only in a");
+        assert_eq!(store_b.all().unwrap()[0].content, "only in b");
+    }
+
+    /// Shared SQLite file — two Store handles with different namespaces must
+    /// not bleed across (the real multi-tenant scenario).
+    #[test]
+    fn test_namespace_shared_file_isolation() {
+        let dir = std::env::temp_dir();
+        static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique_id = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!(
+            "memoire_ns_{}_{}_{}.db",
+            std::process::id(),
+            unique_id,
+            // cheap unique suffix using stack address
+            &dir as *const _ as usize,
+        ));
+        let path_str = path.to_str().unwrap();
+
+        {
+            let store_a = Store::open_ns(path_str, "tenant_a").unwrap();
+            let store_b = Store::open_ns(path_str, "tenant_b").unwrap();
+
+            store_a.insert("tenant_a secret", &[1.0_f32, 0.0]).unwrap();
+            store_b.insert("tenant_b secret", &[0.0_f32, 1.0]).unwrap();
+
+            assert_eq!(store_a.count().unwrap(), 1);
+            assert_eq!(store_b.count().unwrap(), 1);
+
+            assert_eq!(store_a.all().unwrap()[0].content, "tenant_a secret");
+            assert_eq!(store_b.all().unwrap()[0].content, "tenant_b secret");
+
+            // Search from tenant_a's perspective must not surface tenant_b's memory.
+            let found = store_a.search(&[0.0_f32, 1.0], 5).unwrap();
+            assert!(
+                found.iter().all(|m| m.content != "tenant_b secret"),
+                "tenant_a search must not return tenant_b's memory"
+            );
+        }
+
+        // Cleanup — ignore errors (WAL files on Windows)
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 }

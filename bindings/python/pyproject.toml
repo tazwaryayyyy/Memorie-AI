@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "memoire"
@@ -31,9 +31,10 @@ Repository = "https://github.com/tazwaryayyyy/Memorie-AI"
 Issues = "https://github.com/tazwaryayyyy/Memorie-AI/issues"
 Changelog = "https://github.com/tazwaryayyyy/Memorie-AI/blob/main/CHANGELOG.md"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["memoire*"]
+[tool.maturin]
+features = ["pyo3"]
+manifest-path = "../../Cargo.toml"
+module-name = "memoire.memoire"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -70,12 +70,14 @@ class MemoireRetriever:
     def __init__(
         self,
         db_path: str = "./memoire.db",
+        namespace: str = "default",
         top_k: int = 5,
         min_score: float = 0.0,
         strict_policy: bool = False,
     ) -> None:
         _require_langchain()
         self._db_path = db_path
+        self._namespace = namespace
         self._top_k = top_k
         self._min_score = min_score
         self._policy = MemoryPolicy(strict=strict_policy)
@@ -88,7 +90,7 @@ class MemoireRetriever:
         except ImportError:
             from langchain.schema import Document  # type: ignore[no-redef]
 
-        with Memoire(self._db_path) as m:
+        with Memoire(self._db_path, namespace=self._namespace) as m:
             memories: List[Memory] = m.recall(query, top_k=self._top_k)
             if self._min_score > 0.0:
                 memories = [
@@ -163,11 +165,13 @@ class MemoireIndex:
     def __init__(
         self,
         db_path: str = "./memoire.db",
+        namespace: str = "default",
         top_k: int = 5,
         strict_policy: bool = False,
     ) -> None:
         _require_llama_index()
         self._db_path = db_path
+        self._namespace = namespace
         self._top_k = top_k
         self._policy = MemoryPolicy(strict=strict_policy)
 
@@ -179,7 +183,7 @@ class MemoireIndex:
         )
 
         k = top_k or self._top_k
-        with Memoire(self._db_path) as m:
+        with Memoire(self._db_path, namespace=self._namespace) as m:
             memories: List[Memory] = m.recall(query, top_k=k)
             decisions = self._policy.evaluate(memories)
             nodes = []

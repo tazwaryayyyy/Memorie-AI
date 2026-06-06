@@ -40,6 +40,7 @@ COMMANDS:
     import   <FILE>               Import memories line-by-line from a file
     export   [--json]             Dump all memories to stdout
     info                          Show database info and stats
+    cache-models                  Pre-download embedding models to local cache
 
 EXAMPLES:
     memoire remember "Fixed off-by-one error in pagination endpoint"
@@ -81,6 +82,7 @@ enum Command {
         json: bool,
     },
     Info,
+    CacheModels,
     Help,
 }
 
@@ -191,6 +193,7 @@ fn parse_args() -> Result<Args, String> {
         }
 
         "info" => Command::Info,
+        "cache-models" => Command::CacheModels,
 
         "" | "--help" | "-h" => Command::Help,
 
@@ -210,6 +213,13 @@ fn run() -> anyhow::Result<()> {
 
     if let Command::Help = args.command {
         print!("{HELP}");
+        return Ok(());
+    }
+
+    if let Command::CacheModels = args.command {
+        println!("Pre-downloading embedding models to cache...");
+        let _ = memoire::embedder::Embedder::new()?;
+        println!("✓ Model caching complete. You can now use Memoire in offline mode.");
         return Ok(());
     }
 
@@ -349,6 +359,9 @@ fn run() -> anyhow::Result<()> {
             println!("  Engine:  fastembed + rusqlite (bundled SQLite)");
             println!();
         }
+
+        // Handled above via early return before Memoire::new() is called
+        Command::CacheModels => unreachable!(),
     }
 
     Ok(())
