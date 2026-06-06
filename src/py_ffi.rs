@@ -1,4 +1,4 @@
-use crate::{Memoire, Memory};
+use crate::Memoire;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 
