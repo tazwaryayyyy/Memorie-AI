@@ -12,9 +12,117 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Planned
 - Metadata tagging (`project`, `session_id`, `language`) on stored memories
 - Filtered recall: `recall_where(query, project="my-api")`
-- HNSW approximate nearest-neighbour index via `usearch` for 100k+ memory stores
 - Node.js native addon via `napi-rs` (faster than ffi-napi)
-- `wasm32-wasi` target for browser/edge deployment
+- `wasm32-wasi` target for browser/edge deployment (stubs added in P3.4)
+- NLI-based contradiction detection (P3.3 — opt-in via `use_nli_contradiction: true`)
+- Cross-encoder re-ranking (`recall_reranked` / P3.1 — fastembed TextRerank)
+- Memory snapshot export/import CLI + MCP tools (P3.2 — `export_namespace` / `import_namespace`)
+
+---
+
+## [0.3.0] — 2026-06-07
+
+### Fixed (P0 — bugs)
+
+- **P0.1 — MCP namespace bypass:** `get_memoire()` in `server.py` now takes
+  `(db_path, namespace)` as its cache key. All ten MCP tools (`memoire_remember`,
+  `memoire_recall`, `memoire_reinforce`, `memoire_penalize`, `memoire_batch_feedback`,
+  `memoire_status`, `memoire_resolve_conflicts`, `memoire_forget`, `memoire_count`,
+  `memoire_clear`) accept `namespace: str = "default"` and forward it correctly.
+  Multi-agent deployments on the same database file no longer silently share state.
+
+- **P0.2 — C header out of sync:** `include/memoire.h` was missing declarations for
+  `memoire_new_ns`, `memoire_reinforce_if_used`, `memoire_penalize_if_used`, and
+  `memoire_resolve_contradictions`. All four are now declared with correct signatures.
+  C consumers can link against every `pub extern "C"` function in `ffi.rs`.
+
+- **P0.3 — Telemetry field name mismatch:** `server.py`'s `JsonFormatter` emitted
+  `"level"` but the dashboard TypeScript read `"levelname"`. The server now emits
+  `"levelname"` to match the conventional Python logging name. Severity coloring and
+  badges in the dashboard now work correctly.
+
+- **P0.4 — dbPath path injection in dashboard:** `dashboard/app/api/databases/route.ts`
+  previously passed `dbPath` from the request body directly to CLI arguments with no
+  validation. Added `getAllowedPaths()` and `validateDbPath()` helpers that check against
+  the `MEMOIRE_ALLOWED_PATHS` environment variable (comma-separated directory allowlist).
+  Requests outside the allowlist return HTTP 403. Empty `MEMOIRE_ALLOWED_PATHS` (default)
+  allows all paths for local development. Created `dashboard/.env.local` with the
+  configuration key documented.
+
+- **P0.5 — Missing CHECK constraints on trust columns:** The `memories` table had no
+  database-level constraints on `confidence`, `novelty`, `trust_ema`, or `archived`.
+  The `CREATE TABLE` statement now enforces:
+  `CHECK(confidence BETWEEN 0.0 AND 1.0)`, `CHECK(novelty BETWEEN 0.0 AND 1.0)`,
+  `CHECK(archived IN (0, 1))`, `CHECK(trust_ema IS NULL OR trust_ema BETWEEN 0.0 AND 1.0)`.
+  Application code additionally clamps all values before every INSERT/UPDATE so the
+  constraint is never triggered by normal use.
+
+### Changed (P1 — architecture)
+
+- **P1.1 — RwLock for Store:** The `Store` is now protected by `RwLock<StoreInner>`
+  instead of a single `Mutex`. Read operations (`recall`, `count`, `export_namespace`)
+  acquire a shared read lock; write operations (`remember`, `reinforce_if_used`,
+  `penalize_if_used`, `forget`, `clear`, `import_namespace`) acquire an exclusive write
+  lock. Concurrent recalls from multiple agents no longer block each other.
+  The `Embedder` remains behind `Arc<Mutex<...>>` — embedding inference requires
+  exclusive access.
+
+- **P1.2 — Axum HTTP server replaces dashboard CLI subprocesses:** Added
+  `src/bin/memoire_server.rs` — a long-lived Axum 0.7 service that exposes the library
+  behind a local HTTP API on port 6779 (`MEMOIRE_SERVER_PORT` to override). The
+  dashboard's `route.ts` now calls `http://localhost:6779` via `fetch` instead of
+  spawning two `execFileAsync` CLI subprocesses per GET request. If the server is
+  unreachable, the dashboard returns HTTP 503 with a startup instruction. Added
+  `axum = "0.7"` and `tokio = { version = "1", features = ["full"] }` to `Cargo.toml`.
+  Added `[[bin]] name = "memoire-server"` to `Cargo.toml`.
+
+- **P1.3 — Async filesystem calls in Next.js route handlers:** All remaining
+  `readFileSync`, `existsSync` calls in `dashboard/app/api/databases/route.ts` replaced
+  with `await readFile(...)` and `await access(...)` from `fs/promises`. Synchronous
+  filesystem calls in async handlers no longer block the Node.js event loop under
+  concurrent dashboard use.
+
+### Added (P2 — core quality)
+
+- **P2.1 — Cold-start trust:** Added `cold_start_weight: f32` (default `0.5`) to
+  `ScoringConfig`. New memories receive `trust_ema = quality_score × cold_start_weight`
+  on INSERT instead of starting at zero. A freshly stored, high-quality memory is
+  immediately visible to recall without needing prior reinforcement. Set
+  `cold_start_weight: 0.0` to restore the original behaviour.
+
+- **P2.2 — Trust time decay:** Added `decay_rate: f32` (default `0.01`, half-life ~69 days)
+  to `ScoringConfig`. Added `last_used_at INTEGER` column to the `memories` table with an
+  idempotent schema migration. On every recall, effective trust is computed as
+  `trust_ema × exp(−decay_rate × days_since_last_used)` and `last_used_at` is updated in
+  a single batched UPDATE. Stale lessons now fade automatically. `decay_rate: 0.0` is a
+  no-op. Added `last_used_at: Option<i64>` to the `Memory` struct.
+
+- **P2.3 — MMR recall:** Added `Store::mmr_rerank()` using the existing
+  `cosine_similarity` function (no new duplicate). Added `Memoire::recall_mmr(query,
+  top_k, mmr_lambda)` — retrieves `max(top_k × 3, 20)` candidates then greedily selects
+  `top_k` by marginal relevance. `mmr_lambda = 1.0` produces output identical to
+  `recall`. Exposed as `recall_mmr(query, top_k, mmr_lambda=0.5)` in the PyO3 binding.
+
+- **P2.4 — Code-aware chunker:** Rewrote `src/chunker.rs` to support three modes:
+  - `ChunkerMode::Prose` — original sliding-window (byte-for-byte unchanged).
+  - `ChunkerMode::Code(CodeLanguage)` — splits at function/class/impl/struct/enum/trait
+    boundaries for Python, Rust, JavaScript, TypeScript, and Generic (regex).
+  - `ChunkerMode::Auto` (new default) — detects triple-backtick language fences and
+    dispatches to the appropriate mode; falls back to Prose if no fences are found.
+  Added `mode: ChunkerMode` to `ChunkerConfig` (default `Auto` — backward compatible
+  because Auto falls back to Prose on prose text). Added `tree-sitter = "0.22"` to
+  `Cargo.toml`.
+
+### Documentation
+
+- `docs/ARCHITECTURE.md` — replaced "full cosine scan" retrieval description with the
+  accurate hybrid path (linear scan below `hnsw_threshold=500`, HNSW above it, lazy
+  rebuild); added sections for RwLock, trust model, cold-start, time decay, MMR flow,
+  code-aware chunker, HTTP API server, and namespace isolation.
+- `docs/FFI_GUIDE.md` — added `memoire_new_ns`, `memoire_reinforce_if_used`,
+  `memoire_penalize_if_used`, `memoire_resolve_contradictions` to all language examples
+  and the ownership table.
+- `README.md` — fully updated to reflect all P0–P2 changes.
 
 ---
 

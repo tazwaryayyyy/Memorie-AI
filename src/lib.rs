@@ -337,6 +337,28 @@ impl Memoire {
         self.store.maintenance_pass()
     }
 
+    /// Recall with Maximal Marginal Relevance reranking to reduce redundancy.
+    ///
+    /// Retrieves `top_k * 3` candidates (min 20) then reranks using MMR so
+    /// near-duplicate chunks do not dominate the top-k slots.
+    ///
+    /// `mmr_lambda = 1.0` → identical to `recall` (pure relevance).
+    /// `mmr_lambda = 0.5` (default) → balanced relevance/diversity.
+    pub fn recall_mmr(&self, query: &str, top_k: usize, mmr_lambda: f32) -> Result<Vec<Memory>> {
+        if self.store.count()? == 0 {
+            return Ok(vec![]);
+        }
+        let candidate_k = (top_k * 3).max(20);
+        let query_vec = self
+            .embedder
+            .embed_one(query)
+            .map_err(MemoireError::Embedding)?;
+        let candidates = self.store.search(&query_vec, candidate_k)?;
+        Ok(self
+            .store
+            .mmr_rerank(candidates, &query_vec, top_k, mmr_lambda))
+    }
+
     // ─── Private helpers ─────────────────────────────────────────────────────
 
     fn compute_prototypes(embedder: &dyn EmbedProvider) -> ScoringPrototypes {

@@ -25,6 +25,15 @@ pub struct ScoringConfig {
     /// Default 500. Below this, a linear scan over the in-memory embedding cache is
     /// faster due to lower constant factors than HNSW index construction.
     pub hnsw_threshold: usize,
+    /// Multiplied by quality_score to compute the initial trust_ema for a new memory
+    /// that has no reinforcement history (reinforcement_count == 0).
+    /// Range: 0.0–1.0. Default: 0.5
+    /// Set to 0.0 to disable cold-start trust (original behavior).
+    pub cold_start_weight: f32,
+    /// Exponential decay rate applied to trust_ema per day since last use.
+    /// Effective trust = trust_ema * exp(-decay_rate * days_since_last_used)
+    /// Default: 0.01 (half-life ~69 days). Set to 0.0 to disable.
+    pub decay_rate: f32,
 }
 
 impl Default for ScoringConfig {
@@ -34,6 +43,8 @@ impl Default for ScoringConfig {
             rc_saturation: 3.0,
             jaccard_threshold: 0.35,
             hnsw_threshold: 500,
+            cold_start_weight: 0.5,
+            decay_rate: 0.01,
         }
     }
 }

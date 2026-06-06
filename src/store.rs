@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use crate::error::{MemoireError, Result};
 use crate::quality::{
@@ -22,6 +22,7 @@ pub struct Memory {
     pub uncertainty: f32,
     pub state: String,
     pub created_at: i64,
+    pub last_used_at: Option<i64>,
 }
 
 /// Trust and uncertainty delta produced by a single call to `penalize_if_used`.
@@ -36,7 +37,7 @@ pub struct PenaltyOutcome {
 }
 
 pub struct Store {
-    inner: Mutex<StoreInner>,
+    inner: RwLock<StoreInner>,
     pub config: ScoringConfig,
     /// Namespace this store instance is scoped to. All reads/writes are filtered
     /// by this value. Defaults to `"default"`. Set via `Store::open_ns()`.
@@ -144,8 +145,8 @@ const SCHEMA: &str = "
         embedding   BLOB    NOT NULL,
         created_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
         importance_base REAL NOT NULL DEFAULT 0.5,
-        confidence REAL NOT NULL DEFAULT 0.5,
-        novelty REAL NOT NULL DEFAULT 0.5,
+        confidence REAL NOT NULL DEFAULT 0.5 CHECK(confidence BETWEEN 0.0 AND 1.0),
+        novelty REAL NOT NULL DEFAULT 0.5 CHECK(novelty BETWEEN 0.0 AND 1.0),
         actionability REAL NOT NULL DEFAULT 0.5,
         evidence REAL NOT NULL DEFAULT 0.5,
         consequence REAL NOT NULL DEFAULT 0.5,
@@ -156,13 +157,14 @@ const SCHEMA: &str = "
         last_accessed_at INTEGER,
         superseded_by INTEGER,
         contradiction_group TEXT,
-        archived INTEGER NOT NULL DEFAULT 0,
+        archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
         effective_weight REAL NOT NULL DEFAULT 1.0,
         fingerprint TEXT NOT NULL DEFAULT '',
         claim_key TEXT,
         claim_value TEXT,
         failure_count INTEGER NOT NULL DEFAULT 0,
-        trust_ema     REAL
+        trust_ema     REAL CHECK(trust_ema IS NULL OR trust_ema BETWEEN 0.0 AND 1.0),
+        last_used_at  INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_memories_created_at
         ON memories (created_at DESC);
@@ -268,8 +270,12 @@ fn search_candidates(
 }
 
 impl Store {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, StoreInner>> {
-        self.inner.lock().map_err(|_| MemoireError::LockPoisoned)
+    fn write_lock(&self) -> Result<std::sync::RwLockWriteGuard<'_, StoreInner>> {
+        self.inner.write().map_err(|_| MemoireError::LockPoisoned)
+    }
+
+    fn read_lock(&self) -> Result<std::sync::RwLockReadGuard<'_, StoreInner>> {
+        self.inner.read().map_err(|_| MemoireError::LockPoisoned)
     }
 
     pub fn open(path: &str) -> Result<Self> {
@@ -299,7 +305,7 @@ impl Store {
             fingerprints.len()
         );
         Ok(Self {
-            inner: Mutex::new(StoreInner {
+            inner: RwLock::new(StoreInner {
                 conn,
                 embedding_cache: Vec::new(),
                 embedding_cache_loaded: false,
@@ -329,7 +335,7 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
         Ok(Self {
-            inner: Mutex::new(StoreInner {
+            inner: RwLock::new(StoreInner {
                 conn,
                 embedding_cache: Vec::new(),
                 // In-memory store starts empty — no deferred load needed.
@@ -359,7 +365,7 @@ impl Store {
             return Ok(false);
         }
 
-        let inner = self.lock()?;
+        let inner = self.write_lock()?;
         let row = inner.conn.query_row(
             "SELECT content, embedding,
                     reinforcement_count, confidence, importance_base,
@@ -478,7 +484,7 @@ impl Store {
             return Ok(vec![]);
         }
         let severity = failure_severity.clamp(0.0, 1.0);
-        let inner = self.lock()?;
+        let inner = self.write_lock()?;
         let now: i64 =
             inner
                 .conn
@@ -576,7 +582,19 @@ impl Store {
         quality: &QualityMeta,
     ) -> Result<i64> {
         let blob = vec_to_blob(embedding);
-        let mut inner = self.lock()?;
+        // Clamp trust-related fields to valid ranges before writing so CHECK
+        // constraints are never triggered by normal application logic.
+        let confidence = quality.confidence.clamp(0.0_f32, 1.0_f32);
+        let novelty = quality.novelty.clamp(0.0_f32, 1.0_f32);
+        // Cold-start trust: seed trust_ema from quality score for new memories
+        // so high-quality memories surface above HINT before any reinforcement.
+        let initial_trust_ema = if quality.reinforcement_count == 0 {
+            Some((quality.importance_base * self.config.cold_start_weight).clamp(0.0_f32, 1.0_f32))
+        } else {
+            None
+        };
+        let now_ts_val = now_ts();
+        let mut inner = self.write_lock()?;
         inner.conn.execute(
             "INSERT INTO memories (
                 namespace, content, embedding,
@@ -584,22 +602,24 @@ impl Store {
                 actionability, evidence, consequence, reusability,
                 source_kind, store_state, reinforcement_count,
                 last_accessed_at, superseded_by, contradiction_group,
-                archived, effective_weight, fingerprint, claim_key, claim_value
+                archived, effective_weight, fingerprint, claim_key, claim_value,
+                trust_ema, last_used_at
             ) VALUES (
                 ?1, ?2, ?3,
                 ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21
+                ?17, ?18, ?19, ?20, ?21,
+                ?22, ?23
             )",
             params![
                 self.namespace,
                 content,
                 blob,
                 quality.importance_base,
-                quality.confidence,
-                quality.novelty,
+                confidence,
+                novelty,
                 quality.actionability,
                 quality.evidence,
                 quality.consequence,
@@ -615,6 +635,8 @@ impl Store {
                 quality.fingerprint,
                 quality.claim_key,
                 quality.claim_value,
+                initial_trust_ema,
+                now_ts_val,
             ],
         )?;
         let id = inner.conn.last_insert_rowid();
@@ -631,7 +653,7 @@ impl Store {
     }
 
     pub fn max_similarity(&self, query_vec: &[f32]) -> Result<f32> {
-        let mut inner = self.lock()?;
+        let mut inner = self.write_lock()?;
         let ns = self.namespace.clone();
         inner.ensure_embedding_cache(&ns)?;
         let max_sim = inner
@@ -643,7 +665,7 @@ impl Store {
     }
 
     pub fn fingerprint_exists(&self, fp: &str) -> Result<bool> {
-        let inner = self.lock()?;
+        let inner = self.read_lock()?;
         Ok(inner.fingerprints.contains(fp))
     }
 
@@ -652,7 +674,7 @@ impl Store {
             return Ok(vec![]);
         }
 
-        let mut inner = self.lock()?;
+        let mut inner = self.write_lock()?;
         let ns = self.namespace.clone();
         inner.ensure_embedding_cache(&ns)?;
         if inner.embedding_cache.is_empty() {
@@ -674,7 +696,7 @@ impl Store {
                 "SELECT content, created_at,
                         importance_base, reinforcement_count, confidence,
                         store_state, contradiction_group,
-                        failure_count, trust_ema
+                        failure_count, trust_ema, last_used_at
                  FROM memories
                  WHERE id = ?1
                    AND namespace = ?2
@@ -693,6 +715,7 @@ impl Store {
                         r.get::<_, Option<String>>(6)?,
                         r.get::<_, i64>(7)?,
                         r.get::<_, Option<f32>>(8)?,
+                        r.get::<_, Option<i64>>(9)?,
                     ))
                 },
             );
@@ -706,6 +729,7 @@ impl Store {
                 contradiction_group,
                 failure_count,
                 trust_ema_stored,
+                last_used_at,
             ) = match row {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -728,9 +752,21 @@ impl Store {
             let sim_clamped = sim.clamp(0.0, 1.0);
             let trust_computed = (trust_base * (0.6 + 0.4 * sim_clamped)).clamp(0.0, 1.0);
             let w = self.config.ema_new_weight;
-            let trust = match trust_ema_stored {
+            let trust_ema_blended = match trust_ema_stored {
                 Some(ema) => ((1.0 - w) * ema + w * trust_computed).clamp(0.0, 1.0),
                 None => trust_computed,
+            };
+            // Apply time decay based on days since last use
+            let trust = if self.config.decay_rate > 0.0 {
+                if let Some(last_used) = last_used_at {
+                    let days_elapsed = ((now - last_used).max(0) as f32) / 86_400.0;
+                    let decay_factor = (-self.config.decay_rate * days_elapsed).exp();
+                    (trust_ema_blended * decay_factor).clamp(0.0, 1.0)
+                } else {
+                    trust_ema_blended
+                }
+            } else {
+                trust_ema_blended
             };
             let rc_f = reinforcement_count as f32;
             let fc_f = failure_count as f32;
@@ -749,6 +785,7 @@ impl Store {
                     uncertainty,
                     state: store_state,
                     created_at,
+                    last_used_at,
                 },
             ));
         }
@@ -790,6 +827,16 @@ impl Store {
             .take(top_k)
             .collect();
 
+        // Update last_used_at for all returned memories in a single batch
+        if !result.is_empty() {
+            let ids: Vec<String> = result.iter().map(|m| m.id.to_string()).collect();
+            let placeholders = ids.join(",");
+            inner.conn.execute_batch(&format!(
+                "UPDATE memories SET last_used_at = {now} WHERE id IN ({placeholders});",
+                now = now
+            ))?;
+        }
+
         Ok(result)
     }
 
@@ -817,7 +864,7 @@ impl Store {
     ///
     /// Applicable to any domain. Quality-weighted resolution preserved.
     pub fn resolve_contradictions_for_id(&self, id: i64) -> Result<()> {
-        let mut inner = self.lock()?;
+        let mut inner = self.write_lock()?;
         let ns = self.namespace.clone();
 
         let target_row = inner.conn.query_row(
@@ -965,7 +1012,7 @@ impl Store {
     }
 
     pub fn maintenance_pass(&self) -> Result<()> {
-        let mut inner = self.lock()?;
+        let mut inner = self.write_lock()?;
 
         inner.conn.execute_batch(
             "UPDATE memories
@@ -1003,7 +1050,7 @@ impl Store {
     }
 
     pub fn all(&self) -> Result<Vec<Memory>> {
-        let inner = self.lock()?;
+        let inner = self.write_lock()?;
         let ns = &self.namespace;
         let now: i64 =
             inner
@@ -1078,6 +1125,7 @@ impl Store {
                         uncertainty,
                         state,
                         created_at,
+                        last_used_at: None,
                     }
                 },
             )
@@ -1086,7 +1134,7 @@ impl Store {
     }
 
     pub fn forget(&self, id: i64) -> Result<bool> {
-        let mut inner = self.lock()?;
+        let mut inner = self.write_lock()?;
         let rows = inner
             .conn
             .execute("DELETE FROM memories WHERE id = ?1", params![id])?;
@@ -1097,7 +1145,7 @@ impl Store {
     }
 
     pub fn count(&self) -> Result<i64> {
-        let inner = self.lock()?;
+        let inner = self.write_lock()?;
         Ok(inner.conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND archived = 0",
             rusqlite::params![self.namespace],
@@ -1106,7 +1154,7 @@ impl Store {
     }
 
     pub fn clear(&self) -> Result<()> {
-        let mut inner = self.lock()?;
+        let mut inner = self.write_lock()?;
         inner.conn.execute_batch("DELETE FROM memories;")?;
         inner.embedding_cache.clear();
         inner.embedding_cache_loaded = true; // empty store is coherent — no load needed
@@ -1114,6 +1162,80 @@ impl Store {
         inner.hnsw = None;
         inner.hnsw_dirty = false;
         Ok(())
+    }
+
+    /// Maximal Marginal Relevance reranking.
+    ///
+    /// Selects up to `top_k` results from `candidates` that maximise relevance
+    /// to `query_embedding` while minimising redundancy with already-selected items.
+    ///
+    /// `lambda = 1.0` → pure relevance (identical to `recall`).
+    /// `lambda = 0.0` → pure diversity.
+    pub fn mmr_rerank(
+        &self,
+        mut candidates: Vec<Memory>,
+        _query_embedding: &[f32],
+        top_k: usize,
+        lambda: f32,
+    ) -> Vec<Memory> {
+        if lambda >= 1.0 || candidates.len() <= top_k {
+            candidates.truncate(top_k);
+            return candidates;
+        }
+        if candidates.is_empty() || top_k == 0 {
+            return vec![];
+        }
+
+        // We need per-candidate embeddings to compute similarity between candidates.
+        // Use the score field (which encodes cosine sim to query) as the relevance term,
+        // and do a second pass to compute inter-candidate similarity from the in-memory cache.
+        let inner = match self.write_lock() {
+            Ok(i) => i,
+            Err(_) => {
+                candidates.truncate(top_k);
+                return candidates;
+            }
+        };
+
+        let get_emb = |id: i64| -> Option<Vec<f32>> {
+            inner
+                .embedding_cache
+                .iter()
+                .find(|(cid, _)| *cid == id)
+                .map(|(_, e)| e.clone())
+        };
+
+        let mut selected: Vec<Memory> = Vec::with_capacity(top_k);
+
+        while selected.len() < top_k && !candidates.is_empty() {
+            let mut best_idx = 0;
+            let mut best_score = f32::NEG_INFINITY;
+
+            for (i, cand) in candidates.iter().enumerate() {
+                let relevance = cand.score; // cosine to query, pre-computed
+                let max_sim_to_selected = if selected.is_empty() {
+                    0.0_f32
+                } else {
+                    selected
+                        .iter()
+                        .map(|s| match (get_emb(cand.id), get_emb(s.id)) {
+                            (Some(e_c), Some(e_s)) => cosine_similarity(&e_c, &e_s),
+                            _ => 0.0,
+                        })
+                        .fold(f32::NEG_INFINITY, f32::max)
+                };
+
+                let mmr_score = lambda * relevance - (1.0 - lambda) * max_sim_to_selected;
+                if mmr_score > best_score {
+                    best_score = mmr_score;
+                    best_idx = i;
+                }
+            }
+
+            selected.push(candidates.remove(best_idx));
+        }
+
+        selected
     }
 
     fn ensure_quality_columns(conn: &Connection) -> Result<()> {
@@ -1197,6 +1319,9 @@ impl Store {
         if !has("namespace") {
             alter
                 .push("ALTER TABLE memories ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';");
+        }
+        if !has("last_used_at") {
+            alter.push("ALTER TABLE memories ADD COLUMN last_used_at INTEGER;");
         }
 
         for sql in alter {

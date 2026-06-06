@@ -1,3 +1,4 @@
+import server
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -9,8 +10,6 @@ from uuid import uuid4
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import server
 
 
 @dataclass
@@ -27,8 +26,9 @@ class FakeMemory:
 class FakeMemoire:
     instances = []
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, namespace: str = "default") -> None:
         self.db_path = db_path
+        self.namespace = namespace
         self.remembered = []
         self.reinforced = []
         self.penalized = []
@@ -37,7 +37,8 @@ class FakeMemoire:
         self.cleared = False
         self.memories = [
             FakeMemory(1, "Always validate external inputs"),
-            FakeMemory(2, "Low-confidence draft note", state="shadow", trust=0.2),
+            FakeMemory(2, "Low-confidence draft note",
+                       state="shadow", trust=0.2),
         ]
         FakeMemoire.instances.append(self)
 
@@ -98,14 +99,16 @@ def isolated_server(monkeypatch, workspace_tmp):
 def test_db_path_prefers_env(monkeypatch):
     monkeypatch.setenv("MEMOIRE_DB_PATH", "/tmp/custom.db")
 
-    assert server.get_db_path(SimpleNamespace()) == os.path.normpath("/tmp/custom.db")
+    assert server.get_db_path(
+        SimpleNamespace()) == os.path.normpath("/tmp/custom.db")
 
 
 def test_db_path_reads_workspace_override(workspace_tmp):
     workspace = workspace_tmp / "workspace"
     workspace.mkdir()
     (workspace / ".memoire_path").write_text("state/memoire.db", encoding="utf-8")
-    init_params = SimpleNamespace(workspaceFolders=[SimpleNamespace(uri=workspace.as_uri())])
+    init_params = SimpleNamespace(
+        workspaceFolders=[SimpleNamespace(uri=workspace.as_uri())])
     session = SimpleNamespace(init_params=init_params)
     ctx = SimpleNamespace(request_context=SimpleNamespace(session=session))
 
@@ -134,14 +137,16 @@ def test_health_check_failure(monkeypatch):
 
 
 def test_remember_returns_structured_success():
-    response = server.memoire_remember("Fixed pagination bug", SimpleNamespace())
+    response = server.memoire_remember(
+        "Fixed pagination bug", SimpleNamespace())
 
     assert response == {"ok": True, "error": None, "chunks_stored": 1}
     assert FakeMemoire.instances[0].remembered == ["Fixed pagination bug"]
 
 
 def test_recall_filters_shadow_by_default():
-    response = server.memoire_recall("input validation", SimpleNamespace(), top_k=5)
+    response = server.memoire_recall(
+        "input validation", SimpleNamespace(), top_k=5)
 
     assert response["ok"] is True
     assert [item["id"] for item in response["memories"]] == [1]

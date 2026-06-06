@@ -2,6 +2,10 @@
 
 How to call `libmemoire` from Python, Node.js, Go, Ruby, and C.
 
+> **New exports since P0.2:** `memoire_new_ns`, `memoire_reinforce_if_used`,
+> `memoire_penalize_if_used`, `memoire_resolve_contradictions`.
+> All declarations are in `include/memoire.h`.
+
 ## Build the library first
 
 ```bash
@@ -23,14 +27,24 @@ lib = ctypes.CDLL("target/release/libmemoire.so")  # adjust path/extension
 
 # Declare signatures
 lib.memoire_new.argtypes      = [ctypes.c_char_p];  lib.memoire_new.restype       = ctypes.c_void_p
+lib.memoire_new_ns.argtypes   = [ctypes.c_char_p, ctypes.c_char_p]; lib.memoire_new_ns.restype = ctypes.c_void_p
 lib.memoire_free.argtypes     = [ctypes.c_void_p];  lib.memoire_free.restype      = None
 lib.memoire_remember.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 lib.memoire_remember.restype  = ctypes.c_int
 lib.memoire_recall.argtypes   = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
 lib.memoire_recall.restype    = ctypes.c_char_p
 lib.memoire_free_string.argtypes = [ctypes.c_char_p]; lib.memoire_free_string.restype = None
+lib.memoire_reinforce_if_used.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_char_p, ctypes.c_bool]
+lib.memoire_reinforce_if_used.restype  = ctypes.c_int
+lib.memoire_penalize_if_used.argtypes  = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_float]
+lib.memoire_penalize_if_used.restype   = ctypes.c_int
 
+# Default namespace
 h = lib.memoire_new(b"agent.db")
+
+# Explicit namespace (multi-tenant)
+h_ns = lib.memoire_new_ns(b"shared.db", b"billing-agent")
+
 lib.memoire_remember(h, b"Fixed the auth bug today")
 
 raw = lib.memoire_recall(h, b"authentication", 3)
@@ -39,8 +53,10 @@ lib.memoire_free_string(raw)        # ← MUST free
 
 for r in results:
     print(f"[{r['score']:.3f}] {r['content']}")
+    lib.memoire_reinforce_if_used(h, r['id'], b"fixed with Decimal", True)
 
 lib.memoire_free(h)
+lib.memoire_free(h_ns)
 ```
 
 Or use the included wrapper (zero boilerplate):
@@ -70,13 +86,15 @@ const voidPtr = ref.refType(ref.types.void);
 const charPtr = ref.refType(ref.types.char);
 
 const lib = ffi.Library("target/release/libmemoire", {
-  memoire_new:         [voidPtr,  ["string"]],
-  memoire_free:        ["void",   [voidPtr]],
-  memoire_remember:    ["int",    [voidPtr, "string"]],
-  memoire_recall:      [charPtr,  [voidPtr, "string", "int"]],
-  memoire_free_string: ["void",   [charPtr]],
-  memoire_count:       ["int64",  [voidPtr]],
-  memoire_free:        ["void",   [voidPtr]],
+  memoire_new:                [voidPtr,  ["string"]],
+  memoire_new_ns:             [voidPtr,  ["string", "string"]],
+  memoire_free:               ["void",   [voidPtr]],
+  memoire_remember:           ["int",    [voidPtr, "string"]],
+  memoire_recall:             [charPtr,  [voidPtr, "string", "int"]],
+  memoire_free_string:        ["void",   [charPtr]],
+  memoire_count:              ["int64",  [voidPtr]],
+  memoire_reinforce_if_used:  ["int",    [voidPtr, "int64", "string", "bool"]],
+  memoire_penalize_if_used:   ["int",    [voidPtr, "string", "float"]],
 });
 
 const h = lib.memoire_new("agent.db");
@@ -110,8 +128,13 @@ import (
 )
 
 func main() {
+    // Default namespace
     h := C.memoire_new(C.CString("agent.db"))
     defer C.memoire_free(h)
+
+    // Explicit namespace
+    hNs := C.memoire_new_ns(C.CString("shared.db"), C.CString("billing-agent"))
+    defer C.memoire_free(hNs)
 
     content := C.CString("Fixed the auth bug today")
     defer C.free(unsafe.Pointer(content))
@@ -131,6 +154,10 @@ func main() {
 
     for _, r := range results {
         fmt.Printf("[%.3f] %s\n", r.Score, r.Content)
+        // Reinforce after successful use
+        out := C.CString("fixed with Decimal")
+        C.memoire_reinforce_if_used(h, C.longlong(r.ID), out, true)
+        C.free(unsafe.Pointer(out))
     }
 }
 ```
@@ -162,11 +189,14 @@ module Memoire
   dlload 'target/release/libmemoire.so'
 
   extern 'void* memoire_new(const char*)'
+  extern 'void* memoire_new_ns(const char*, const char*)'
   extern 'void  memoire_free(void*)'
   extern 'int   memoire_remember(void*, const char*)'
   extern 'char* memoire_recall(void*, const char*, int)'
   extern 'void  memoire_free_string(char*)'
   extern 'long long memoire_count(void*)'
+  extern 'int   memoire_reinforce_if_used(void*, long long, const char*, int)'
+  extern 'int   memoire_penalize_if_used(void*, const char*, float)'
 end
 
 h = Memoire.memoire_new("agent.db")
@@ -190,8 +220,12 @@ Memoire.memoire_free(h)
 #include <stdlib.h>
 
 int main(void) {
+    /* Default namespace */
     MemoireHandle* h = memoire_new("agent.db");
     if (!h) { fprintf(stderr, "failed to open\n"); return 1; }
+
+    /* Named namespace */
+    MemoireHandle* h_ns = memoire_new_ns("shared.db", "billing-agent");
 
     memoire_remember(h, "Fixed the auth bug today");
 
@@ -201,8 +235,12 @@ int main(void) {
         memoire_free_string(json);   /* MUST free */
     }
 
+    /* Reinforce a specific memory id (e.g., 42) */
+    memoire_reinforce_if_used(h, 42, "fixed with Decimal", true);
+
     printf("total chunks: %lld\n", memoire_count(h));
     memoire_free(h);
+    memoire_free(h_ns);
     return 0;
 }
 ```
@@ -230,11 +268,14 @@ class Memoire {
     const string Lib = "libmemoire";
 
     [DllImport(Lib)] static extern IntPtr memoire_new(string dbPath);
+    [DllImport(Lib)] static extern IntPtr memoire_new_ns(string dbPath, string ns);
     [DllImport(Lib)] static extern void   memoire_free(IntPtr h);
     [DllImport(Lib)] static extern int    memoire_remember(IntPtr h, string content);
     [DllImport(Lib)] static extern IntPtr memoire_recall(IntPtr h, string query, int topK);
     [DllImport(Lib)] static extern void   memoire_free_string(IntPtr s);
     [DllImport(Lib)] static extern long   memoire_count(IntPtr h);
+    [DllImport(Lib)] static extern int    memoire_reinforce_if_used(IntPtr h, long id, string output, bool success);
+    [DllImport(Lib)] static extern int    memoire_penalize_if_used(IntPtr h, string ids_json, float severity);
 
     static void Main() {
         var h = memoire_new("agent.db");
@@ -262,10 +303,14 @@ class Memoire {
 | Function | Returns | Caller must... |
 |---|---|---|
 | `memoire_new` | opaque pointer | `memoire_free(h)` when done |
+| `memoire_new_ns` | opaque pointer | `memoire_free(h)` when done |
 | `memoire_remember` | `int` (count) | nothing |
 | `memoire_recall` | `char*` JSON string | `memoire_free_string(ptr)` |
 | `memoire_forget` | `int` (status) | nothing |
 | `memoire_count` | `int64` | nothing |
 | `memoire_clear` | `int` (status) | nothing |
+| `memoire_reinforce_if_used` | `int` (status) | nothing |
+| `memoire_penalize_if_used` | `int` (status) | nothing |
+| `memoire_resolve_contradictions` | `int` (archived count) | nothing |
 
 **Never** pass the JSON string pointer to the system `free()` or your language runtime's allocator — it must go through `memoire_free_string` which routes it back to Rust's allocator.

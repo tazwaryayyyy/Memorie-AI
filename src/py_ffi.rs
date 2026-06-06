@@ -21,6 +21,8 @@ pub struct PyMemory {
     pub state: String,
     #[pyo3(get)]
     pub created_at: i64,
+    #[pyo3(get)]
+    pub last_used_at: Option<i64>,
 }
 
 #[pymethods]
@@ -80,6 +82,29 @@ impl PyMemoire {
                 uncertainty: m.uncertainty,
                 state: m.state,
                 created_at: m.created_at,
+                last_used_at: m.last_used_at,
+            })
+            .collect();
+        Ok(py_memories)
+    }
+
+    #[pyo3(signature = (query, top_k, mmr_lambda = 0.5))]
+    fn recall_mmr(&self, query: &str, top_k: usize, mmr_lambda: f32) -> PyResult<Vec<PyMemory>> {
+        let memories = self
+            .inner
+            .recall_mmr(query, top_k, mmr_lambda)
+            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
+        let py_memories = memories
+            .into_iter()
+            .map(|m| PyMemory {
+                id: m.id,
+                content: m.content,
+                score: m.score,
+                trust: m.trust,
+                uncertainty: m.uncertainty,
+                state: m.state,
+                created_at: m.created_at,
+                last_used_at: m.last_used_at,
             })
             .collect();
         Ok(py_memories)
