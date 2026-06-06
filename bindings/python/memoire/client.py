@@ -21,6 +21,24 @@ except ImportError:
 Memory = _NativeMemory
 
 
+def _get_lib():
+    """
+    Backward-compatible native extension probe.
+
+    Returns:
+        The loaded native Memoire extension class when available.
+
+    Raises:
+        MemoireError: if the native extension is unavailable.
+    """
+    if _NativeMemoire is None:
+        raise MemoireError(
+            "Native compiled memoire extension is not installed.\n"
+            "Please run `pip install .` or `maturin dev` in bindings/python."
+        )
+    return _NativeMemoire
+
+
 class Memoire:
     """
     Local-first semantic memory engine for AI coding agents.
