@@ -174,3 +174,26 @@ class TestLifecycle:
         m = Memoire(":memory:")
         m.close()
         m.close()  # should not raise
+
+
+# ─── namespaces ──────────────────────────────────────────────────────────────
+
+class TestNamespace:
+    def test_namespace_isolation(self, tmp_path):
+        db_file = str(tmp_path / "test_ns.db")
+        with Memoire(db_file, namespace="tenant_a") as m_a:
+            with Memoire(db_file, namespace="tenant_b") as m_b:
+                m_a.remember("secret database password is admin123")
+                m_b.remember("secret database password is password789")
+
+                results_a = m_a.recall("database password", top_k=1)
+                results_b = m_b.recall("database password", top_k=1)
+
+                assert len(results_a) == 1
+                assert "admin123" in results_a[0].content
+                assert "password789" not in results_a[0].content
+
+                assert len(results_b) == 1
+                assert "password789" in results_b[0].content
+                assert "admin123" not in results_b[0].content
+

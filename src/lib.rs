@@ -2,6 +2,8 @@ pub mod chunker;
 pub mod embedder;
 pub mod error;
 pub mod ffi;
+#[cfg(feature = "pyo3")]
+pub mod py_ffi;
 pub mod quality;
 pub mod store;
 
@@ -30,7 +32,7 @@ use store::{Memory, Store};
 /// }
 /// ```
 pub struct Memoire {
-    store: Store,
+    pub(crate) store: Store,
     embedder: Box<dyn EmbedProvider>,
     chunker_config: ChunkerConfig,
     scoring_weights: ScoringWeights,
@@ -38,113 +40,54 @@ pub struct Memoire {
 }
 
 impl Memoire {
+    // ─── Constructors ────────────────────────────────────────────────────────
+
     /// Open or create a persistent memory store at `db_path`.
     pub fn new(db_path: &str) -> Result<Self> {
         let _ = env_logger::try_init();
-        Self::new_with_embedder(
-            db_path,
-            Box::new(Embedder::new().map_err(MemoireError::Embedding)?),
-        )
+        let embedder: Box<dyn EmbedProvider> =
+            Box::new(Embedder::new().map_err(MemoireError::Embedding)?);
+        Self::new_with_embedder(db_path, embedder)
     }
 
-    /// Open or create a persistent store with a custom embedding backend.
+    /// Open a persistent store scoped to `namespace`.
+    ///
+    /// Multiple agents can share one SQLite file with hard isolation:
+    /// ```rust,no_run
+    /// # use memoire::Memoire;
+    /// let agent_a = Memoire::new_ns("shared.db", "agent_a").unwrap();
+    /// let agent_b = Memoire::new_ns("shared.db", "agent_b").unwrap();
+    /// // agent_a.recall(…) never returns agent_b's memories and vice-versa.
+    /// ```
+    pub fn new_ns(db_path: &str, namespace: &str) -> Result<Self> {
+        let _ = env_logger::try_init();
+        let embedder: Box<dyn EmbedProvider> =
+            Box::new(Embedder::new().map_err(MemoireError::Embedding)?);
+        Self::new_ns_with_embedder(db_path, namespace, embedder)
+    }
+
+    /// Open a persistent store with a custom embedding backend.
     ///
     /// Allows swapping `all-MiniLM-L6-v2` for any model — BERT-large, an
-    /// OpenAI API wrapper, or a proprietary encoder — without recompiling the
-    /// Rust core. Implement [`embedder::EmbedProvider`] and pass the backend here.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use memoire::{Memoire, embedder::EmbedProvider};
-    ///
-    /// struct MyEmbedder;
-    /// impl EmbedProvider for MyEmbedder {
-    ///     fn embed(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-    ///         Ok(texts.iter().map(|_| vec![0.0_f32; 768]).collect())
-    ///     }
-    ///     fn dim(&self) -> usize { 768 }
-    /// }
-    ///
-    /// let m = Memoire::new_with_embedder("agent.db", Box::new(MyEmbedder))?;
-    /// # Ok::<(), anyhow::Error>(())
-    /// ```
+    /// OpenAI API wrapper, or a proprietary encoder — without recompiling.
+    /// Implement [`embedder::EmbedProvider`] and pass the backend here.
     pub fn new_with_embedder(db_path: &str, embedder: Box<dyn EmbedProvider>) -> Result<Self> {
+        Self::new_ns_with_embedder(db_path, "default", embedder)
+    }
+
+    pub fn new_ns_with_embedder(
+        db_path: &str,
+        namespace: &str,
+        embedder: Box<dyn EmbedProvider>,
+    ) -> Result<Self> {
         let prototypes = Self::compute_prototypes(&*embedder);
         Ok(Self {
-            store: Store::open_with_config(db_path, ScoringConfig::default())?,
+            store: Store::open_ns_with_config(db_path, namespace, ScoringConfig::default())?,
             embedder,
             chunker_config: ChunkerConfig::default(),
             scoring_weights: ScoringWeights::default(),
             prototypes,
         })
-    }
-
-    fn compute_prototypes(embedder: &dyn EmbedProvider) -> ScoringPrototypes {
-        let consequence_sents = [
-            "Critical security breach in production database exposing user data".to_string(),
-            "System outage caused data loss for all users".to_string(),
-            "Race condition in payment processing leads to double charges".to_string(),
-            "Authentication bypass vulnerability allows unauthorized access".to_string(),
-            "Production database corrupted during migration".to_string(),
-        ];
-        let actionability_sents = [
-            "Fixed the bug by replacing the function with the corrected version".to_string(),
-            "Replaced deprecated API call with the new stable endpoint".to_string(),
-            "Patched the vulnerability by updating the dependency to latest version".to_string(),
-            "Refactored the module to remove dead code and reduce coupling".to_string(),
-            "Disabled the feature flag after rollback to restore stable behavior".to_string(),
-        ];
-        let reusability_sents = [
-            "Always use Decimal for financial calculations never use float".to_string(),
-            "Never store passwords in plain text always hash with bcrypt".to_string(),
-            "API rate limit policy must enforce maximum requests per hour".to_string(),
-            "Rule: all database queries must use parameterized statements".to_string(),
-            "Mandatory: all external inputs must be validated and sanitized".to_string(),
-        ];
-
-        let all: Vec<String> = consequence_sents
-            .iter()
-            .chain(actionability_sents.iter())
-            .chain(reusability_sents.iter())
-            .cloned()
-            .collect();
-
-        match embedder.embed(all) {
-            Ok(vecs) if vecs.len() == 15 => {
-                let avg = |group: &[Vec<f32>]| -> Vec<f32> {
-                    let dim = group[0].len();
-                    let mut acc = vec![0.0_f32; dim];
-                    for v in group {
-                        for (a, b) in acc.iter_mut().zip(v.iter()) {
-                            *a += b;
-                        }
-                    }
-                    acc.iter_mut().for_each(|x| *x /= group.len() as f32);
-                    acc
-                };
-                let consequence = avg(&vecs[0..5]);
-                let actionability = avg(&vecs[5..10]);
-                let reusability = avg(&vecs[10..15]);
-                let is_semantic = true;
-                ScoringPrototypes {
-                    consequence,
-                    actionability,
-                    reusability,
-                    is_semantic,
-                }
-            }
-            Err(e) => {
-                log::warn!("compute_prototypes failed — falling back to neutral: {e}");
-                ScoringPrototypes::neutral(384)
-            }
-            Ok(_) => {
-                log::warn!(
-                    "compute_prototypes returned unexpected count — falling back to neutral"
-                );
-                ScoringPrototypes::neutral(384)
-            }
-        }
     }
 
     /// In-memory store — not persisted. Useful for tests.
@@ -155,15 +98,29 @@ impl Memoire {
         Self::in_memory_with_embedder(embedder)
     }
 
+    /// In-memory store scoped to `namespace`.
+    pub fn in_memory_ns(namespace: &str) -> Result<Self> {
+        let _ = env_logger::try_init();
+        let embedder: Box<dyn EmbedProvider> =
+            Box::new(Embedder::new().map_err(MemoireError::Embedding)?);
+        Self::in_memory_ns_with_embedder(namespace, embedder)
+    }
+
     /// In-memory store with a custom embedding backend.
     ///
-    /// This is useful for deterministic tests and for callers that want an
-    /// ephemeral store without initialising the default ONNX model.
+    /// Useful for deterministic unit tests without initialising the ONNX model.
     pub fn in_memory_with_embedder(embedder: Box<dyn EmbedProvider>) -> Result<Self> {
+        Self::in_memory_ns_with_embedder("default", embedder)
+    }
+
+    pub fn in_memory_ns_with_embedder(
+        namespace: &str,
+        embedder: Box<dyn EmbedProvider>,
+    ) -> Result<Self> {
         let _ = env_logger::try_init();
         let prototypes = Self::compute_prototypes(&*embedder);
         Ok(Self {
-            store: Store::in_memory_with_config(ScoringConfig::default())?,
+            store: Store::in_memory_ns_with_config(namespace, ScoringConfig::default())?,
             embedder,
             chunker_config: ChunkerConfig::default(),
             scoring_weights: ScoringWeights::default(),
@@ -171,7 +128,16 @@ impl Memoire {
         })
     }
 
-    /// Builder: override the scoring config used by the store.
+    // ─── Introspection ───────────────────────────────────────────────────────
+
+    /// Return the namespace this instance is scoped to.
+    pub fn namespace(&self) -> &str {
+        &self.store.namespace
+    }
+
+    // ─── Builders ────────────────────────────────────────────────────────────
+
+    /// Override the scoring config used by the store.
     pub fn with_scoring_config(mut self, config: ScoringConfig) -> Self {
         self.store.config = config;
         self
@@ -196,6 +162,8 @@ impl Memoire {
         self.scoring_weights = weights;
         self
     }
+
+    // ─── Core API ────────────────────────────────────────────────────────────
 
     /// Chunk `content`, embed each chunk, and persist. Returns inserted row ids.
     pub fn remember(&self, content: &str) -> Result<Vec<i64>> {
@@ -354,12 +322,12 @@ impl Memoire {
         self.store.all()
     }
 
-    /// Total stored memory chunks.
+    /// Total stored memory chunks (namespace-scoped).
     pub fn count(&self) -> Result<i64> {
         self.store.count()
     }
 
-    /// Erase ALL memories. Irreversible.
+    /// Erase ALL memories in this namespace. Irreversible.
     pub fn clear(&self) -> Result<()> {
         self.store.clear()
     }
@@ -367,5 +335,73 @@ impl Memoire {
     /// Run a quality-control maintenance pass (pruning + archive enforcement).
     pub fn maintenance_pass(&self) -> Result<()> {
         self.store.maintenance_pass()
+    }
+
+    // ─── Private helpers ─────────────────────────────────────────────────────
+
+    fn compute_prototypes(embedder: &dyn EmbedProvider) -> ScoringPrototypes {
+        let consequence_sents = [
+            "Critical security breach in production database exposing user data".to_string(),
+            "System outage caused data loss for all users".to_string(),
+            "Race condition in payment processing leads to double charges".to_string(),
+            "Authentication bypass vulnerability allows unauthorized access".to_string(),
+            "Production database corrupted during migration".to_string(),
+        ];
+        let actionability_sents = [
+            "Fixed the bug by replacing the function with the corrected version".to_string(),
+            "Replaced deprecated API call with the new stable endpoint".to_string(),
+            "Patched the vulnerability by updating the dependency to latest version".to_string(),
+            "Refactored the module to remove dead code and reduce coupling".to_string(),
+            "Disabled the feature flag after rollback to restore stable behavior".to_string(),
+        ];
+        let reusability_sents = [
+            "Always use Decimal for financial calculations never use float".to_string(),
+            "Never store passwords in plain text always hash with bcrypt".to_string(),
+            "API rate limit policy must enforce maximum requests per hour".to_string(),
+            "Rule: all database queries must use parameterized statements".to_string(),
+            "Mandatory: all external inputs must be validated and sanitized".to_string(),
+        ];
+
+        let all: Vec<String> = consequence_sents
+            .iter()
+            .chain(actionability_sents.iter())
+            .chain(reusability_sents.iter())
+            .cloned()
+            .collect();
+
+        match embedder.embed(all) {
+            Ok(vecs) if vecs.len() == 15 => {
+                let avg = |group: &[Vec<f32>]| -> Vec<f32> {
+                    let dim = group[0].len();
+                    let mut acc = vec![0.0_f32; dim];
+                    for v in group {
+                        for (a, b) in acc.iter_mut().zip(v.iter()) {
+                            *a += b;
+                        }
+                    }
+                    acc.iter_mut().for_each(|x| *x /= group.len() as f32);
+                    acc
+                };
+                let consequence = avg(&vecs[0..5]);
+                let actionability = avg(&vecs[5..10]);
+                let reusability = avg(&vecs[10..15]);
+                ScoringPrototypes {
+                    consequence,
+                    actionability,
+                    reusability,
+                    is_semantic: true,
+                }
+            }
+            Err(e) => {
+                log::warn!("compute_prototypes failed — falling back to neutral: {e}");
+                ScoringPrototypes::neutral(384)
+            }
+            Ok(_) => {
+                log::warn!(
+                    "compute_prototypes returned unexpected count — falling back to neutral"
+                );
+                ScoringPrototypes::neutral(384)
+            }
+        }
     }
 }

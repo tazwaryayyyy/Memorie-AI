@@ -9,29 +9,72 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-- **MCP server** (`examples/mcp_server.py`) — trust-aware `save_lesson` and `get_lessons` tools,
-  plus low-level passthrough tools (`memoire_remember`, `memoire_recall`, `memoire_forget`,
-  `memoire_status`). Requires `pip install mcp`.
-- **Framework adapters** (`bindings/python/memoire/adapters.py`)
-  - `MemoireRetriever` — LangChain `BaseRetriever`-compatible; policy-filtered, works with
-    LCEL pipes and `RetrievalQA`. Requires `pip install langchain langchain-core`.
-  - `MemoireIndex` — LlamaIndex-compatible index with `as_retriever()` and `as_query_engine()`.
-    Requires `pip install llama-index-core`.
-  - Both adapters apply `MemoryPolicy` internally — IGNORE-ranked memories never reach the LLM.
-- **`EmbedProvider` trait** (`src/embedder.rs`) — pluggable embedding backend; swap out
-  `fastembed` without changing call sites.
-- **`new_with_embedder`** / **`with_scoring_weights`** builder methods on `Memoire`.
-- **`recall_within_days`** — time-bounded recall (stale ≠ wrong; no trust penalty applied).
-- **`ScoringWeights`** struct — scoring constants surfaced for testing and custom calibration;
-  default weights are frozen for reproducibility.
-
 ### Planned
 - Metadata tagging (`project`, `session_id`, `language`) on stored memories
 - Filtered recall: `recall_where(query, project="my-api")`
 - HNSW approximate nearest-neighbour index via `usearch` for 100k+ memory stores
 - Node.js native addon via `napi-rs` (faster than ffi-napi)
 - `wasm32-wasi` target for browser/edge deployment
+
+---
+
+## [0.2.0] — 2026-06-05
+
+### Added
+
+- **Hard namespace isolation** — `Memoire::new_ns(db, namespace)` and `Memoire::in_memory_ns(ns)`
+  scope all SQL reads/writes to a partition column. Data written in one namespace is completely
+  hidden from any other namespace sharing the same SQLite file. Verified with isolation tests
+  in both Rust and Python.
+
+- **PyO3 native extension** (`src/py_ffi.rs`) — replaced the `ctypes` FFI layer in the Python
+  binding with a compiled Rust extension module built via `maturin`. Classes `PyMemoire` and
+  `PyMemory` are exposed natively; no dynamic library loading at runtime. The C FFI layer is
+  preserved for Node.js and Go consumers.
+  - `Memoire(db_path, namespace="default")` — namespace parameter added.
+  - `MemoireError` Python exception class exposed from Rust.
+  - `pyproject.toml` updated to use the `maturin` build backend.
+  - All 26 Python tests now run against the native module (`pytest bindings/python/tests/ -v`).
+
+- **`cache-models` CLI command** — `memoire cache-models` pre-downloads and caches the
+  `all-MiniLM-L6-v2` embedding model to the FastEmbed local cache. Allows subsequent runs
+  on air-gapped machines without any network access or cold-start latency.
+
+- **Observability dashboard** (`dashboard/`) — Next.js 15 application with TypeScript and
+  Tailwind CSS providing local observability for any Memoire SQLite database.
+  - `/api/logs` — streams `~/.memoire/logs/mcp-server.jsonl` as parsed JSON.
+  - `/api/databases` — scans log history to discover active DB paths, queries memory records,
+    and supports `remember`, `recall`, and `forget` actions via `POST`.
+  - Dark glassmorphic UI with auto-refresh (5 s), semantic search recall tester, memory
+    explorer with trust/state/uncertainty badges, telemetry log timeline.
+  - Run locally: `cd dashboard && npm run dev` → `http://localhost:3000`.
+
+### Changed
+
+- **Framework adapters** (`bindings/python/memoire/adapters.py`) — `MemoireRetriever` and
+  `MemoireIndex` now accept a `namespace` parameter and forward it to the underlying
+  `Memoire(db_path, namespace=...)` constructor.
+
+- **MCP server** (`examples/mcp_server.py`) — trust-aware `save_lesson` and `get_lessons`
+  tools, plus low-level passthrough tools (`memoire_remember`, `memoire_recall`,
+  `memoire_forget`, `memoire_status`). Requires `pip install mcp`.
+
+- **Framework adapters** (`bindings/python/memoire/adapters.py`)
+  - `MemoireRetriever` — LangChain `BaseRetriever`-compatible; policy-filtered, works with
+    LCEL pipes and `RetrievalQA`. Requires `pip install langchain langchain-core`.
+  - `MemoireIndex` — LlamaIndex-compatible index with `as_retriever()` and `as_query_engine()`.
+    Requires `pip install llama-index-core`.
+  - Both adapters apply `MemoryPolicy` internally — IGNORE-ranked memories never reach the LLM.
+
+- **`EmbedProvider` trait** (`src/embedder.rs`) — pluggable embedding backend.
+- **`recall_within_days`** — time-bounded recall.
+- **`ScoringWeights`** struct — scoring constants surfaced for testing.
+
+### Fixed
+
+- `Command::CacheModels` match arm was missing from the CLI `match` block, causing a Rust
+  compile error (`E0004: non-exhaustive patterns`). Added `unreachable!()` arm since the
+  variant is handled via early `if let` return before `Memoire::new()` is invoked.
 
 ---
 
