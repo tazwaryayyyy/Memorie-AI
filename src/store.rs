@@ -109,7 +109,9 @@ impl StoreInner {
              WHERE namespace = ?1 AND archived = 0 AND superseded_by IS NULL",
         )?;
         for (id, blob) in stmt
-            .query_map(rusqlite::params![namespace], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+            .query_map(rusqlite::params![namespace], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
             .flatten()
         {
             if let Some(emb) = blob_to_vec(&blob) {
@@ -1193,7 +1195,8 @@ impl Store {
         }
         // Namespace column — added in v0.3.0. Existing rows get 'default'.
         if !has("namespace") {
-            alter.push("ALTER TABLE memories ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';");
+            alter
+                .push("ALTER TABLE memories ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';");
         }
 
         for sql in alter {
