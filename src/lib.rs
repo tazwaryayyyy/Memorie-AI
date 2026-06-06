@@ -270,7 +270,8 @@ impl Memoire {
             .embedder
             .embed_one(query)
             .map_err(MemoireError::Embedding)?;
-        self.store.search_within_days(&query_vec, top_k, max_age_days)
+        self.store
+            .search_within_days(&query_vec, top_k, max_age_days)
     }
 
     /// Reinforce a memory only when it was actually used by the agent.
