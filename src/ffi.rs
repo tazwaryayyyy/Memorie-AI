@@ -290,7 +290,7 @@ fn to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 /// 1. **Ownership**: `MemoireHandle` lives in a `Box` allocated by `memoire_new`
 ///    and freed only by `memoire_free`. The reference cannot outlive the Box.
 /// 2. **No exclusive aliasing**: `Memoire` exposes no `&mut self` methods — all
-///    mutation flows through the `Mutex<StoreInner>` inside. A shared `&Memoire`
+///    mutation flows through the synchronized store internals. A shared `&Memoire`
 ///    is therefore safe to hold across concurrent FFI calls.
 /// 3. **No mutation through this reference**: we cast `*mut → &` (not `&mut`),
 ///    which satisfies Rust's aliasing rules for the duration of the call.

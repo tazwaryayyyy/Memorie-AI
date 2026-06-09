@@ -35,7 +35,8 @@ Memoire is structured as four clean layers with no circular dependencies:
                              │  (src/store.rs)             │
                              │                             │
                              │  rusqlite (bundled SQLite)  │
-                             │  RwLock<StoreInner>         │
+                             │  r2d2 SQLite pool           │
+                             │  RwLock<StoreInner> cache   │
                              │  Cosine / HNSW search       │
                              │  MMR reranking              │
                              │  Trust decay on recall      │
@@ -308,10 +309,11 @@ Chunks exceeding `chunk_size × 3` characters fall back to the sliding window on
 
 ## Thread Safety
 
-The `Store` is protected by a `RwLock<StoreInner>`:
+The `Store` uses an `r2d2_sqlite` connection pool for SQLite access and a
+`RwLock<StoreInner>` for in-memory search state:
 
-- **Read operations** (`recall`, `recall_mmr`, `count`, `export_namespace`) acquire a shared read lock — multiple concurrent recalls do not block each other.
-- **Write operations** (`remember`, `reinforce_if_used`, `penalize_if_used`, `forget`, `clear`, `import_namespace`) acquire an exclusive write lock.
+- **Read operations** (`recall`, `recall_mmr`, `count`, `export_namespace`) draw their own SQLite connections from the pool. Hot recall paths use shared read locks for the embedding/HNSW cache, so concurrent recalls do not serialize on one `rusqlite::Connection`.
+- **Write operations** (`remember`, `reinforce_if_used`, `penalize_if_used`, `forget`, `clear`, `import_namespace`) also draw pooled connections. Operations that mutate the in-memory cache acquire an exclusive write lock for that cache update.
 
 The `Embedder` is always behind `Arc<Mutex<...>>` — embedding inference requires exclusive access regardless of read/write context.
 
@@ -327,7 +329,7 @@ std::thread::spawn(move || { let _ = m2.recall("other", 5); });
 // Both recalls proceed concurrently
 ```
 
-SQLite's WAL mode allows one writer and multiple readers to proceed concurrently at the database level.
+SQLite's WAL mode allows one writer and multiple readers to proceed concurrently at the database level. In-memory stores use a single pooled connection because SQLite `:memory:` databases are connection-local.
 
 ---
 

@@ -1,3 +1,5 @@
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
@@ -37,18 +39,13 @@ pub struct PenaltyOutcome {
 }
 
 pub struct Store {
+    pool: Pool<SqliteConnectionManager>,
     inner: RwLock<StoreInner>,
     pub config: ScoringConfig,
     /// Namespace this store instance is scoped to. All reads/writes are filtered
     /// by this value. Defaults to `"default"`. Set via `Store::open_ns()`.
     pub namespace: String,
 }
-
-// StoreInner contains rusqlite::Connection which is Send but not Sync.
-// Wrapping it in Mutex<StoreInner> provides the Sync we need for Store.
-// SAFETY: Connection is only ever accessed while holding the mutex.
-unsafe impl Send for StoreInner {}
-unsafe impl Sync for StoreInner {}
 
 /// ✅ FIX #5 — In-memory HNSW embedding point wrapper.
 ///
@@ -72,14 +69,11 @@ impl instant_distance::Point for EmbeddingPoint {
     }
 }
 
-/// ✅ FIX #1 — All mutable state lives inside a single Mutex.
+/// In-memory search state protected by `Store::inner`.
 ///
-/// `StoreInner` is the exclusive owner of the SQLite connection, in-memory
-/// embedding cache, fingerprint set, and HNSW index. Every method acquires
-/// `Mutex::lock()` before touching any of these fields, making `Store`
-/// safe to call from multiple threads (including FFI) without data races.
+/// SQLite connections live in `Store::pool`, so readers and writers do not
+/// serialize through one `rusqlite::Connection`.
 struct StoreInner {
-    conn: Connection,
     /// In-memory cache of (sqlite_id, embedding) for all live memories.
     /// Populated lazily on the first `max_similarity` or `search` call so that
     /// startup cost is O(fingerprint count) not O(embedding count).
@@ -101,11 +95,11 @@ impl StoreInner {
     /// Fingerprints are loaded eagerly at construction; embeddings are deferred here
     /// to keep startup cost proportional to fingerprint count (small strings) rather
     /// than embedding count (1536 bytes × N).
-    fn ensure_embedding_cache(&mut self, namespace: &str) -> crate::error::Result<()> {
+    fn ensure_embedding_cache(&mut self, conn: &Connection, namespace: &str) -> Result<()> {
         if self.embedding_cache_loaded {
             return Ok(());
         }
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, embedding FROM memories
              WHERE namespace = ?1 AND archived = 0 AND superseded_by IS NULL",
         )?;
@@ -224,20 +218,13 @@ fn rebuild_hnsw(inner: &mut StoreInner) {
     log::debug!("hnsw rebuilt: {} points", n);
 }
 
-/// Get top-K candidate (id, cosine_similarity) pairs.
-///
-/// - Below `config.hnsw_threshold`: linear scan over in-memory embedding cache.
-/// - Above threshold: HNSW ANN search (rebuilt lazily).
-fn search_candidates(
-    inner: &mut StoreInner,
+fn search_candidates_read(
+    inner: &StoreInner,
     query_vec: &[f32],
     top_k: usize,
     config: &ScoringConfig,
 ) -> Vec<(i64, f32)> {
     if inner.embedding_cache.len() >= config.hnsw_threshold {
-        if inner.hnsw_dirty || inner.hnsw.is_none() {
-            rebuild_hnsw(inner);
-        }
         if let Some(hnsw) = &inner.hnsw {
             let query_point = EmbeddingPoint(query_vec.to_vec());
             let mut search = instant_distance::Search::default();
@@ -246,7 +233,6 @@ fn search_candidates(
                 .map(|item| {
                     let dist = item.distance;
                     let id = *item.value;
-                    // L2 on unit vectors: cosine ≈ 1 − dist²/2
                     let sim = (1.0_f32 - dist * dist / 2.0).clamp(0.0, 1.0);
                     (id, sim)
                 })
@@ -258,7 +244,6 @@ fn search_candidates(
         }
     }
 
-    // Linear scan over in-memory cache — fast because it avoids all SQLite I/O.
     let mut candidates: Vec<(i64, f32)> = inner
         .embedding_cache
         .iter()
@@ -278,6 +263,54 @@ impl Store {
         self.inner.read().map_err(|_| MemoireError::LockPoisoned)
     }
 
+    fn prepare_search_cache(&self, conn: &Connection) -> Result<bool> {
+        {
+            let inner = self.read_lock()?;
+            if inner.embedding_cache_loaded {
+                if inner.embedding_cache.is_empty() {
+                    return Ok(false);
+                }
+                let hnsw_ready = inner.embedding_cache.len() < self.config.hnsw_threshold
+                    || (!inner.hnsw_dirty && inner.hnsw.is_some());
+                if hnsw_ready {
+                    return Ok(true);
+                }
+            }
+        }
+
+        let mut inner = self.write_lock()?;
+        let ns = self.namespace.clone();
+        inner.ensure_embedding_cache(conn, &ns)?;
+        if inner.embedding_cache.is_empty() {
+            return Ok(false);
+        }
+        if inner.embedding_cache.len() >= self.config.hnsw_threshold
+            && (inner.hnsw_dirty || inner.hnsw.is_none())
+        {
+            rebuild_hnsw(&mut inner);
+        }
+        Ok(true)
+    }
+
+    fn pooled_file_manager(path: &str) -> SqliteConnectionManager {
+        SqliteConnectionManager::file(path).with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA busy_timeout=5000;
+                 PRAGMA foreign_keys=ON;",
+            )
+        })
+    }
+
+    fn pooled_memory_manager() -> SqliteConnectionManager {
+        SqliteConnectionManager::memory().with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA busy_timeout=5000;
+                 PRAGMA foreign_keys=ON;",
+            )
+        })
+    }
+
     pub fn open(path: &str) -> Result<Self> {
         Self::open_ns(path, "default")
     }
@@ -293,10 +326,9 @@ impl Store {
     }
 
     pub fn open_ns_with_config(path: &str, namespace: &str, config: ScoringConfig) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let manager = Self::pooled_file_manager(path);
+        let pool = Pool::builder().max_size(20).build(manager)?;
+        let conn = pool.get()?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
         let fingerprints = load_fingerprints_from_db(&conn, namespace)?;
@@ -305,8 +337,8 @@ impl Store {
             fingerprints.len()
         );
         Ok(Self {
+            pool,
             inner: RwLock::new(StoreInner {
-                conn,
                 embedding_cache: Vec::new(),
                 embedding_cache_loaded: false,
                 fingerprints,
@@ -331,12 +363,15 @@ impl Store {
     }
 
     pub fn in_memory_ns_with_config(namespace: &str, config: ScoringConfig) -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let manager = Self::pooled_memory_manager();
+        let pool = Pool::builder().max_size(1).build(manager)?;
+        let conn = pool.get()?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
+        drop(conn);
         Ok(Self {
+            pool,
             inner: RwLock::new(StoreInner {
-                conn,
                 embedding_cache: Vec::new(),
                 // In-memory store starts empty — no deferred load needed.
                 embedding_cache_loaded: true,
@@ -365,8 +400,8 @@ impl Store {
             return Ok(false);
         }
 
-        let inner = self.write_lock()?;
-        let row = inner.conn.query_row(
+        let conn = self.pool.get()?;
+        let row = conn.query_row(
             "SELECT content, embedding,
                     reinforcement_count, confidence, importance_base,
                     created_at, store_state, contradiction_group,
@@ -442,11 +477,9 @@ impl Store {
             conf
         };
         let now: i64 =
-            inner
-                .conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
+            conn.query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
         let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
         let contradiction_survived = cg.is_some() && store_state == "active";
         let trust_after = compute_trust(
@@ -463,7 +496,7 @@ impl Store {
             Some(ema) => ((1.0 - w) * ema + w * trust_after).clamp(0.0, 1.0),
             None => trust_after,
         };
-        inner.conn.execute(
+        conn.execute(
             "UPDATE memories
              SET reinforcement_count = ?1,
                  confidence = ?2,
@@ -484,16 +517,14 @@ impl Store {
             return Ok(vec![]);
         }
         let severity = failure_severity.clamp(0.0, 1.0);
-        let inner = self.write_lock()?;
+        let conn = self.pool.get()?;
         let now: i64 =
-            inner
-                .conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
+            conn.query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
         let mut outcomes = Vec::with_capacity(memory_ids.len());
         for &id in memory_ids {
-            let row = inner.conn.query_row(
+            let row = conn.query_row(
                 "SELECT reinforcement_count, confidence, importance_base,
                         created_at, store_state, contradiction_group,
                         failure_count, trust_ema
@@ -554,7 +585,7 @@ impl Store {
             let uncertainty_after =
                 (0.5 / (1.0 + rc_f) + 0.5 * fc_f / (fc_f + rc_f + 1.0)).clamp(0.0, 1.0);
 
-            inner.conn.execute(
+            conn.execute(
                 "UPDATE memories
                  SET reinforcement_count = ?1,
                      confidence = ?2,
@@ -594,8 +625,8 @@ impl Store {
             None
         };
         let now_ts_val = now_ts();
-        let mut inner = self.write_lock()?;
-        inner.conn.execute(
+        let conn = self.pool.get()?;
+        conn.execute(
             "INSERT INTO memories (
                 namespace, content, embedding,
                 importance_base, confidence, novelty,
@@ -639,8 +670,9 @@ impl Store {
                 now_ts_val,
             ],
         )?;
-        let id = inner.conn.last_insert_rowid();
+        let id = conn.last_insert_rowid();
         if quality.store_state != "rejected" && quality.archived == 0 {
+            let mut inner = self.write_lock()?;
             // Only update the in-memory cache if it has already been loaded.
             // If not yet loaded, the lazy load will pick this row up from SQLite.
             if inner.embedding_cache_loaded {
@@ -653,9 +685,11 @@ impl Store {
     }
 
     pub fn max_similarity(&self, query_vec: &[f32]) -> Result<f32> {
-        let mut inner = self.write_lock()?;
-        let ns = self.namespace.clone();
-        inner.ensure_embedding_cache(&ns)?;
+        let conn = self.pool.get()?;
+        if !self.prepare_search_cache(&conn)? {
+            return Ok(0.0);
+        }
+        let inner = self.read_lock()?;
         let max_sim = inner
             .embedding_cache
             .iter()
@@ -674,25 +708,25 @@ impl Store {
             return Ok(vec![]);
         }
 
-        let mut inner = self.write_lock()?;
-        let ns = self.namespace.clone();
-        inner.ensure_embedding_cache(&ns)?;
-        if inner.embedding_cache.is_empty() {
+        let conn = self.pool.get()?;
+        if !self.prepare_search_cache(&conn)? {
             return Ok(vec![]);
         }
 
-        let candidates = search_candidates(&mut inner, query_vec, top_k, &self.config);
+        let candidates = {
+            let inner = self.read_lock()?;
+            search_candidates_read(&inner, query_vec, top_k, &self.config)
+        };
+        let ns = self.namespace.clone();
 
         let now: i64 =
-            inner
-                .conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
+            conn.query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
 
         let mut scored: Vec<(f32, f32, Option<String>, Memory)> = Vec::new();
         for (id, sim) in &candidates {
-            let row = inner.conn.query_row(
+            let row = conn.query_row(
                 "SELECT content, created_at,
                         importance_base, reinforcement_count, confidence,
                         store_state, contradiction_group,
@@ -831,7 +865,7 @@ impl Store {
         if !result.is_empty() {
             let ids: Vec<String> = result.iter().map(|m| m.id.to_string()).collect();
             let placeholders = ids.join(",");
-            inner.conn.execute_batch(&format!(
+            conn.execute_batch(&format!(
                 "UPDATE memories SET last_used_at = {now} WHERE id IN ({placeholders});",
                 now = now
             ))?;
@@ -864,10 +898,11 @@ impl Store {
     ///
     /// Applicable to any domain. Quality-weighted resolution preserved.
     pub fn resolve_contradictions_for_id(&self, id: i64) -> Result<()> {
+        let conn = self.pool.get()?;
         let mut inner = self.write_lock()?;
         let ns = self.namespace.clone();
 
-        let target_row = inner.conn.query_row(
+        let target_row = conn.query_row(
             "SELECT content, embedding, importance_base, confidence, evidence, created_at, claim_value
              FROM memories WHERE id = ?1 AND namespace = ?2 AND archived = 0",
             params![id, ns],
@@ -901,13 +936,11 @@ impl Store {
         }
 
         let now: i64 =
-            inner
-                .conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
+            conn.query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
 
-        let mut stmt = inner.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, content, embedding, importance_base, confidence, evidence, created_at, claim_value
              FROM memories
              WHERE id != ?1
@@ -993,7 +1026,7 @@ impl Store {
             };
 
             let group = winner_id.to_string();
-            inner.conn.execute(
+            conn.execute(
                 "UPDATE memories SET superseded_by = ?1, archived = 1, contradiction_group = ?2
                  WHERE id = ?3",
                 params![winner_id, group, loser_id],
@@ -1012,16 +1045,17 @@ impl Store {
     }
 
     pub fn maintenance_pass(&self) -> Result<()> {
+        let conn = self.pool.get()?;
         let mut inner = self.write_lock()?;
 
-        inner.conn.execute_batch(
+        conn.execute_batch(
             "UPDATE memories
              SET archived = 1
              WHERE superseded_by IS NOT NULL
                AND archived = 0;",
         )?;
 
-        let mut stmt = inner.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id FROM memories
              WHERE archived = 1
                AND (strftime('%s', 'now') - created_at) > 7 * 86400
@@ -1040,9 +1074,7 @@ impl Store {
         drop(stmt);
 
         for del_id in to_delete {
-            inner
-                .conn
-                .execute("DELETE FROM memories WHERE id = ?1", params![del_id])?;
+            conn.execute("DELETE FROM memories WHERE id = ?1", params![del_id])?;
             inner.remove_from_cache(del_id);
         }
 
@@ -1050,16 +1082,14 @@ impl Store {
     }
 
     pub fn all(&self) -> Result<Vec<Memory>> {
-        let inner = self.write_lock()?;
+        let conn = self.pool.get()?;
         let ns = &self.namespace;
         let now: i64 =
-            inner
-                .conn
-                .query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
-                    r.get(0)
-                })?;
+            conn.query_row("SELECT CAST(strftime('%s', 'now') AS INTEGER)", [], |r| {
+                r.get(0)
+            })?;
 
-        let mut stmt = inner.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, content, created_at,
                     importance_base, reinforcement_count, confidence,
                     store_state, contradiction_group,
@@ -1134,10 +1164,9 @@ impl Store {
     }
 
     pub fn forget(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
         let mut inner = self.write_lock()?;
-        let rows = inner
-            .conn
-            .execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        let rows = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
         if rows > 0 {
             inner.remove_from_cache(id);
         }
@@ -1145,8 +1174,8 @@ impl Store {
     }
 
     pub fn count(&self) -> Result<i64> {
-        let inner = self.write_lock()?;
-        Ok(inner.conn.query_row(
+        let conn = self.pool.get()?;
+        Ok(conn.query_row(
             "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND archived = 0",
             rusqlite::params![self.namespace],
             |r| r.get(0),
@@ -1154,8 +1183,9 @@ impl Store {
     }
 
     pub fn clear(&self) -> Result<()> {
+        let conn = self.pool.get()?;
         let mut inner = self.write_lock()?;
-        inner.conn.execute_batch("DELETE FROM memories;")?;
+        conn.execute_batch("DELETE FROM memories;")?;
         inner.embedding_cache.clear();
         inner.embedding_cache_loaded = true; // empty store is coherent — no load needed
         inner.fingerprints.clear();
@@ -1189,7 +1219,7 @@ impl Store {
         // We need per-candidate embeddings to compute similarity between candidates.
         // Use the score field (which encodes cosine sim to query) as the relevance term,
         // and do a second pass to compute inter-candidate similarity from the in-memory cache.
-        let inner = match self.write_lock() {
+        let inner = match self.read_lock() {
             Ok(i) => i,
             Err(_) => {
                 candidates.truncate(top_k);

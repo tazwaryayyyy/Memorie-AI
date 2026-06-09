@@ -110,6 +110,27 @@ impl PyMemoire {
         Ok(py_memories)
     }
 
+    fn recall_reranked(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
+        let memories = self
+            .inner
+            .recall_reranked(query, top_k)
+            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
+        let py_memories = memories
+            .into_iter()
+            .map(|m| PyMemory {
+                id: m.id,
+                content: m.content,
+                score: m.score,
+                trust: m.trust,
+                uncertainty: m.uncertainty,
+                state: m.state,
+                created_at: m.created_at,
+                last_used_at: m.last_used_at,
+            })
+            .collect();
+        Ok(py_memories)
+    }
+
     fn forget(&self, memory_id: i64) -> PyResult<bool> {
         let deleted = self
             .inner

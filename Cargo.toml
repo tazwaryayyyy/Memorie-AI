@@ -27,6 +27,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 fastembed = { version = "=5.13.2", default-features = false, features = ["online", "ort-download-binaries-native-tls"] }
 blake3 = "1"
 instant-distance = "0.6"

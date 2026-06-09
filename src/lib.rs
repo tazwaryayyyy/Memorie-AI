@@ -8,12 +8,13 @@ pub mod quality;
 pub mod store;
 
 use chunker::{chunk_text, ChunkerConfig};
-use embedder::{EmbedProvider, Embedder};
+use embedder::{EmbedProvider, Embedder, FastEmbedReranker, Reranker};
 use error::{MemoireError, Result};
 use quality::{
     build_quality_meta, fingerprint, IngestDecision, ScoringConfig, ScoringPrototypes,
     ScoringWeights,
 };
+use std::sync::{Arc, Mutex};
 use store::{Memory, Store};
 
 /// The central Memoire instance.
@@ -34,6 +35,7 @@ use store::{Memory, Store};
 pub struct Memoire {
     pub(crate) store: Store,
     embedder: Box<dyn EmbedProvider>,
+    reranker: Option<Arc<Mutex<Box<dyn Reranker>>>>,
     chunker_config: ChunkerConfig,
     scoring_weights: ScoringWeights,
     prototypes: ScoringPrototypes,
@@ -84,6 +86,7 @@ impl Memoire {
         Ok(Self {
             store: Store::open_ns_with_config(db_path, namespace, ScoringConfig::default())?,
             embedder,
+            reranker: None,
             chunker_config: ChunkerConfig::default(),
             scoring_weights: ScoringWeights::default(),
             prototypes,
@@ -122,6 +125,7 @@ impl Memoire {
         Ok(Self {
             store: Store::in_memory_ns_with_config(namespace, ScoringConfig::default())?,
             embedder,
+            reranker: None,
             chunker_config: ChunkerConfig::default(),
             scoring_weights: ScoringWeights::default(),
             prototypes,
@@ -146,6 +150,15 @@ impl Memoire {
     pub fn with_chunker_config(mut self, config: ChunkerConfig) -> Self {
         self.chunker_config = config;
         self
+    }
+
+    /// Enable cross-encoder reranking for `recall_reranked`.
+    ///
+    /// This is opt-in because the reranker downloads and initialises a separate
+    /// model on first construction.
+    pub fn with_reranker(mut self) -> Result<Self> {
+        self.reranker = Some(Arc::new(Mutex::new(Box::new(FastEmbedReranker::new()?))));
+        Ok(self)
     }
 
     /// Override the default scoring weights used at ingestion time.
@@ -357,6 +370,30 @@ impl Memoire {
         Ok(self
             .store
             .mmr_rerank(candidates, &query_vec, top_k, mmr_lambda))
+    }
+
+    /// Recall with an optional cross-encoder reranking pass.
+    ///
+    /// Without `with_reranker()`, this falls back to regular recall candidates.
+    pub fn recall_reranked(&self, query: &str, top_k: usize) -> Result<Vec<Memory>> {
+        if self.store.count()? == 0 || top_k == 0 {
+            return Ok(vec![]);
+        }
+
+        let candidate_k = (top_k * 4).max(20);
+        let candidates = self.recall(query, candidate_k)?;
+        if let Some(reranker) = &self.reranker {
+            let texts: Vec<&str> = candidates.iter().map(|m| m.content.as_str()).collect();
+            let scores = reranker
+                .lock()
+                .map_err(|_| MemoireError::LockPoisoned)?
+                .rerank(query, &texts)?;
+            let mut scored: Vec<(f32, Memory)> = scores.into_iter().zip(candidates).collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            Ok(scored.into_iter().take(top_k).map(|(_, m)| m).collect())
+        } else {
+            Ok(candidates.into_iter().take(top_k).collect())
+        }
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────

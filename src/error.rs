@@ -5,6 +5,9 @@ pub enum MemoireError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 
+    #[error("database pool error: {0}")]
+    DatabasePool(#[from] r2d2::Error),
+
     #[error("embedding error: {0}")]
     Embedding(#[from] anyhow::Error),
 

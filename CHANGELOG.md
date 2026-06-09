@@ -59,13 +59,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed (P1 — architecture)
 
-- **P1.1 — RwLock for Store:** The `Store` is now protected by `RwLock<StoreInner>`
-  instead of a single `Mutex`. Read operations (`recall`, `count`, `export_namespace`)
-  acquire a shared read lock; write operations (`remember`, `reinforce_if_used`,
-  `penalize_if_used`, `forget`, `clear`, `import_namespace`) acquire an exclusive write
-  lock. Concurrent recalls from multiple agents no longer block each other.
-  The `Embedder` remains behind `Arc<Mutex<...>>` — embedding inference requires
-  exclusive access.
+- **P1.1 — RwLock + SQLite pool for Store:** The `Store` now keeps in-memory search
+  state behind `RwLock<StoreInner>` and uses an `r2d2_sqlite` connection pool for DB
+  access. Hot recall paths use shared read locks and independent SQLite connections;
+  writes that mutate the embedding/fingerprint/HNSW cache still acquire an exclusive
+  cache lock. The `Embedder` remains behind `Arc<Mutex<...>>` — embedding inference
+  requires exclusive access.
 
 - **P1.2 — Axum HTTP server replaces dashboard CLI subprocesses:** Added
   `src/bin/memoire_server.rs` — a long-lived Axum 0.7 service that exposes the library

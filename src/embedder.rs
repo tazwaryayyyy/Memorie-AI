@@ -1,5 +1,7 @@
 use anyhow::Result;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
+};
 use std::sync::Mutex;
 
 pub struct Embedder {
@@ -81,5 +83,51 @@ impl EmbedProvider for Embedder {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+}
+
+/// Cross-encoder reranking backend abstraction.
+pub trait Reranker: Send + Sync {
+    /// Returns one relevance score per `(query, candidate)` pair.
+    /// Higher score means more relevant.
+    fn rerank(&self, query: &str, candidates: &[&str]) -> anyhow::Result<Vec<f32>>;
+}
+
+pub struct FastEmbedReranker {
+    model: Mutex<TextRerank>,
+}
+
+impl FastEmbedReranker {
+    pub fn new() -> Result<Self> {
+        log::info!("Initialising reranker model (BAAI/bge-reranker-base)...");
+        let model = TextRerank::try_new(
+            RerankInitOptions::new(RerankerModel::BGERerankerBase)
+                .with_show_download_progress(true),
+        )?;
+        log::info!("Reranker model ready.");
+        Ok(Self {
+            model: Mutex::new(model),
+        })
+    }
+}
+
+impl Reranker for FastEmbedReranker {
+    fn rerank(&self, query: &str, candidates: &[&str]) -> anyhow::Result<Vec<f32>> {
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reranker mutex poisoned"))?;
+        let results = model.rerank(query, candidates, false, None)?;
+        let mut scores = vec![f32::NEG_INFINITY; candidates.len()];
+        for result in results {
+            if result.index < scores.len() {
+                scores[result.index] = result.score;
+            }
+        }
+        Ok(scores)
     }
 }
