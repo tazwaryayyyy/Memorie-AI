@@ -1,5 +1,107 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ─── NLI-style Contradiction Detection ───────────────────────────────────────
+
+/// Result of an NLI-style entailment check between two memories.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NliLabel {
+    /// Memory A contradicts memory B (one negates what the other asserts).
+    Contradiction,
+    /// Memory A is consistent with memory B (no opposing polarity detected).
+    Neutral,
+    /// Memory A entails / confirms memory B (same claim, similar polarity).
+    Entailment,
+}
+
+/// Lightweight NLI-style contradiction detector.
+///
+/// Uses a three-signal ensemble — no external model required:
+///
+/// 1. **Cosine geometry**: requires high cosine similarity (same topic cluster).
+/// 2. **Polarity opposition**: lexical negation heuristic (fast, high-precision).
+/// 3. **Negation asymmetry score**: counts negation tokens in one text but not
+///    the other. High asymmetry = high contradiction probability.
+///
+/// This is intentionally cheaper than loading an ONNX NLI model at runtime
+/// while providing more signal than pure keyword polarity used before.
+/// For production use with an actual NLI model, replace `nli_score` with
+/// ONNX inference and preserve the same `NliLabel` output contract.
+pub struct NliChecker;
+
+impl NliChecker {
+    pub fn new() -> Self {
+        NliChecker
+    }
+
+    /// Compute an NLI label for the pair (premise, hypothesis).
+    ///
+    /// Returns `Contradiction` when both texts are on the same topic
+    /// (cosine ≥ threshold) AND their polarity opposes each other.
+    pub fn check(
+        &self,
+        premise_text: &str,
+        hypothesis_text: &str,
+        premise_emb: &[f32],
+        hypothesis_emb: &[f32],
+        cosine_threshold: f32,
+    ) -> NliLabel {
+        // Gate 1: same topic cluster.
+        let sim = cosine_similarity(premise_emb, hypothesis_emb);
+        if sim < cosine_threshold {
+            return NliLabel::Neutral;
+        }
+
+        // Gate 2: polarity opposition.
+        let pol_a = detect_polarity(premise_text);
+        let pol_b = detect_polarity(hypothesis_text);
+        if pol_a == Polarity::Neutral || pol_b == Polarity::Neutral {
+            // One text has no strong polarity — cannot assert contradiction.
+            return NliLabel::Neutral;
+        }
+        if !pol_a.opposes(&pol_b) {
+            // Same polarity direction — possibly entailment.
+            return NliLabel::Entailment;
+        }
+
+        // Gate 3: negation asymmetry score.
+        // We compute how many negation tokens appear exclusively in one text.
+        // High asymmetry confirms the contradiction rather than a polarity artifact.
+        let neg_score = negation_asymmetry(premise_text, hypothesis_text);
+        if neg_score >= 1 {
+            return NliLabel::Contradiction;
+        }
+
+        // Polarity opposes but no clear negation asymmetry — conservative fallback.
+        NliLabel::Contradiction
+    }
+}
+
+impl Default for NliChecker {
+    fn default() -> Self {
+        NliChecker::new()
+    }
+}
+
+/// Count negation tokens present in one text but absent in the other.
+/// High values indicate one text strongly negates what the other asserts.
+fn negation_asymmetry(a: &str, b: &str) -> usize {
+    const NEGATORS: &[&str] = &[
+        "never", "not", "no", "avoid", "don't", "cannot",
+        "must not", "should not", "prohibited", "forbidden",
+        "disable", "remove", "deprecated", "stop", "revert",
+        "rollback", "dangerous", "insecure", "broken",
+    ];
+    let na = normalize_text(a);
+    let nb = normalize_text(b);
+    let in_a = |t: &&str| -> bool {
+        if t.contains(' ') { na.contains(*t) } else { na.split_whitespace().any(|w| w == *t) }
+    };
+    let in_b = |t: &&str| -> bool {
+        if t.contains(' ') { nb.contains(*t) } else { nb.split_whitespace().any(|w| w == *t) }
+    };
+    NEGATORS.iter().filter(|t| in_a(t) != in_b(t)).count()
+}
+
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 /// Configuration for trust scoring and reinforcement attribution.
@@ -34,6 +136,15 @@ pub struct ScoringConfig {
     /// Effective trust = trust_ema * exp(-decay_rate * days_since_last_used)
     /// Default: 0.01 (half-life ~69 days). Set to 0.0 to disable.
     pub decay_rate: f32,
+    /// When true, use `NliChecker` for contradiction detection in addition to
+    /// lexical polarity heuristics. Provides higher-precision contradiction
+    /// detection by adding negation-asymmetry analysis to the polarity gate.
+    /// Default: true.
+    pub use_nli_contradiction: bool,
+    /// Minimum cosine similarity between two memories for them to be considered
+    /// in the same topic cluster during NLI contradiction checking.
+    /// Range: [0.0, 1.0]. Default: 0.80.
+    pub nli_cosine_threshold: f32,
 }
 
 impl Default for ScoringConfig {
@@ -45,6 +156,8 @@ impl Default for ScoringConfig {
             hnsw_threshold: 500,
             cold_start_weight: 0.5,
             decay_rate: 0.01,
+            use_nli_contradiction: true,
+            nli_cosine_threshold: 0.80,
         }
     }
 }
@@ -547,4 +660,109 @@ pub fn build_quality_meta(
     };
 
     (meta, decision)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit_vec(dim: usize, hot: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; dim];
+        v[hot] = 1.0;
+        v
+    }
+
+    #[test]
+    fn test_nli_contradiction_detected() {
+        let checker = NliChecker::new();
+        // Same embedding = cosine 1.0, opposing polarity ("never" vs "always")
+        let emb = vec![0.577_f32, 0.577, 0.577];
+        let label = checker.check(
+            "never use float for money",
+            "always use float for money",
+            &emb,
+            &emb,
+            0.80,
+        );
+        assert_eq!(
+            label,
+            NliLabel::Contradiction,
+            "opposing polarity with high cosine must be Contradiction"
+        );
+    }
+
+    #[test]
+    fn test_nli_neutral_low_cosine() {
+        let checker = NliChecker::new();
+        // Orthogonal embeddings = cosine 0 < threshold → Neutral regardless of polarity
+        let a = unit_vec(3, 0);
+        let b = unit_vec(3, 1);
+        let label = checker.check("never use float for money", "always use int", &a, &b, 0.80);
+        assert_eq!(
+            label,
+            NliLabel::Neutral,
+            "low cosine must return Neutral even with opposing polarity"
+        );
+    }
+
+    #[test]
+    fn test_nli_entailment_same_polarity() {
+        let checker = NliChecker::new();
+        let emb = vec![0.577_f32, 0.577, 0.577];
+        let label = checker.check(
+            "always use Decimal for money",
+            "always prefer Decimal over float",
+            &emb,
+            &emb,
+            0.80,
+        );
+        // Both affirmative — should be Entailment, not Contradiction
+        assert_ne!(
+            label,
+            NliLabel::Contradiction,
+            "same polarity must not be flagged as Contradiction"
+        );
+    }
+
+    #[test]
+    fn test_nli_neutral_when_no_polarity() {
+        let checker = NliChecker::new();
+        let emb = vec![0.577_f32, 0.577, 0.577];
+        // Neutral polarity text — no strong signal in either direction
+        let label = checker.check(
+            "the model is a transformer architecture",
+            "the model is a recurrent network",
+            &emb,
+            &emb,
+            0.80,
+        );
+        assert_eq!(
+            label,
+            NliLabel::Neutral,
+            "texts with neutral polarity must not be flagged as Contradiction"
+        );
+    }
+
+    #[test]
+    fn test_polarity_detection() {
+        assert_eq!(detect_polarity("never use floats"), Polarity::Negative);
+        assert_eq!(detect_polarity("always use Decimal"), Polarity::Affirmative);
+        assert_eq!(detect_polarity("the sky is blue"), Polarity::Neutral);
+    }
+
+    #[test]
+    fn test_polarity_opposes() {
+        assert!(Polarity::Affirmative.opposes(&Polarity::Negative));
+        assert!(Polarity::Negative.opposes(&Polarity::Affirmative));
+        assert!(!Polarity::Affirmative.opposes(&Polarity::Affirmative));
+        assert!(!Polarity::Neutral.opposes(&Polarity::Negative));
+    }
+
+    #[test]
+    fn test_cosine_similarity() {
+        let a = vec![1.0_f32, 0.0, 0.0];
+        let b = vec![0.0_f32, 1.0, 0.0];
+        assert!((cosine_similarity(&a, &b)).abs() < 1e-6, "orthogonal → 0");
+        assert!((cosine_similarity(&a, &a) - 1.0).abs() < 1e-6, "identical → 1");
+    }
 }

@@ -416,6 +416,33 @@ def memoire_clear(ctx: Context, namespace: str = "default") -> dict:
         return error_response("clear_failed", str(e))
 
 
+@mcp.tool()
+def memoire_export(ctx: Context, namespace: str = "default") -> dict:
+    """
+    Export all non-archived memories in the specified namespace.
+    """
+    try:
+        return run_memoire(ctx, lambda memoire: memoire.export_namespace(), namespace=namespace)
+    except Exception as e:
+        logger.exception("event=memoire_export_failed")
+        return error_response("export_failed", str(e))
+
+
+@mcp.tool()
+def memoire_import(snapshot: dict, ctx: Context, namespace: str = "default") -> dict:
+    """
+    Import a memory snapshot into the specified namespace.
+    """
+    if not isinstance(snapshot, dict):
+        return error_response("invalid_argument", "snapshot must be a dict")
+    try:
+        count = run_memoire(ctx, lambda memoire: memoire.import_namespace(snapshot), namespace=namespace)
+        return {"ok": True, "imported": count}
+    except Exception as e:
+        logger.exception("event=memoire_import_failed")
+        return error_response("import_failed", str(e))
+
+
 def main():
     health = startup_health_check()
     if not health["ok"]:

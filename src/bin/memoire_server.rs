@@ -287,8 +287,8 @@ async fn export_handler(
     Query(params): Query<DbQuery>,
 ) -> impl IntoResponse {
     match get_or_create(&cache, &params.db, &params.ns).await {
-        Ok(m) => match m.export_all() {
-            Ok(memories) => (StatusCode::OK, Json(json!({ "memories": memories }))).into_response(),
+        Ok(m) => match m.export_namespace() {
+            Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e.to_string() })),

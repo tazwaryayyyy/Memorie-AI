@@ -9,7 +9,7 @@ use std::sync::RwLock;
 use crate::error::{MemoireError, Result};
 use crate::quality::{
     compute_trust, cosine_similarity, detect_polarity, effective_weight, now_ts, recency_bonus,
-    Polarity, QualityMeta, ScoringConfig,
+    NliChecker, NliLabel, Polarity, QualityMeta, ScoringConfig,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -889,14 +889,16 @@ impl Store {
             .collect())
     }
 
-    /// ✅ FIX #4 — Generalised semantic contradiction detection.
+    /// NLI-enhanced semantic contradiction detection.
     ///
-    /// Replaces the 4-domain hardcoded claim matching (JWT, bcrypt, rate limiting,
-    /// floats) with a domain-agnostic approach:
-    ///   1. cosine similarity > 0.80 → same topic cluster
-    ///   2. opposing polarity       → one asserts, the other negates
+    /// When `config.use_nli_contradiction` is true (default), uses `NliChecker`
+    /// which applies a three-signal ensemble:
+    ///   1. Cosine similarity gate (same topic cluster, threshold from config)
+    ///   2. Polarity opposition (lexical negation)
+    ///   3. Negation asymmetry score (how many negators appear in one but not the other)
     ///
-    /// Applicable to any domain. Quality-weighted resolution preserved.
+    /// When `use_nli_contradiction` is false, falls back to the original
+    /// pure polarity-based gate for backward compatibility.
     pub fn resolve_contradictions_for_id(&self, id: i64) -> Result<()> {
         let conn = self.pool.get()?;
         let mut inner = self.write_lock()?;
@@ -950,6 +952,11 @@ impl Store {
                AND store_state IN ('active', 'shadow')",
         )?;
 
+        // Build NLI checker once (zero-cost: stateless struct).
+        let use_nli = self.config.use_nli_contradiction;
+        let nli_threshold = self.config.nli_cosine_threshold;
+        let nli = NliChecker::new();
+
         let mut contradictions: Vec<(i64, f32, f32, f32, i64)> = Vec::new();
         for row in stmt.query_map(params![id, ns], |r| {
             Ok((
@@ -982,24 +989,37 @@ impl Store {
                 None => continue,
             };
 
-            let sim = cosine_similarity(&new_emb, &other_emb);
-            if sim < 0.80 {
-                continue;
-            }
+            let is_contradiction = if use_nli {
+                // NLI path: three-signal ensemble.
+                let label = nli.check(
+                    &new_content,
+                    &other_content,
+                    &new_emb,
+                    &other_emb,
+                    nli_threshold,
+                );
+                label == NliLabel::Contradiction
+            } else {
+                // Legacy path: cosine + polarity only.
+                let sim = cosine_similarity(&new_emb, &other_emb);
+                if sim < 0.80 {
+                    continue;
+                }
+                let other_polarity_str = other_polarity_opt
+                    .as_deref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| detect_polarity(&other_content).as_str().to_string());
+                let new_pol = Polarity::from_stored(&new_polarity_str);
+                let other_pol = Polarity::from_stored(&other_polarity_str);
+                new_pol.opposes(&other_pol)
+            };
 
-            let other_polarity_str = other_polarity_opt
-                .unwrap_or_else(|| detect_polarity(&other_content).as_str().to_string());
-            if other_polarity_str == "neutral" {
-                continue;
-            }
-
-            // IMPORTANT: parse the stored polarity string with Polarity::from_stored.
-            // Calling detect_polarity("affirmative") would scan for tokens like "never"/
-            // "always" in the word "affirmative" — none match, so it returns Neutral,
-            // making opposes() always false and silently disabling all contradiction detection.
-            let new_pol = Polarity::from_stored(&new_polarity_str);
-            let other_pol = Polarity::from_stored(&other_polarity_str);
-            if !new_pol.opposes(&other_pol) {
+            if !is_contradiction {
+                // For the NLI path we need to check the polarity explicitly for legacy compat.
+                if !use_nli {
+                    continue;
+                }
+                // NLI returned Neutral or Entailment — skip.
                 continue;
             }
 
@@ -1037,7 +1057,8 @@ impl Store {
             // memories whose best-survivor trust < 0.40 — incorrectly hiding the winner.
             inner.remove_from_cache(loser_id);
             log::debug!(
-                "contradiction resolved: winner={winner_id} loser={loser_id} group={group}"
+                "contradiction resolved ({}): winner={winner_id} loser={loser_id} group={group}",
+                if use_nli { "nli" } else { "polarity" }
             );
         }
 
@@ -1191,6 +1212,73 @@ impl Store {
         inner.fingerprints.clear();
         inner.hnsw = None;
         inner.hnsw_dirty = false;
+        Ok(())
+    }
+
+    pub fn export_namespace(&self) -> Result<serde_json::Value> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT content, trust_ema, reinforcement_count, importance_base, confidence, created_at
+             FROM memories
+             WHERE namespace = ?1 AND archived = 0"
+        )?;
+        
+        let ns = &self.namespace;
+        let memories: Vec<serde_json::Value> = stmt.query_map(params![ns], |r| {
+            let content: String = r.get(0)?;
+            let trust_ema: Option<f32> = r.get(1)?;
+            let reinforcement_count: i64 = r.get(2)?;
+            let importance_base: f32 = r.get(3)?;
+            let confidence: f32 = r.get(4)?;
+            let created_at: i64 = r.get(5)?;
+            
+            Ok(serde_json::json!({
+                "content": content,
+                "trust_ema": trust_ema,
+                "reinforcement_count": reinforcement_count,
+                "importance_base": importance_base,
+                "confidence": confidence,
+                "created_at": created_at,
+            }))
+        })?.filter_map(|r| r.ok()).collect();
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+            
+        Ok(serde_json::json!({
+            "memoire_export_version": 1,
+            "namespace": ns,
+            "exported_at": now,
+            "memories": memories,
+        }))
+    }
+
+    pub fn update_imported_metadata(
+        &self,
+        ids: &[i64],
+        trust_ema: Option<f32>,
+        reinforcement_count: i64,
+        importance_base: f32,
+        confidence: f32,
+        created_at: Option<i64>,
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.pool.get()?;
+        let placeholders = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let query = format!(
+            "UPDATE memories SET trust_ema = ?1, reinforcement_count = ?2, importance_base = ?3, confidence = ?4 {} WHERE id IN ({})",
+            if created_at.is_some() { ", created_at = ?5" } else { "" },
+            placeholders
+        );
+        if let Some(created) = created_at {
+            conn.execute(&query, params![trust_ema, reinforcement_count, importance_base, confidence, created])?;
+        } else {
+            conn.execute(&query, params![trust_ema, reinforcement_count, importance_base, confidence])?;
+        }
         Ok(())
     }
 

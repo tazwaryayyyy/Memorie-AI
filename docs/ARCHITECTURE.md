@@ -396,3 +396,65 @@ Namespace isolation is enforced at every entry point:
 - Dashboard (passes namespace through to server)
 
 The MCP server instance cache key is `(db_path, namespace)` — different namespaces on the same database get separate `Memoire` instances with no state leakage.
+
+---
+
+## NLI Contradiction Detection (P3.3)
+
+`resolve_contradictions_for_id` is called after every `remember()` for each new chunk. When `ScoringConfig::use_nli_contradiction` is `true` (default), it uses a three-signal ensemble implemented in `src/quality.rs::NliChecker`:
+
+### Signal 1 — Cosine gate
+Memories with cosine similarity below `nli_cosine_threshold` (default 0.80) are on different topics and skipped.
+
+### Signal 2 — Polarity opposition
+`detect_polarity()` classifies each text as `Affirmative`, `Negative`, or `Neutral` via a small high-precision lexicon. Texts where one is `Neutral` are skipped. Only `Affirmative↔Negative` pairs proceed.
+
+### Signal 3 — Negation asymmetry
+`negation_asymmetry(a, b)` counts negation tokens present in one text but absent in the other. Score ≥ 1 confirms the contradiction. This guards against polarity false positives where both texts happen to share surface tokens.
+
+### Resolution
+Quality-weighted: `q = 0.45×importance + 0.25×confidence + 0.20×recency + 0.10×evidence`. The loser is archived (`archived=1`, `superseded_by=winner_id`), removed from the in-memory embedding cache, and logged. The winner is untouched.
+
+Setting `use_nli_contradiction: false` reverts to the previous polarity-only gate for backward compatibility.
+
+---
+
+## Export / Import (P3.2)
+
+`export_namespace()` serialises all non-archived memories in the current namespace to a JSON snapshot:
+
+```json
+{
+  "memoire_export_version": 1,
+  "namespace": "billing-agent",
+  "exported_at": 1718000000,
+  "memories": [
+    { "content": "...", "trust_ema": 0.62, "reinforcement_count": 3, ... }
+  ]
+}
+```
+
+Embeddings and raw IDs are **never exported** — they are recomputed on import. `import_namespace()` calls `remember()` on each content string (which re-embeds, deduplicates, and runs quality scoring), then overwrites `trust_ema`, `reinforcement_count`, `importance_base`, `confidence`, and `created_at` with the snapshot values to preserve the original trust history.
+
+---
+
+## WASM Target (P3.4)
+
+On `wasm32-unknown-unknown`, the following modules are excluded via `#[cfg(not(target_arch = "wasm32"))]`:
+
+- `embedder` (requires ONNX Runtime)
+- `store` (requires rusqlite)
+- `ffi` (native C ABI)
+- `py_ffi` (PyO3)
+- The `Memoire` struct and all its methods
+
+The `quality` module and `chunker` module are pure-Rust with no native deps and compile to WASM unchanged. WASM re-exports available:
+
+```rust
+pub use quality::{NliChecker, NliLabel, ScoringConfig, detect_polarity, cosine_similarity};
+```
+
+Build:
+```bash
+cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
+```

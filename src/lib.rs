@@ -1,23 +1,41 @@
 pub mod chunker;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod embedder;
 pub mod error;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ffi;
-#[cfg(feature = "pyo3")]
+#[cfg(all(feature = "pyo3", not(target_arch = "wasm32")))]
 pub mod py_ffi;
 pub mod quality;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 
+#[cfg(not(target_arch = "wasm32"))]
 use chunker::{chunk_text, ChunkerConfig};
+#[cfg(not(target_arch = "wasm32"))]
 use embedder::{EmbedProvider, Embedder, FastEmbedReranker, Reranker};
 use error::{MemoireError, Result};
 use quality::{
     build_quality_meta, fingerprint, IngestDecision, ScoringConfig, ScoringPrototypes,
     ScoringWeights,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use store::{Memory, Store};
 
+// ─── WASM re-exports ─────────────────────────────────────────────────────────
+// On wasm32, only the pure-Rust quality and NLI functions are available.
+// Agents running in a browser/WASM environment can import these to score
+// and detect contradictions in memory text without SQLite or ONNX.
+#[cfg(target_arch = "wasm32")]
+pub use quality::{NliChecker, NliLabel, ScoringConfig, detect_polarity, cosine_similarity};
+
+
 /// The central Memoire instance.
+///
+/// Not available on `wasm32` targets — use the quality module directly for
+/// scoring and NLI contradiction detection in browser environments.
 ///
 /// # Example
 ///
@@ -32,6 +50,7 @@ use store::{Memory, Store};
 ///     println!("[{:.3}] {}", r.score, r.content);
 /// }
 /// ```
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Memoire {
     pub(crate) store: Store,
     embedder: Box<dyn EmbedProvider>,
@@ -41,6 +60,7 @@ pub struct Memoire {
     prototypes: ScoringPrototypes,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Memoire {
     // ─── Constructors ────────────────────────────────────────────────────────
 
@@ -333,6 +353,38 @@ impl Memoire {
     /// Return every stored memory ordered by recency. Score is 1.0 (no query).
     pub fn export_all(&self) -> Result<Vec<store::Memory>> {
         self.store.all()
+    }
+
+    /// Export the current namespace's non-archived memories as a JSON-serializable snapshot.
+    pub fn export_namespace(&self) -> Result<serde_json::Value> {
+        self.store.export_namespace()
+    }
+
+    /// Import a memory snapshot into the current namespace.
+    pub fn import_namespace(&self, snapshot: &serde_json::Value) -> Result<usize> {
+        let memories = snapshot.get("memories")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| MemoireError::Embedding(anyhow::anyhow!("Invalid snapshot format: missing memories array")))?;
+
+        let mut imported_count = 0;
+        for mem in memories {
+            let content = match mem.get("content").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+            let trust_ema = mem.get("trust_ema").and_then(|v| v.as_f64()).map(|f| f as f32);
+            let reinforcement_count = mem.get("reinforcement_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            let importance_base = mem.get("importance_base").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.5);
+            let confidence = mem.get("confidence").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.5);
+            let created_at = mem.get("created_at").and_then(|v| v.as_i64());
+
+            let ids = self.remember(content)?;
+            if !ids.is_empty() {
+                self.store.update_imported_metadata(&ids, trust_ema, reinforcement_count, importance_base, confidence, created_at)?;
+                imported_count += 1;
+            }
+        }
+        Ok(imported_count)
     }
 
     /// Total stored memory chunks (namespace-scoped).

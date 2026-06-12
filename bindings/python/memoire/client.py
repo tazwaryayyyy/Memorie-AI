@@ -194,6 +194,24 @@ class Memoire:
         except Exception as e:
             raise MemoireError(f"clear() failed: {e}") from e
 
+    def export_namespace(self) -> dict:
+        """Export the current namespace's non-archived memories as a JSON snapshot."""
+        self._check_open()
+        try:
+            res_str = self._impl.export_namespace()
+            return json.loads(res_str)
+        except Exception as e:
+            raise MemoireError(f"export_namespace() failed: {e}") from e
+
+    def import_namespace(self, snapshot: dict) -> int:
+        """Import memories from a namespace snapshot dict."""
+        self._check_open()
+        try:
+            snapshot_str = json.dumps(snapshot)
+            return self._impl.import_namespace(snapshot_str)
+        except Exception as e:
+            raise MemoireError(f"import_namespace() failed: {e}") from e
+
     def close(self) -> None:
         """Release the native instance."""
         self._impl = None

@@ -26,10 +26,7 @@ name = "memoire"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rusqlite = { version = "0.31", features = ["bundled"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.24"
-fastembed = { version = "=5.13.2", default-features = false, features = ["online", "ort-download-binaries-native-tls"] }
+# ─── Shared (all targets) ─────────────────────────────────────────────────────
 blake3 = "1"
 instant-distance = "0.6"
 anyhow = "1"
@@ -44,14 +41,30 @@ walkdir = "2.4"
 rayon = "1.9"
 once_cell = "1.19"
 dirs = "5.0"
-pyo3 = { version = "0.21", features = ["extension-module", "abi3-py310"], optional = true }
-axum = "0.7"
-tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.22"
 
+# ─── Native-only (optional, activated by target cfg below) ───────────────────
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+r2d2 = { version = "0.8", optional = true }
+r2d2_sqlite = { version = "0.24", optional = true }
+fastembed = { version = "=5.13.2", default-features = false, features = ["online", "ort-download-binaries-native-tls"], optional = true }
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+
+# ─── Optional feature-gated ───────────────────────────────────────────────────
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py310"], optional = true }
+# WASM random number generation (activated by `wasm` feature)
+getrandom = { version = "0.2", features = ["js"], optional = true }
+
 [features]
-default = []
+default = ["native"]
+# Native feature bundle: SQLite + embedding model + HTTP server.
+# Activated by default on native targets.
+native = ["dep:rusqlite", "dep:r2d2", "dep:r2d2_sqlite", "dep:fastembed", "dep:axum", "dep:tokio"]
 pyo3 = ["dep:pyo3"]
+# WASM-compatible build — excludes SQLite, ONNX, async runtime.
+# Usage: cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
+wasm = ["dep:getrandom"]
 
 [dev-dependencies]
 tempfile = "3"

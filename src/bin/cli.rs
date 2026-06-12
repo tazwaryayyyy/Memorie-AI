@@ -81,6 +81,16 @@ enum Command {
     Export {
         json: bool,
     },
+    ExportNamespace {
+        db_path: String,
+        namespace: Option<String>,
+        output: Option<String>,
+    },
+    ImportNamespace {
+        db_path: String,
+        file_path: String,
+        namespace: Option<String>,
+    },
     Info,
     CacheModels,
     Help,
@@ -183,13 +193,63 @@ fn parse_args() -> Result<Args, String> {
         }
 
         "import" => {
-            let path = raw.get(i).cloned().ok_or("import requires a file path")?;
-            Command::Import { path }
+            let mut pos_args = Vec::new();
+            let mut temp_i = i;
+            while temp_i < raw.len() {
+                if temp_i < raw.len() && !raw[temp_i].starts_with('-') {
+                    pos_args.push(raw[temp_i].clone());
+                } else if temp_i < raw.len() && raw[temp_i] == "--namespace" {
+                    temp_i += 1; // skip next
+                }
+                temp_i += 1;
+            }
+
+            if pos_args.len() >= 2 {
+                let db_path = raw.get(i).cloned().unwrap();
+                i += 1;
+                let file_path = raw.get(i).cloned().unwrap();
+                i += 1;
+                let mut namespace = None;
+                while i < raw.len() {
+                    if raw[i] == "--namespace" {
+                        i += 1;
+                        namespace = raw.get(i).cloned();
+                    }
+                    i += 1;
+                }
+                Command::ImportNamespace { db_path, file_path, namespace }
+            } else {
+                let path = raw.get(i).cloned().ok_or("import requires a file path")?;
+                Command::Import { path }
+            }
         }
 
         "export" => {
-            let json = raw.get(i).map(String::as_str) == Some("--json");
-            Command::Export { json }
+            let next_arg = raw.get(i).map(String::as_str);
+            if next_arg == Some("--json") || next_arg.is_none() {
+                let json = next_arg == Some("--json");
+                Command::Export { json }
+            } else {
+                let db_path = raw.get(i).cloned().ok_or("export requires a database path")?;
+                i += 1;
+                let mut namespace = None;
+                let mut output = None;
+                while i < raw.len() {
+                    match raw[i].as_str() {
+                        "--namespace" => {
+                            i += 1;
+                            namespace = raw.get(i).cloned();
+                        }
+                        "--output" => {
+                            i += 1;
+                            output = raw.get(i).cloned();
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                Command::ExportNamespace { db_path, namespace, output }
+            }
         }
 
         "info" => Command::Info,
@@ -338,6 +398,42 @@ fn run() -> anyhow::Result<()> {
                     println!("[id={}  {}] {}", r.id, r.created_at, r.content);
                 }
             }
+        }
+
+        Command::ExportNamespace { db_path, namespace, output } => {
+            let ns = namespace.unwrap_or_else(|| "default".to_string());
+            let m = Memoire::new_ns(&db_path, &ns)?;
+            let snapshot = m.export_namespace()?;
+            let json_str = serde_json::to_string_pretty(&snapshot)?;
+            if let Some(out_path) = output {
+                fs::write(&out_path, json_str)
+                    .map_err(|e| anyhow::anyhow!("failed to write output file: {e}"))?;
+            } else {
+                println!("{json_str}");
+            }
+        }
+
+        Command::ImportNamespace { db_path, file_path, namespace } => {
+            let json_str = if file_path == "-" {
+                let stdin = io::stdin();
+                let mut input = String::new();
+                stdin.lock().read_to_string(&mut input)
+                    .map_err(|e| anyhow::anyhow!("failed to read stdin: {e}"))?;
+                input
+            } else {
+                fs::read_to_string(&file_path)
+                    .map_err(|e| anyhow::anyhow!("failed to read file: {e}"))?
+            };
+            let snapshot: serde_json::Value = serde_json::from_str(&json_str)
+                .map_err(|e| anyhow::anyhow!("failed to parse import JSON: {e}"))?;
+                
+            let ns = namespace
+                .or_else(|| snapshot.get("namespace").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_else(|| "default".to_string());
+                
+            let m = Memoire::new_ns(&db_path, &ns)?;
+            let count = m.import_namespace(&snapshot)?;
+            println!("✓ imported {count} memories into namespace '{ns}'");
         }
 
         Command::Info => {
