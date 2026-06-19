@@ -317,7 +317,11 @@ async fn import_handler(
 ) -> impl IntoResponse {
     match get_or_create(&cache, &req.db, &req.ns).await {
         Ok(m) => match m.import_namespace(&req.snapshot) {
-            Ok(count) => (StatusCode::OK, Json(json!({ "ok": true, "imported": count }))).into_response(),
+            Ok(count) => (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "imported": count })),
+            )
+                .into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": e.to_string() })),

@@ -60,17 +60,34 @@ struct Args {
 }
 
 enum Command {
-    Remember { text: String },
-    Recall { query: String, top: usize, json: bool, min_score: f32 },
-    Forget { id: i64 },
+    Remember {
+        text: String,
+    },
+    Recall {
+        query: String,
+        top: usize,
+        json: bool,
+        min_score: f32,
+    },
+    Forget {
+        id: i64,
+    },
     Count,
-    Clear { confirmed: bool },
+    Clear {
+        confirmed: bool,
+    },
     /// Export the current namespace as a JSON snapshot.
-    Export { output: Option<String> },
+    Export {
+        output: Option<String>,
+    },
     /// Import a JSON snapshot into the current namespace.
-    Import { file: String },
+    Import {
+        file: String,
+    },
     /// Ingest memories line-by-line from a plain-text file (legacy import).
-    Ingest { path: String },
+    Ingest {
+        path: String,
+    },
     Info,
     CacheModels,
     Help,
@@ -94,7 +111,11 @@ fn parse_args() -> Result<Args, String> {
                 ns = raw.get(i).cloned().ok_or("--ns requires a namespace")?;
             }
             "--help" | "-h" => {
-                return Ok(Args { db, ns, command: Command::Help });
+                return Ok(Args {
+                    db,
+                    ns,
+                    command: Command::Help,
+                });
             }
             _ => break,
         }
@@ -111,7 +132,12 @@ fn parse_args() -> Result<Args, String> {
                 return Err("remember requires text (or \"-\" to read stdin)".into());
             }
             let text = if text == "-" {
-                io::stdin().lock().lines().map_while(|l| l.ok()).collect::<Vec<_>>().join("\n")
+                io::stdin()
+                    .lock()
+                    .lines()
+                    .map_while(|l| l.ok())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             } else {
                 raw[i..].join(" ")
             };
@@ -145,7 +171,12 @@ fn parse_args() -> Result<Args, String> {
                 }
                 i += 1;
             }
-            Command::Recall { query, top, json, min_score }
+            Command::Recall {
+                query,
+                top,
+                json,
+                min_score,
+            }
         }
 
         "forget" => {
@@ -176,7 +207,10 @@ fn parse_args() -> Result<Args, String> {
         }
 
         "import" => {
-            let file = raw.get(i).cloned().ok_or("import requires a file path (or \"-\" for stdin)")?;
+            let file = raw
+                .get(i)
+                .cloned()
+                .ok_or("import requires a file path (or \"-\" for stdin)")?;
             Command::Import { file }
         }
 
@@ -230,7 +264,12 @@ fn run() -> anyhow::Result<()> {
             println!("✓ stored {} chunk(s) → ids: {:?}", ids.len(), ids);
         }
 
-        Command::Recall { query, top, json, min_score } => {
+        Command::Recall {
+            query,
+            top,
+            json,
+            min_score,
+        } => {
             let mut results = m.recall(&query, top)?;
             results.retain(|r| r.score >= min_score);
 
@@ -273,12 +312,18 @@ fn run() -> anyhow::Result<()> {
 
         Command::Clear { confirmed } => {
             if !confirmed {
-                eprintln!("⚠ This will erase ALL memories in namespace '{}'. Add --confirm to proceed.", args.ns);
+                eprintln!(
+                    "⚠ This will erase ALL memories in namespace '{}'. Add --confirm to proceed.",
+                    args.ns
+                );
                 process::exit(1);
             }
             let n = m.count()?;
             m.clear()?;
-            println!("✓ cleared {n} memory chunk(s) from namespace '{}'.", args.ns);
+            println!(
+                "✓ cleared {n} memory chunk(s) from namespace '{}'.",
+                args.ns
+            );
         }
 
         Command::Export { output } => {
@@ -334,7 +379,12 @@ fn run() -> anyhow::Result<()> {
             for (idx, line) in lines.iter().enumerate() {
                 let ids = m.remember(line)?;
                 total_chunks += ids.len();
-                print!("\r  [{}/{}] {} chunk(s) stored", idx + 1, lines.len(), total_chunks);
+                print!(
+                    "\r  [{}/{}] {} chunk(s) stored",
+                    idx + 1,
+                    lines.len(),
+                    total_chunks
+                );
                 io::stdout().flush()?;
             }
             println!("\n✓ done. {total_chunks} total chunk(s) stored.");
