@@ -90,6 +90,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - uses: astral-sh/setup-uv@v6
 
       - name: Install locked MCP environment
@@ -124,7 +127,8 @@ jobs:
           python -m venv /tmp/memoire-smoke
           . /tmp/memoire-smoke/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install ./bindings/python
+          python -m pip install maturin
+          python -m pip install --no-build-isolation ./bindings/python
           python -m pip install "mcp[cli]==1.27.1"
           python -m pip install --no-deps ./mcp-server
 

@@ -1222,31 +1222,34 @@ impl Store {
              FROM memories
              WHERE namespace = ?1 AND archived = 0"
         )?;
-        
+
         let ns = &self.namespace;
-        let memories: Vec<serde_json::Value> = stmt.query_map(params![ns], |r| {
-            let content: String = r.get(0)?;
-            let trust_ema: Option<f32> = r.get(1)?;
-            let reinforcement_count: i64 = r.get(2)?;
-            let importance_base: f32 = r.get(3)?;
-            let confidence: f32 = r.get(4)?;
-            let created_at: i64 = r.get(5)?;
-            
-            Ok(serde_json::json!({
-                "content": content,
-                "trust_ema": trust_ema,
-                "reinforcement_count": reinforcement_count,
-                "importance_base": importance_base,
-                "confidence": confidence,
-                "created_at": created_at,
-            }))
-        })?.filter_map(|r| r.ok()).collect();
-        
+        let memories: Vec<serde_json::Value> = stmt
+            .query_map(params![ns], |r| {
+                let content: String = r.get(0)?;
+                let trust_ema: Option<f32> = r.get(1)?;
+                let reinforcement_count: i64 = r.get(2)?;
+                let importance_base: f32 = r.get(3)?;
+                let confidence: f32 = r.get(4)?;
+                let created_at: i64 = r.get(5)?;
+
+                Ok(serde_json::json!({
+                    "content": content,
+                    "trust_ema": trust_ema,
+                    "reinforcement_count": reinforcement_count,
+                    "importance_base": importance_base,
+                    "confidence": confidence,
+                    "created_at": created_at,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-            
+
         Ok(serde_json::json!({
             "memoire_export_version": 1,
             "namespace": ns,
@@ -1268,16 +1271,32 @@ impl Store {
             return Ok(());
         }
         let conn = self.pool.get()?;
-        let placeholders = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let placeholders = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let query = format!(
             "UPDATE memories SET trust_ema = ?1, reinforcement_count = ?2, importance_base = ?3, confidence = ?4 {} WHERE id IN ({})",
             if created_at.is_some() { ", created_at = ?5" } else { "" },
             placeholders
         );
         if let Some(created) = created_at {
-            conn.execute(&query, params![trust_ema, reinforcement_count, importance_base, confidence, created])?;
+            conn.execute(
+                &query,
+                params![
+                    trust_ema,
+                    reinforcement_count,
+                    importance_base,
+                    confidence,
+                    created
+                ],
+            )?;
         } else {
-            conn.execute(&query, params![trust_ema, reinforcement_count, importance_base, confidence])?;
+            conn.execute(
+                &query,
+                params![trust_ema, reinforcement_count, importance_base, confidence],
+            )?;
         }
         Ok(())
     }

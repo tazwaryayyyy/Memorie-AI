@@ -29,8 +29,7 @@ use store::{Memory, Store};
 // Agents running in a browser/WASM environment can import these to score
 // and detect contradictions in memory text without SQLite or ONNX.
 #[cfg(target_arch = "wasm32")]
-pub use quality::{NliChecker, NliLabel, ScoringConfig, detect_polarity, cosine_similarity};
-
+pub use quality::{cosine_similarity, detect_polarity, NliChecker, NliLabel, ScoringConfig};
 
 /// The central Memoire instance.
 ///
@@ -362,9 +361,14 @@ impl Memoire {
 
     /// Import a memory snapshot into the current namespace.
     pub fn import_namespace(&self, snapshot: &serde_json::Value) -> Result<usize> {
-        let memories = snapshot.get("memories")
+        let memories = snapshot
+            .get("memories")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| MemoireError::Embedding(anyhow::anyhow!("Invalid snapshot format: missing memories array")))?;
+            .ok_or_else(|| {
+                MemoireError::Embedding(anyhow::anyhow!(
+                    "Invalid snapshot format: missing memories array"
+                ))
+            })?;
 
         let mut imported_count = 0;
         for mem in memories {
@@ -372,15 +376,36 @@ impl Memoire {
                 Some(c) => c,
                 None => continue,
             };
-            let trust_ema = mem.get("trust_ema").and_then(|v| v.as_f64()).map(|f| f as f32);
-            let reinforcement_count = mem.get("reinforcement_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let importance_base = mem.get("importance_base").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.5);
-            let confidence = mem.get("confidence").and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(0.5);
+            let trust_ema = mem
+                .get("trust_ema")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32);
+            let reinforcement_count = mem
+                .get("reinforcement_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let importance_base = mem
+                .get("importance_base")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32)
+                .unwrap_or(0.5);
+            let confidence = mem
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32)
+                .unwrap_or(0.5);
             let created_at = mem.get("created_at").and_then(|v| v.as_i64());
 
             let ids = self.remember(content)?;
             if !ids.is_empty() {
-                self.store.update_imported_metadata(&ids, trust_ema, reinforcement_count, importance_base, confidence, created_at)?;
+                self.store.update_imported_metadata(
+                    &ids,
+                    trust_ema,
+                    reinforcement_count,
+                    importance_base,
+                    confidence,
+                    created_at,
+                )?;
                 imported_count += 1;
             }
         }

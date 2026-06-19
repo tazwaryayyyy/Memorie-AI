@@ -86,18 +86,41 @@ impl Default for NliChecker {
 /// High values indicate one text strongly negates what the other asserts.
 fn negation_asymmetry(a: &str, b: &str) -> usize {
     const NEGATORS: &[&str] = &[
-        "never", "not", "no", "avoid", "don't", "cannot",
-        "must not", "should not", "prohibited", "forbidden",
-        "disable", "remove", "deprecated", "stop", "revert",
-        "rollback", "dangerous", "insecure", "broken",
+        "never",
+        "not",
+        "no",
+        "avoid",
+        "don't",
+        "cannot",
+        "must not",
+        "should not",
+        "prohibited",
+        "forbidden",
+        "disable",
+        "remove",
+        "deprecated",
+        "stop",
+        "revert",
+        "rollback",
+        "dangerous",
+        "insecure",
+        "broken",
     ];
     let na = normalize_text(a);
     let nb = normalize_text(b);
     let in_a = |t: &&str| -> bool {
-        if t.contains(' ') { na.contains(*t) } else { na.split_whitespace().any(|w| w == *t) }
+        if t.contains(' ') {
+            na.contains(*t)
+        } else {
+            na.split_whitespace().any(|w| w == *t)
+        }
     };
     let in_b = |t: &&str| -> bool {
-        if t.contains(' ') { nb.contains(*t) } else { nb.split_whitespace().any(|w| w == *t) }
+        if t.contains(' ') {
+            nb.contains(*t)
+        } else {
+            nb.split_whitespace().any(|w| w == *t)
+        }
     };
     NEGATORS.iter().filter(|t| in_a(t) != in_b(t)).count()
 }
@@ -763,6 +786,9 @@ mod tests {
         let a = vec![1.0_f32, 0.0, 0.0];
         let b = vec![0.0_f32, 1.0, 0.0];
         assert!((cosine_similarity(&a, &b)).abs() < 1e-6, "orthogonal → 0");
-        assert!((cosine_similarity(&a, &a) - 1.0).abs() < 1e-6, "identical → 1");
+        assert!(
+            (cosine_similarity(&a, &a) - 1.0).abs() < 1e-6,
+            "identical → 1"
+        );
     }
 }

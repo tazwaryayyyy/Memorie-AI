@@ -101,6 +101,14 @@ struct ClearReq {
 }
 
 #[derive(Deserialize)]
+struct ImportReq {
+    db: String,
+    #[serde(default = "default_ns")]
+    ns: String,
+    snapshot: serde_json::Value,
+}
+
+#[derive(Deserialize)]
 struct DbQuery {
     db: String,
     #[serde(default = "default_ns")]
@@ -303,6 +311,27 @@ async fn export_handler(
     }
 }
 
+async fn import_handler(
+    State(cache): State<InstanceCache>,
+    Json(req): Json<ImportReq>,
+) -> impl IntoResponse {
+    match get_or_create(&cache, &req.db, &req.ns).await {
+        Ok(m) => match m.import_namespace(&req.snapshot) {
+            Ok(count) => (StatusCode::OK, Json(json!({ "ok": true, "imported": count }))).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -326,6 +355,7 @@ async fn main() {
         .route("/clear", post(clear_handler))
         .route("/info", get(info_handler))
         .route("/export", get(export_handler))
+        .route("/import", post(import_handler))
         .with_state(cache);
 
     let addr = format!("127.0.0.1:{port}");

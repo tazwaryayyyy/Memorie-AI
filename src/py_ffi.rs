@@ -155,7 +155,9 @@ impl PyMemoire {
     }
 
     fn export_namespace(&self) -> PyResult<String> {
-        let value = self.inner.export_namespace()
+        let value = self
+            .inner
+            .export_namespace()
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         let json = serde_json::to_string(&value)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
@@ -165,7 +167,9 @@ impl PyMemoire {
     fn import_namespace(&self, snapshot_str: &str) -> PyResult<usize> {
         let snapshot: serde_json::Value = serde_json::from_str(snapshot_str)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        let count = self.inner.import_namespace(&snapshot)
+        let count = self
+            .inner
+            .import_namespace(&snapshot)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(count)
     }

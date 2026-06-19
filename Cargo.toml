@@ -76,7 +76,7 @@ name = "basic_usage"
 path = "examples/basic_usage.rs"
 
 [[bin]]
-name = "memoire"
+name = "memoire-cli"
 path = "src/bin/cli.rs"
 
 [[bin]]
