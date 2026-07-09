@@ -8,8 +8,9 @@ use std::sync::RwLock;
 
 use crate::error::{MemoireError, Result};
 use crate::quality::{
-    compute_trust, cosine_similarity, detect_polarity, effective_weight, now_ts, recency_bonus,
-    NliChecker, NliLabel, Polarity, QualityMeta, ScoringConfig,
+    compute_gravity_radius, compute_trust, cosine_similarity, detect_polarity, effective_weight,
+    now_ts, recency_bonus, should_supersede, NliChecker, NliLabel, OnnxNliChecker, Polarity,
+    QualityMeta, ScoringConfig,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -18,7 +19,13 @@ pub struct Memory {
     pub content: String,
     pub score: f32,
     pub trust: f32,
-    /// Uncertainty ∈ [0, 1]: high when little reinforcement or when the memory
+    pub trust_variance: f64,
+    pub trust_samples: i64,
+    pub trust_last_session_id: Option<String>,
+    pub effective_weight: f32,
+    pub reinforcement_count: i64,
+    pub ingestion_driver: String,
+    /// Uncertainty âˆˆ [0, 1]: high when little reinforcement or when the memory
     /// has been both reinforced and penalized (oscillation). Agents may use this
     /// to modulate how strongly they act on a recall result.
     pub uncertainty: f32,
@@ -33,7 +40,7 @@ pub struct PenaltyOutcome {
     pub id: i64,
     pub trust_before: f32,
     pub trust_after: f32,
-    /// Uncertainty of this memory after the penalty, ∈ [0, 1].
+    /// Uncertainty of this memory after the penalty, âˆˆ [0, 1].
     /// Increases as failure_count rises relative to reinforcement_count.
     pub uncertainty_after: f32,
 }
@@ -45,13 +52,35 @@ pub struct Store {
     /// Namespace this store instance is scoped to. All reads/writes are filtered
     /// by this value. Defaults to `"default"`. Set via `Store::open_ns()`.
     pub namespace: String,
+    nli_checker: NliChecker,
 }
 
-/// ✅ FIX #5 — In-memory HNSW embedding point wrapper.
+impl Clone for Store {
+    fn clone(&self) -> Self {
+        let fingerprints = self
+            .read_lock()
+            .map(|inner| inner.fingerprints.clone())
+            .unwrap_or_default();
+        Self {
+            pool: self.pool.clone(),
+            inner: RwLock::new(StoreInner {
+                embedding_cache: Vec::new(),
+                embedding_cache_loaded: false,
+                fingerprints,
+                hnsw: None,
+                hnsw_dirty: false,
+            }),
+            config: self.config.clone(),
+            namespace: self.namespace.clone(),
+            nli_checker: self.nli_checker.clone(),
+        }
+    }
+}
+/// âœ… FIX #5 â€” In-memory HNSW embedding point wrapper.
 ///
 /// Wraps a 384-dim embedding vector. Implements `instant_distance::Point`
 /// using L2 distance. For L2-normalised fastembed vectors:
-///   ||a − b||² = 2·(1 − cosine) → closer L2 = higher cosine.
+///   ||a âˆ’ b||Â² = 2Â·(1 âˆ’ cosine) â†’ closer L2 = higher cosine.
 #[derive(Clone)]
 pub struct EmbeddingPoint(pub Vec<f32>);
 
@@ -82,11 +111,11 @@ struct StoreInner {
     /// Inserts update the cache only when this is true; otherwise they write
     /// to SQLite and let the lazy load pick them up.
     embedding_cache_loaded: bool,
-    /// O(1) fingerprint lookup — avoids a SQLite round-trip per insert.
+    /// O(1) fingerprint lookup â€” avoids a SQLite round-trip per insert.
     fingerprints: HashSet<String>,
     /// Approximate nearest-neighbour index. Rebuilt lazily when dirty.
     hnsw: Option<instant_distance::HnswMap<EmbeddingPoint, i64>>,
-    /// True after any insert or archive — triggers a lazy HNSW rebuild.
+    /// True after any insert or archive â€” triggers a lazy HNSW rebuild.
     hnsw_dirty: bool,
 }
 
@@ -94,7 +123,7 @@ impl StoreInner {
     /// Load all embeddings from SQLite into the in-memory cache if not yet loaded.
     /// Fingerprints are loaded eagerly at construction; embeddings are deferred here
     /// to keep startup cost proportional to fingerprint count (small strings) rather
-    /// than embedding count (1536 bytes × N).
+    /// than embedding count (1536 bytes Ã— N).
     fn ensure_embedding_cache(&mut self, conn: &Connection, namespace: &str) -> Result<()> {
         if self.embedding_cache_loaded {
             return Ok(());
@@ -158,6 +187,10 @@ const SCHEMA: &str = "
         claim_value TEXT,
         failure_count INTEGER NOT NULL DEFAULT 0,
         trust_ema     REAL CHECK(trust_ema IS NULL OR trust_ema BETWEEN 0.0 AND 1.0),
+        trust_variance REAL NOT NULL DEFAULT 0.0,
+        trust_samples INTEGER NOT NULL DEFAULT 0,
+        trust_last_session_id TEXT,
+        ingestion_driver TEXT,
         last_used_at  INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_memories_created_at
@@ -185,7 +218,7 @@ pub fn blob_to_vec(blob: &[u8]) -> Option<Vec<f32>> {
     )
 }
 
-/// Load only fingerprints at startup — O(n × 64 bytes) instead of O(n × 1536 bytes).
+/// Load only fingerprints at startup â€” O(n Ã— 64 bytes) instead of O(n Ã— 1536 bytes).
 /// Embedding vectors are loaded lazily on the first search via `StoreInner::ensure_embedding_cache`.
 fn load_fingerprints_from_db(conn: &Connection, namespace: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(
@@ -331,6 +364,34 @@ impl Store {
         let conn = pool.get()?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
+        let current_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current_version < 2 {
+            let needs_v2_columns = !Self::memories_has_columns(
+                &conn,
+                &[
+                    "trust_variance",
+                    "trust_samples",
+                    "trust_last_session_id",
+                    "ingestion_driver",
+                ],
+            )?;
+            if needs_v2_columns {
+                conn.execute_batch(include_str!("../migrations/v2.sql"))?;
+            } else {
+                conn.execute_batch("PRAGMA user_version = 2;")?;
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS prototype_checkpoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        namespace TEXT NOT NULL DEFAULT 'default',
+                        created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                        reinforcements_at_update INTEGER NOT NULL,
+                        actionability_centroid BLOB NOT NULL,
+                        consequence_centroid BLOB NOT NULL,
+                        reusability_centroid BLOB NOT NULL
+                    );",
+                )?;
+            }
+        }
         let fingerprints = load_fingerprints_from_db(&conn, namespace)?;
         log::debug!(
             "SQLite store opened at {path} ns={namespace}; {} fingerprints loaded (embeddings deferred)",
@@ -347,6 +408,7 @@ impl Store {
             }),
             config,
             namespace: namespace.to_string(),
+            nli_checker: NliChecker::new(),
         })
     }
 
@@ -368,12 +430,40 @@ impl Store {
         let conn = pool.get()?;
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
+        let current_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if current_version < 2 {
+            let needs_v2_columns = !Self::memories_has_columns(
+                &conn,
+                &[
+                    "trust_variance",
+                    "trust_samples",
+                    "trust_last_session_id",
+                    "ingestion_driver",
+                ],
+            )?;
+            if needs_v2_columns {
+                conn.execute_batch(include_str!("../migrations/v2.sql"))?;
+            } else {
+                conn.execute_batch("PRAGMA user_version = 2;")?;
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS prototype_checkpoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        namespace TEXT NOT NULL DEFAULT 'default',
+                        created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                        reinforcements_at_update INTEGER NOT NULL,
+                        actionability_centroid BLOB NOT NULL,
+                        consequence_centroid BLOB NOT NULL,
+                        reusability_centroid BLOB NOT NULL
+                    );",
+                )?;
+            }
+        }
         drop(conn);
         Ok(Self {
             pool,
             inner: RwLock::new(StoreInner {
                 embedding_cache: Vec::new(),
-                // In-memory store starts empty — no deferred load needed.
+                // In-memory store starts empty â€” no deferred load needed.
                 embedding_cache_loaded: true,
                 fingerprints: HashSet::new(),
                 hnsw: None,
@@ -381,6 +471,7 @@ impl Store {
             }),
             config,
             namespace: namespace.to_string(),
+            nli_checker: NliChecker::new(),
         })
     }
 
@@ -395,6 +486,7 @@ impl Store {
         agent_output: &str,
         task_succeeded: bool,
         output_embedding: Option<&[f32]>,
+        session_id: Option<&str>,
     ) -> Result<bool> {
         if !task_succeeded {
             return Ok(false);
@@ -491,19 +583,68 @@ impl Store {
             age_days,
             &self.config,
         );
-        let w = self.config.ema_new_weight;
-        let new_ema = match trust_ema_stored {
-            Some(ema) => ((1.0 - w) * ema + w * trust_after).clamp(0.0, 1.0),
-            None => trust_after,
+        let mut stored_variance = 0.0f64;
+        let mut stored_samples = 0i64;
+        let mut last_session = None;
+        let trust_row = conn.query_row(
+            "SELECT trust_variance, trust_samples, trust_last_session_id FROM memories WHERE id = ?1",
+            params![memory_id],
+            |r| {
+                Ok((
+                    r.get::<_, f64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        );
+        if let Ok((variance, samples, ls)) = trust_row {
+            stored_variance = variance;
+            stored_samples = samples;
+            last_session = ls;
+        }
+        let stored_ema = trust_ema_stored
+            .map(|e| e as f64)
+            .unwrap_or(trust_after as f64);
+        let same_session = session_id.is_some() && session_id == last_session.as_deref();
+        let effective_weight = if same_session {
+            self.config.ema_new_weight as f64 * 0.2
+        } else {
+            self.config.ema_new_weight as f64
         };
+        let new_ema = stored_ema + effective_weight * (trust_after as f64 - stored_ema);
+        let new_samples = if same_session {
+            stored_samples
+        } else {
+            stored_samples + 1
+        };
+        let new_variance = if new_samples > 1 && !same_session {
+            let delta = trust_after as f64 - stored_ema;
+            let delta2 = trust_after as f64 - new_ema;
+            (stored_variance * (stored_samples - 1) as f64 + delta * delta2)
+                / (new_samples - 1) as f64
+        } else {
+            stored_variance
+        };
+        let new_ema_f32 = new_ema.clamp(0.0, 1.0) as f32;
         conn.execute(
             "UPDATE memories
              SET reinforcement_count = ?1,
                  confidence = ?2,
                  trust_ema = ?3,
+                 trust_variance = ?4,
+                 trust_samples = ?5,
+                 trust_last_session_id = ?6,
                  last_accessed_at = CAST(strftime('%s', 'now') AS INTEGER)
-             WHERE id = ?4",
-            params![new_rc, new_conf, new_ema, memory_id],
+             WHERE id = ?7",
+            params![
+                new_rc,
+                new_conf,
+                new_ema_f32,
+                new_variance,
+                new_samples,
+                session_id,
+                memory_id
+            ],
         )?;
         Ok(true)
     }
@@ -612,6 +753,14 @@ impl Store {
         embedding: &[f32],
         quality: &QualityMeta,
     ) -> Result<i64> {
+        assert!(
+            quality.store_state == "active"
+                || quality.store_state == "shadow"
+                || quality.store_state == "rejected"
+                || quality.store_state == "probationary",
+            "invalid store_state: {}",
+            quality.store_state
+        );
         let blob = vec_to_blob(embedding);
         // Clamp trust-related fields to valid ranges before writing so CHECK
         // constraints are never triggered by normal application logic.
@@ -634,7 +783,8 @@ impl Store {
                 source_kind, store_state, reinforcement_count,
                 last_accessed_at, superseded_by, contradiction_group,
                 archived, effective_weight, fingerprint, claim_key, claim_value,
-                trust_ema, last_used_at
+                trust_ema, trust_variance, trust_samples, trust_last_session_id,
+                ingestion_driver, last_used_at
             ) VALUES (
                 ?1, ?2, ?3,
                 ?4, ?5, ?6,
@@ -642,7 +792,7 @@ impl Store {
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21,
-                ?22, ?23
+                ?22, ?23, ?24, ?25, ?26, ?27
             )",
             params![
                 self.namespace,
@@ -667,6 +817,10 @@ impl Store {
                 quality.claim_key,
                 quality.claim_value,
                 initial_trust_ema,
+                0.0,
+                0,
+                None::<String>,
+                None::<String>,
                 now_ts_val,
             ],
         )?;
@@ -682,6 +836,11 @@ impl Store {
             inner.fingerprints.insert(quality.fingerprint.clone());
         }
         Ok(id)
+    }
+
+    pub fn set_nli_checker(&self, checker: OnnxNliChecker) -> Result<()> {
+        let _ = checker;
+        Ok(())
     }
 
     pub fn max_similarity(&self, query_vec: &[f32]) -> Result<f32> {
@@ -703,7 +862,12 @@ impl Store {
         Ok(inner.fingerprints.contains(fp))
     }
 
-    pub fn search(&self, query_vec: &[f32], top_k: usize) -> Result<Vec<Memory>> {
+    pub fn search(
+        &self,
+        query_vec: &[f32],
+        top_k: usize,
+        include_shadow: bool,
+    ) -> Result<Vec<Memory>> {
         if top_k == 0 {
             return Ok(vec![]);
         }
@@ -724,35 +888,41 @@ impl Store {
                 r.get(0)
             })?;
 
+        let state_filter = if include_shadow {
+            "store_state IN ('active', 'shadow', 'probationary')"
+        } else {
+            "store_state IN ('active', 'shadow')"
+        };
+        let query_str = format!(
+            "SELECT content, created_at,
+                    importance_base, reinforcement_count, confidence,
+                    store_state, contradiction_group,
+                    failure_count, trust_ema, last_used_at
+             FROM memories
+             WHERE id = ?1
+               AND namespace = ?2
+               AND archived = 0
+               AND superseded_by IS NULL
+               AND {}",
+            state_filter
+        );
+
         let mut scored: Vec<(f32, f32, Option<String>, Memory)> = Vec::new();
         for (id, sim) in &candidates {
-            let row = conn.query_row(
-                "SELECT content, created_at,
-                        importance_base, reinforcement_count, confidence,
-                        store_state, contradiction_group,
-                        failure_count, trust_ema, last_used_at
-                 FROM memories
-                 WHERE id = ?1
-                   AND namespace = ?2
-                   AND archived = 0
-                   AND superseded_by IS NULL
-                   AND store_state IN ('active', 'shadow')",
-                params![id, ns],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, f32>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, f32>(4)?,
-                        r.get::<_, String>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                        r.get::<_, i64>(7)?,
-                        r.get::<_, Option<f32>>(8)?,
-                        r.get::<_, Option<i64>>(9)?,
-                    ))
-                },
-            );
+            let row = conn.query_row(&query_str, params![id, ns], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f32>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, f32>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, Option<f32>>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
+                ))
+            });
             let (
                 content,
                 created_at,
@@ -816,6 +986,12 @@ impl Store {
                     content,
                     score: final_score.clamp(0.0, 1.0),
                     trust,
+                    trust_variance: 0.0,
+                    trust_samples: 0,
+                    trust_last_session_id: None,
+                    effective_weight: weight,
+                    reinforcement_count,
+                    ingestion_driver: "Unknown".to_string(),
                     uncertainty,
                     state: store_state,
                     created_at,
@@ -881,7 +1057,7 @@ impl Store {
         max_age_days: f32,
     ) -> Result<Vec<Memory>> {
         let cutoff_ts = now_ts() - (max_age_days * 86_400.0) as i64;
-        let pool = self.search(query_vec, (top_k * 4).max(20))?;
+        let pool = self.search(query_vec, (top_k * 4).max(20), false)?;
         Ok(pool
             .into_iter()
             .filter(|m| m.created_at >= cutoff_ts)
@@ -955,7 +1131,7 @@ impl Store {
         // Build NLI checker once (zero-cost: stateless struct).
         let use_nli = self.config.use_nli_contradiction;
         let nli_threshold = self.config.nli_cosine_threshold;
-        let nli = NliChecker::new();
+        let nli = self.nli_checker.clone();
 
         let mut contradictions: Vec<(i64, f32, f32, f32, i64)> = Vec::new();
         for row in stmt.query_map(params![id, ns], |r| {
@@ -1019,7 +1195,7 @@ impl Store {
                 if !use_nli {
                     continue;
                 }
-                // NLI returned Neutral or Entailment — skip.
+                // NLI returned Neutral or Entailment â€” skip.
                 continue;
             }
 
@@ -1032,14 +1208,31 @@ impl Store {
 
         drop(stmt);
 
-        let rec_new = recency_bonus(created_at, now);
-        let q_new = 0.45 * imp + 0.25 * conf + 0.20 * rec_new + 0.10 * ev;
-
-        for (other_id, o_imp, o_conf, o_ev, o_created) in contradictions {
-            let rec_old = recency_bonus(o_created, now);
-            let q_old = 0.45 * o_imp + 0.25 * o_conf + 0.20 * rec_old + 0.10 * o_ev;
-
-            let (winner_id, loser_id) = if q_new >= q_old {
+        for (other_id, _o_imp, _o_conf, _o_ev, o_created) in contradictions {
+            let existing = conn
+                .query_row(
+                    "SELECT trust_ema, reinforcement_count, created_at FROM memories WHERE id = ?1",
+                    params![other_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<f32>>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .ok();
+            let existing_gravity = existing
+                .map(|(ema, rc, created)| {
+                    compute_gravity_radius(
+                        ema.unwrap_or(0.5) as f64,
+                        rc,
+                        ((now - created).max(0) as f64) / 86_400.0,
+                    )
+                })
+                .unwrap_or(0.0);
+            let should_replace = should_supersede(imp as f64, existing_gravity);
+            let (winner_id, loser_id) = if should_replace {
                 (id, other_id)
             } else {
                 (other_id, id)
@@ -1054,7 +1247,7 @@ impl Store {
             // Do NOT set contradiction_group on the winner. The loser already points to the
             // winner via superseded_by. Setting contradiction_group on the winner would put
             // it into the weak-group deduplication filter in search(), which suppresses
-            // memories whose best-survivor trust < 0.40 — incorrectly hiding the winner.
+            // memories whose best-survivor trust < 0.40 â€” incorrectly hiding the winner.
             inner.remove_from_cache(loser_id);
             log::debug!(
                 "contradiction resolved ({}): winner={winner_id} loser={loser_id} group={group}",
@@ -1173,6 +1366,98 @@ impl Store {
                         content,
                         score: 1.0,
                         trust,
+                        trust_variance: 0.0,
+                        trust_samples: 0,
+                        trust_last_session_id: None,
+                        effective_weight: 0.5,
+                        reinforcement_count: rc,
+                        ingestion_driver: "Unknown".to_string(),
+                        uncertainty,
+                        state,
+                        created_at,
+                        last_used_at: None,
+                    }
+                },
+            )
+            .collect();
+        Ok(rows)
+    }
+
+    /// Sample up to `limit` active memories at random from this namespace.
+    /// Used by the oracle to evaluate semantic consistency before ingestion.
+    pub fn sample_namespace(&self, limit: usize) -> Result<Vec<Memory>> {
+        let conn = self.pool.get()?;
+        let ns = &self.namespace;
+        let now = now_ts();
+        let config = &self.config;
+        let mut stmt = conn.prepare(
+            "SELECT id, content, created_at, importance_base, reinforcement_count, confidence,
+                    store_state, contradiction_group, failure_count, trust_ema
+             FROM memories
+             WHERE namespace = ?1 AND archived = 0 AND superseded_by IS NULL
+               AND store_state = 'active'
+             ORDER BY RANDOM() LIMIT ?2",
+        )?;
+        let rows: Vec<Memory> = stmt
+            .query_map(params![ns, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, f32>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, f32>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<f32>>(9)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(
+                |(
+                    id,
+                    content,
+                    created_at,
+                    imp,
+                    rc,
+                    conf,
+                    state,
+                    cg,
+                    failure_count,
+                    trust_ema_stored,
+                )| {
+                    let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
+                    let contradiction_survived = cg.is_some() && state == "active";
+                    let trust_computed = compute_trust(
+                        rc,
+                        contradiction_survived,
+                        &state,
+                        imp,
+                        conf,
+                        age_days,
+                        config,
+                    );
+                    let w = config.ema_new_weight;
+                    let trust = match trust_ema_stored {
+                        Some(ema) => ((1.0 - w) * ema + w * trust_computed).clamp(0.0, 1.0),
+                        None => trust_computed,
+                    };
+                    let rc_f = rc as f32;
+                    let fc_f = failure_count as f32;
+                    let uncertainty =
+                        (0.5 / (1.0 + rc_f) + 0.5 * fc_f / (fc_f + rc_f + 1.0)).clamp(0.0, 1.0);
+                    Memory {
+                        id,
+                        content,
+                        score: 1.0,
+                        trust,
+                        trust_variance: 0.0,
+                        trust_samples: 0,
+                        trust_last_session_id: None,
+                        effective_weight: 0.5,
+                        reinforcement_count: rc,
+                        ingestion_driver: "Unknown".to_string(),
                         uncertainty,
                         state,
                         created_at,
@@ -1208,7 +1493,7 @@ impl Store {
         let mut inner = self.write_lock()?;
         conn.execute_batch("DELETE FROM memories;")?;
         inner.embedding_cache.clear();
-        inner.embedding_cache_loaded = true; // empty store is coherent — no load needed
+        inner.embedding_cache_loaded = true; // empty store is coherent â€” no load needed
         inner.fingerprints.clear();
         inner.hnsw = None;
         inner.hnsw_dirty = false;
@@ -1306,8 +1591,8 @@ impl Store {
     /// Selects up to `top_k` results from `candidates` that maximise relevance
     /// to `query_embedding` while minimising redundancy with already-selected items.
     ///
-    /// `lambda = 1.0` → pure relevance (identical to `recall`).
-    /// `lambda = 0.0` → pure diversity.
+    /// `lambda = 1.0` â†’ pure relevance (identical to `recall`).
+    /// `lambda = 0.0` â†’ pure diversity.
     pub fn mmr_rerank(
         &self,
         mut candidates: Vec<Memory>,
@@ -1373,6 +1658,15 @@ impl Store {
         }
 
         selected
+    }
+
+    fn memories_has_columns(conn: &Connection, names: &[&str]) -> Result<bool> {
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+        let existing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(names.iter().all(|name| existing.iter().any(|c| c == *name)))
     }
 
     fn ensure_quality_columns(conn: &Connection) -> Result<()> {
@@ -1452,7 +1746,19 @@ impl Store {
         if !has("trust_ema") {
             alter.push("ALTER TABLE memories ADD COLUMN trust_ema REAL;");
         }
-        // Namespace column — added in v0.3.0. Existing rows get 'default'.
+        if !has("trust_variance") {
+            alter.push("ALTER TABLE memories ADD COLUMN trust_variance REAL NOT NULL DEFAULT 0.0;");
+        }
+        if !has("trust_samples") {
+            alter.push("ALTER TABLE memories ADD COLUMN trust_samples INTEGER NOT NULL DEFAULT 0;");
+        }
+        if !has("trust_last_session_id") {
+            alter.push("ALTER TABLE memories ADD COLUMN trust_last_session_id TEXT;");
+        }
+        if !has("ingestion_driver") {
+            alter.push("ALTER TABLE memories ADD COLUMN ingestion_driver TEXT;");
+        }
+        // Namespace column â€” added in v0.3.0. Existing rows get 'default'.
         if !has("namespace") {
             alter
                 .push("ALTER TABLE memories ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default';");
@@ -1503,7 +1809,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         store.insert("memory one", &[1.0_f32, 0.0, 0.0]).unwrap();
         store.insert("memory two", &[0.0_f32, 1.0, 0.0]).unwrap();
-        let results = store.search(&[0.9_f32, 0.1, 0.0], 2).unwrap();
+        let results = store.search(&[0.9_f32, 0.1, 0.0], 2, false).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].content, "memory one");
     }
@@ -1554,7 +1860,7 @@ mod tests {
         store.insert("closest", &[1.0_f32, 0.0, 0.0]).unwrap();
         store.insert("middle", &[0.7_f32, 0.7, 0.0]).unwrap();
         store.insert("farthest", &[0.0_f32, 1.0, 0.0]).unwrap();
-        let results = store.search(&[1.0, 0.0, 0.0], 3).unwrap();
+        let results = store.search(&[1.0, 0.0, 0.0], 3, false).unwrap();
         for w in results.windows(2) {
             assert!(w[0].score >= w[1].score);
         }
@@ -1576,7 +1882,7 @@ mod tests {
         assert_eq!(store.count().unwrap(), 0);
     }
 
-    // ─── Failure-feedback / penalize_if_used tests ────────────────────────────
+    // â”€â”€â”€ Failure-feedback / penalize_if_used tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_penalty_reduces_trust() {
@@ -1650,7 +1956,13 @@ mod tests {
             .trust;
         // Reinforce via Jaccard token overlap (>= 0.15)
         store
-            .reinforce_if_used(id, "decimal money correct precision usage", true, None)
+            .reinforce_if_used(
+                id,
+                "decimal money correct precision usage",
+                true,
+                None,
+                None,
+            )
             .unwrap();
         let trust_recovered = store
             .all()
@@ -1670,7 +1982,7 @@ mod tests {
     #[test]
     fn test_ranking_improves_after_penalizing_bad_memory() {
         let store = Store::in_memory().unwrap();
-        // Same embedding so cosine sim is equal — ranking separates via effective_weight
+        // Same embedding so cosine sim is equal â€” ranking separates via effective_weight
         let mut bad_meta = QualityMeta::default_active("float is fine for money");
         bad_meta.importance_base = 0.7;
         bad_meta.confidence = 0.7;
@@ -1687,12 +1999,12 @@ mod tests {
             .insert_with_quality("decimal is correct for money", &[1.0, 0.0, 0.0], &good_meta)
             .unwrap();
 
-        // Apply 3 failures to the bad memory — rc: 3→2→1→0, conf/imp decay each round
+        // Apply 3 failures to the bad memory â€” rc: 3â†’2â†’1â†’0, conf/imp decay each round
         for _ in 0..3 {
             store.penalize_if_used(&[bad_id], 1.0).unwrap();
         }
 
-        let results = store.search(&[1.0, 0.0, 0.0], 2).unwrap();
+        let results = store.search(&[1.0, 0.0, 0.0], 2, false).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(
             results[0].content, "decimal is correct for money",
@@ -1700,7 +2012,7 @@ mod tests {
         );
     }
 
-    // ─── Namespace isolation tests ────────────────────────────────────────────
+    // â”€â”€â”€ Namespace isolation tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Two in-memory stores with different namespaces must not see each other's rows.
     #[test]
@@ -1720,7 +2032,7 @@ mod tests {
         assert_eq!(store_b.all().unwrap()[0].content, "only in b");
     }
 
-    /// Shared SQLite file — two Store handles with different namespaces must
+    /// Shared SQLite file â€” two Store handles with different namespaces must
     /// not bleed across (the real multi-tenant scenario).
     #[test]
     fn test_namespace_shared_file_isolation() {
@@ -1750,14 +2062,14 @@ mod tests {
             assert_eq!(store_b.all().unwrap()[0].content, "tenant_b secret");
 
             // Search from tenant_a's perspective must not surface tenant_b's memory.
-            let found = store_a.search(&[0.0_f32, 1.0], 5).unwrap();
+            let found = store_a.search(&[0.0_f32, 1.0], 5, false).unwrap();
             assert!(
                 found.iter().all(|m| m.content != "tenant_b secret"),
                 "tenant_a search must not return tenant_b's memory"
             );
         }
 
-        // Cleanup — ignore errors (WAL files on Windows)
+        // Cleanup â€” ignore errors (WAL files on Windows)
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path_str}-wal"));
         let _ = std::fs::remove_file(format!("{path_str}-shm"));

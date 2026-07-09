@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+pub mod background;
 pub mod chunker;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod embedder;
@@ -16,15 +18,19 @@ use chunker::{chunk_text, ChunkerConfig};
 use embedder::{EmbedProvider, Embedder, FastEmbedReranker, Reranker};
 use error::{MemoireError, Result};
 use quality::{
-    build_quality_meta, fingerprint, IngestDecision, ScoringConfig, ScoringPrototypes,
-    ScoringWeights,
+    build_quality_meta, fingerprint, IngestDecision, IngestionOracle, ScoringConfig,
+    ScoringPrototypes, ScoringWeights,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use serde::Serialize;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use store::{Memory, Store};
 
-// ─── WASM re-exports ─────────────────────────────────────────────────────────
+// â”€â”€â”€ WASM re-exports â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // On wasm32, only the pure-Rust quality and NLI functions are available.
 // Agents running in a browser/WASM environment can import these to score
 // and detect contradictions in memory text without SQLite or ONNX.
@@ -33,7 +39,7 @@ pub use quality::{cosine_similarity, detect_polarity, NliChecker, NliLabel, Scor
 
 /// The central Memoire instance.
 ///
-/// Not available on `wasm32` targets — use the quality module directly for
+/// Not available on `wasm32` targets â€” use the quality module directly for
 /// scoring and NLI contradiction detection in browser environments.
 ///
 /// # Example
@@ -52,16 +58,40 @@ pub use quality::{cosine_similarity, detect_polarity, NliChecker, NliLabel, Scor
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Memoire {
     pub(crate) store: Store,
-    embedder: Box<dyn EmbedProvider>,
+    embedder: Arc<dyn EmbedProvider>,
     reranker: Option<Arc<Mutex<Box<dyn Reranker>>>>,
     chunker_config: ChunkerConfig,
     scoring_weights: ScoringWeights,
-    prototypes: ScoringPrototypes,
+    prototypes: Arc<Mutex<ScoringPrototypes>>,
+    oracle: Option<Arc<dyn IngestionOracle>>,
+    maintenance_handle: Option<tokio::task::JoinHandle<()>>,
+    insert_count: Arc<AtomicU32>,
+    reinforcement_count: Arc<AtomicU32>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallAttribution {
+    pub memory: Memory,
+    pub semantic_score: f32,
+    pub trust: f32,
+    pub uncertainty: f32,
+    pub effective_weight: f32,
+    pub rank_score: f32,
+    pub reasons: Vec<String>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Memoire {
+    fn drop(&mut self) {
+        if let Some(h) = self.maintenance_handle.take() {
+            h.abort();
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Memoire {
-    // ─── Constructors ────────────────────────────────────────────────────────
+    // â”€â”€â”€ Constructors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Open or create a persistent memory store at `db_path`.
     pub fn new(db_path: &str) -> Result<Self> {
@@ -78,7 +108,7 @@ impl Memoire {
     /// # use memoire::Memoire;
     /// let agent_a = Memoire::new_ns("shared.db", "agent_a").unwrap();
     /// let agent_b = Memoire::new_ns("shared.db", "agent_b").unwrap();
-    /// // agent_a.recall(…) never returns agent_b's memories and vice-versa.
+    /// // agent_a.recall(â€¦) never returns agent_b's memories and vice-versa.
     /// ```
     pub fn new_ns(db_path: &str, namespace: &str) -> Result<Self> {
         let _ = env_logger::try_init();
@@ -89,8 +119,8 @@ impl Memoire {
 
     /// Open a persistent store with a custom embedding backend.
     ///
-    /// Allows swapping `all-MiniLM-L6-v2` for any model — BERT-large, an
-    /// OpenAI API wrapper, or a proprietary encoder — without recompiling.
+    /// Allows swapping `all-MiniLM-L6-v2` for any model â€” BERT-large, an
+    /// OpenAI API wrapper, or a proprietary encoder â€” without recompiling.
     /// Implement [`embedder::EmbedProvider`] and pass the backend here.
     pub fn new_with_embedder(db_path: &str, embedder: Box<dyn EmbedProvider>) -> Result<Self> {
         Self::new_ns_with_embedder(db_path, "default", embedder)
@@ -102,17 +132,22 @@ impl Memoire {
         embedder: Box<dyn EmbedProvider>,
     ) -> Result<Self> {
         let prototypes = Self::compute_prototypes(&*embedder);
+        let embedder: Arc<dyn EmbedProvider> = Arc::from(embedder);
         Ok(Self {
             store: Store::open_ns_with_config(db_path, namespace, ScoringConfig::default())?,
             embedder,
             reranker: None,
             chunker_config: ChunkerConfig::default(),
             scoring_weights: ScoringWeights::default(),
-            prototypes,
+            prototypes: Arc::new(Mutex::new(prototypes)),
+            oracle: None,
+            maintenance_handle: None,
+            insert_count: Arc::new(AtomicU32::new(0)),
+            reinforcement_count: Arc::new(AtomicU32::new(0)),
         })
     }
 
-    /// In-memory store — not persisted. Useful for tests.
+    /// In-memory store â€” not persisted. Useful for tests.
     pub fn in_memory() -> Result<Self> {
         let _ = env_logger::try_init();
         let embedder: Box<dyn EmbedProvider> =
@@ -141,24 +176,82 @@ impl Memoire {
     ) -> Result<Self> {
         let _ = env_logger::try_init();
         let prototypes = Self::compute_prototypes(&*embedder);
+        let embedder: Arc<dyn EmbedProvider> = Arc::from(embedder);
         Ok(Self {
             store: Store::in_memory_ns_with_config(namespace, ScoringConfig::default())?,
             embedder,
             reranker: None,
             chunker_config: ChunkerConfig::default(),
             scoring_weights: ScoringWeights::default(),
-            prototypes,
+            prototypes: Arc::new(Mutex::new(prototypes)),
+            oracle: None,
+            maintenance_handle: None,
+            insert_count: Arc::new(AtomicU32::new(0)),
+            reinforcement_count: Arc::new(AtomicU32::new(0)),
         })
     }
 
-    // ─── Introspection ───────────────────────────────────────────────────────
+    // â”€â”€â”€ Introspection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Return the namespace this instance is scoped to.
     pub fn namespace(&self) -> &str {
         &self.store.namespace
     }
 
-    // ─── Builders ────────────────────────────────────────────────────────────
+    // â”€â”€â”€ Background Tasks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Start scheduled background maintenance.
+    ///
+    /// - Runs `maintenance_pass()` every `interval_secs` seconds (time-based).
+    /// - Also watches for `threshold` inserts and triggers maintenance early.
+    ///
+    /// Aborts any previous background task before starting a new one.
+    /// The handle is automatically aborted when `Memoire` is dropped.
+    pub fn start_background_maintenance(&mut self, interval_secs: u64, threshold: u32) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            log::warn!("start_background_maintenance called without a Tokio runtime; scheduler not started");
+            return;
+        }
+
+        if let Some(h) = self.maintenance_handle.take() {
+            h.abort();
+        }
+
+        let store_arc = Arc::new(self.store.clone());
+        let insert_count = Arc::clone(&self.insert_count);
+        let reinforcement_count = Arc::clone(&self.reinforcement_count);
+        let embedder = Arc::clone(&self.embedder);
+        let prototypes = Arc::clone(&self.prototypes);
+
+        let store1 = Arc::clone(&store_arc);
+        let time_fn: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync> =
+            Arc::new(move || store1.maintenance_pass().map_err(anyhow::Error::from));
+        let h1 = background::spawn_maintenance_scheduler(time_fn, interval_secs.max(1));
+
+        let store2 = Arc::clone(&store_arc);
+        let count_fn: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync> =
+            Arc::new(move || store2.maintenance_pass().map_err(anyhow::Error::from));
+        let h2 = background::spawn_count_watcher(count_fn, insert_count, threshold.max(1));
+
+        let recompute_fn: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync> = Arc::new(move || {
+            let new_protos = Self::compute_prototypes(&*embedder);
+            *prototypes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("prototype lock poisoned"))? = new_protos;
+            Ok(())
+        });
+        let h3 = background::spawn_reinforcement_watcher(recompute_fn, reinforcement_count, 100);
+
+        let combined = tokio::spawn(async move {
+            tokio::select! {
+                _ = h1 => {}
+                _ = h2 => {}
+                _ = h3 => {}
+            }
+        });
+        self.maintenance_handle = Some(combined);
+    }
+    // Builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Override the scoring config used by the store.
     pub fn with_scoring_config(mut self, config: ScoringConfig) -> Self {
@@ -184,7 +277,7 @@ impl Memoire {
     ///
     /// The `ScoringWeights::default()` profile is frozen for reproducibility
     /// and is the baseline for all benchmarks. Use this to tune for your domain
-    /// without recompiling — e.g. raise `novelty` to 0.40 for research agents
+    /// without recompiling â€” e.g. raise `novelty` to 0.40 for research agents
     /// where unique facts matter more than actionability.
     ///
     /// Does NOT affect the trust formula (computed at recall time from
@@ -195,7 +288,21 @@ impl Memoire {
         self
     }
 
-    // ─── Core API ────────────────────────────────────────────────────────────
+    pub fn with_oracle(mut self, oracle: impl IngestionOracle + 'static) -> Self {
+        self.oracle = Some(Arc::new(oracle));
+        self
+    }
+
+    pub fn with_nli_model(self, path: &std::path::Path) -> anyhow::Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let checker = quality::OnnxNliChecker::from_path(path)?;
+            self.store.set_nli_checker(checker)?;
+        }
+        Ok(self)
+    }
+
+    // â”€â”€â”€ Core API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Chunk `content`, embed each chunk, and persist. Returns inserted row ids.
     pub fn remember(&self, content: &str) -> Result<Vec<i64>> {
@@ -206,7 +313,7 @@ impl Memoire {
     pub fn remember_with_source(&self, content: &str, source_kind: &str) -> Result<Vec<i64>> {
         let chunks = chunk_text(content, &self.chunker_config);
         if chunks.is_empty() {
-            log::warn!("remember() called with empty input — nothing stored.");
+            log::warn!("remember() called with empty input â€” nothing stored.");
             return Ok(vec![]);
         }
         log::debug!("remember(): {} chunk(s)", chunks.len());
@@ -224,40 +331,73 @@ impl Memoire {
             }
             let max_sim = self.store.max_similarity(embedding)?;
             let novelty = (1.0 - max_sim).clamp(0.0, 1.0);
-            let (meta, decision) = build_quality_meta(
+            let (mut meta, mut decision) = build_quality_meta(
                 chunk,
                 embedding,
                 novelty,
                 source_kind,
                 &self.scoring_weights,
-                &self.prototypes,
+                &*self
+                    .prototypes
+                    .lock()
+                    .map_err(|_| MemoireError::LockPoisoned)?,
             );
+
+            if let Some(oracle) = &self.oracle {
+                let sample = self.store.sample_namespace(50)?;
+                let oracle_decision = oracle.decide(chunk, embedding, &sample);
+                if oracle_decision == IngestDecision::Reject {
+                    continue;
+                }
+                decision = oracle_decision;
+                meta.store_state = match decision {
+                    IngestDecision::Active => "active",
+                    IngestDecision::Probationary => "probationary",
+                    IngestDecision::Shadow => "shadow",
+                    IngestDecision::Reject => "rejected",
+                }
+                .to_string();
+            }
 
             match decision {
                 IngestDecision::Reject => continue,
-                IngestDecision::Shadow | IngestDecision::Active => {
+                IngestDecision::Shadow | IngestDecision::Active | IngestDecision::Probationary => {
                     let id = self.store.insert_with_quality(chunk, embedding, &meta)?;
                     self.store.resolve_contradictions_for_id(id)?;
                     ids.push(id);
+                    self.insert_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
-        self.store.maintenance_pass()?;
         log::debug!("remember(): stored ids: {:?}", ids);
         Ok(ids)
     }
 
     /// Embed `query` and return the `top_k` most similar memories.
     pub fn recall(&self, query: &str, top_k: usize) -> Result<Vec<Memory>> {
+        self.recall_with_options(query, top_k, false)
+    }
+
+    pub fn recall_with_options(
+        &self,
+        query: &str,
+        top_k: usize,
+        include_shadow: bool,
+    ) -> Result<Vec<Memory>> {
         if self.store.count()? == 0 {
             return Ok(vec![]);
         }
-        log::debug!("recall(): {:?} top_k={}", query, top_k);
+        log::debug!(
+            "recall_with_options(): {:?} top_k={} include_shadow={}",
+            query,
+            top_k,
+            include_shadow
+        );
         let query_vec = self
             .embedder
             .embed_one(query)
             .map_err(MemoireError::Embedding)?;
-        self.store.search(&query_vec, top_k)
+        self.store.search(&query_vec, top_k, include_shadow)
     }
 
     /// Recall with a minimum score threshold after ranking.
@@ -276,7 +416,7 @@ impl Memoire {
     ///
     /// Addresses **semantic drift**: a memory accurate for an older library
     /// version should not surface when the API has since changed. This is a
-    /// read-only recency gate — stale memories are skipped but their trust
+    /// read-only recency gate â€” stale memories are skipped but their trust
     /// scores are NOT modified. Use `penalize_if_used` only when the memory
     /// was genuinely wrong, not merely outdated.
     ///
@@ -321,19 +461,36 @@ impl Memoire {
         agent_output: &str,
         task_succeeded: bool,
     ) -> Result<bool> {
+        self.reinforce_if_used_with_session(memory_id, agent_output, task_succeeded, None)
+    }
+
+    pub fn reinforce_if_used_with_session(
+        &self,
+        memory_id: i64,
+        agent_output: &str,
+        task_succeeded: bool,
+        session_id: Option<&str>,
+    ) -> Result<bool> {
         // Embed the agent output so the cosine path can fire on paraphrase
         let output_embedding = self.embedder.embed_one(agent_output).ok();
-        self.store.reinforce_if_used(
+        match self.store.reinforce_if_used(
             memory_id,
             agent_output,
             task_succeeded,
             output_embedding.as_deref(),
-        )
+            session_id,
+        ) {
+            Ok(true) => {
+                self.reinforcement_count.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            other => other,
+        }
     }
 
     /// Penalize memories that contributed to a failed task outcome.
     ///
-    /// `failure_severity` ∈ [0.0, 1.0] — scales how harshly the memories are
+    /// `failure_severity` âˆˆ [0.0, 1.0] â€” scales how harshly the memories are
     /// penalized. Use 1.0 for a direct failure, 0.5 for a partial miss.
     /// Symmetric with `reinforce_if_used`. Returns the trust delta per memory.
     pub fn penalize_if_used(
@@ -432,8 +589,8 @@ impl Memoire {
     /// Retrieves `top_k * 3` candidates (min 20) then reranks using MMR so
     /// near-duplicate chunks do not dominate the top-k slots.
     ///
-    /// `mmr_lambda = 1.0` → identical to `recall` (pure relevance).
-    /// `mmr_lambda = 0.5` (default) → balanced relevance/diversity.
+    /// `mmr_lambda = 1.0` â†’ identical to `recall` (pure relevance).
+    /// `mmr_lambda = 0.5` (default) â†’ balanced relevance/diversity.
     pub fn recall_mmr(&self, query: &str, top_k: usize, mmr_lambda: f32) -> Result<Vec<Memory>> {
         if self.store.count()? == 0 {
             return Ok(vec![]);
@@ -443,7 +600,7 @@ impl Memoire {
             .embedder
             .embed_one(query)
             .map_err(MemoireError::Embedding)?;
-        let candidates = self.store.search(&query_vec, candidate_k)?;
+        let candidates = self.store.search(&query_vec, candidate_k, false)?;
         Ok(self
             .store
             .mmr_rerank(candidates, &query_vec, top_k, mmr_lambda))
@@ -473,7 +630,73 @@ impl Memoire {
         }
     }
 
-    // ─── Private helpers ─────────────────────────────────────────────────────
+    /// Recall memories together with an attribution breakdown for ranking and policy use.
+    pub fn recall_explained(&self, query: &str, top_k: usize) -> Result<Vec<RecallAttribution>> {
+        let memories = self.recall(query, top_k)?;
+        Ok(memories
+            .into_iter()
+            .map(|memory| {
+                let mut reasons = Vec::new();
+                if memory.score >= 0.75 {
+                    reasons.push("high semantic relevance".to_string());
+                } else if memory.score >= 0.45 {
+                    reasons.push("moderate semantic relevance".to_string());
+                } else {
+                    reasons.push("weak semantic relevance".to_string());
+                }
+
+                if memory.trust >= 0.75 {
+                    reasons.push("high trust".to_string());
+                } else if memory.trust >= 0.45 {
+                    reasons.push("hint-level trust".to_string());
+                } else {
+                    reasons.push("low trust".to_string());
+                }
+
+                if memory.uncertainty >= 0.60 {
+                    reasons.push("high uncertainty".to_string());
+                }
+                if memory.reinforcement_count > 0 {
+                    reasons.push(format!(
+                        "{} reinforcement event(s)",
+                        memory.reinforcement_count
+                    ));
+                }
+                if memory.ingestion_driver != "Unknown" {
+                    reasons.push(format!("ingestion driver: {}", memory.ingestion_driver));
+                }
+
+                RecallAttribution {
+                    semantic_score: memory.score,
+                    trust: memory.trust,
+                    uncertainty: memory.uncertainty,
+                    effective_weight: memory.effective_weight,
+                    rank_score: (0.65 * memory.score
+                        + 0.25 * memory.trust
+                        + 0.10 * memory.effective_weight)
+                        .clamp(0.0, 1.0),
+                    memory,
+                    reasons,
+                }
+            })
+            .collect())
+    }
+    // â”€â”€â”€ Private helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Recompute the semantic scoring prototypes from the current embedder.
+    ///
+    /// Should be called periodically (e.g., every 100 reinforcement events) so
+    /// that the prototype centroids reflect any fine-tuned embedding model.
+    /// Internally re-embeds the 15 fixed prototype sentences and updates
+    /// `self.prototypes` in-place.
+    pub fn recompute_prototypes(&self) -> Result<()> {
+        let new_protos = Self::compute_prototypes(&*self.embedder);
+        *self
+            .prototypes
+            .lock()
+            .map_err(|_| MemoireError::LockPoisoned)? = new_protos;
+        Ok(())
+    }
 
     fn compute_prototypes(embedder: &dyn EmbedProvider) -> ScoringPrototypes {
         let consequence_sents = [
@@ -529,12 +752,12 @@ impl Memoire {
                 }
             }
             Err(e) => {
-                log::warn!("compute_prototypes failed — falling back to neutral: {e}");
+                log::warn!("compute_prototypes failed â€” falling back to neutral: {e}");
                 ScoringPrototypes::neutral(384)
             }
             Ok(_) => {
                 log::warn!(
-                    "compute_prototypes returned unexpected count — falling back to neutral"
+                    "compute_prototypes returned unexpected count â€” falling back to neutral"
                 );
                 ScoringPrototypes::neutral(384)
             }

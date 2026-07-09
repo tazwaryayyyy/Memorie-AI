@@ -1,4 +1,4 @@
-use crate::Memoire;
+use crate::{store::Memory, Memoire};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 
@@ -15,6 +15,18 @@ pub struct PyMemory {
     pub score: f32,
     #[pyo3(get)]
     pub trust: f32,
+    #[pyo3(get)]
+    pub trust_variance: f64,
+    #[pyo3(get)]
+    pub trust_samples: i64,
+    #[pyo3(get)]
+    pub trust_last_session_id: Option<String>,
+    #[pyo3(get)]
+    pub effective_weight: f32,
+    #[pyo3(get)]
+    pub reinforcement_count: i64,
+    #[pyo3(get)]
+    pub ingestion_driver: String,
     #[pyo3(get)]
     pub uncertainty: f32,
     #[pyo3(get)]
@@ -38,6 +50,44 @@ impl PyMemory {
             self.id, self.score, self.trust, self.uncertainty, self.state, preview
         )
     }
+}
+
+fn py_memory(m: Memory) -> PyMemory {
+    PyMemory {
+        id: m.id,
+        content: m.content,
+        score: m.score,
+        trust: m.trust,
+        trust_variance: m.trust_variance,
+        trust_samples: m.trust_samples,
+        trust_last_session_id: m.trust_last_session_id,
+        effective_weight: m.effective_weight,
+        reinforcement_count: m.reinforcement_count,
+        ingestion_driver: m.ingestion_driver,
+        uncertainty: m.uncertainty,
+        state: m.state,
+        created_at: m.created_at,
+        last_used_at: m.last_used_at,
+    }
+}
+
+#[pyclass(name = "RecallAttribution")]
+#[derive(Clone)]
+pub struct PyRecallAttribution {
+    #[pyo3(get)]
+    pub memory: PyMemory,
+    #[pyo3(get)]
+    pub semantic_score: f32,
+    #[pyo3(get)]
+    pub trust: f32,
+    #[pyo3(get)]
+    pub uncertainty: f32,
+    #[pyo3(get)]
+    pub effective_weight: f32,
+    #[pyo3(get)]
+    pub rank_score: f32,
+    #[pyo3(get)]
+    pub reasons: Vec<String>,
 }
 
 #[pyclass(name = "Memoire")]
@@ -72,20 +122,7 @@ impl PyMemoire {
             .inner
             .recall(query, top_k)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        let py_memories = memories
-            .into_iter()
-            .map(|m| PyMemory {
-                id: m.id,
-                content: m.content,
-                score: m.score,
-                trust: m.trust,
-                uncertainty: m.uncertainty,
-                state: m.state,
-                created_at: m.created_at,
-                last_used_at: m.last_used_at,
-            })
-            .collect();
-        Ok(py_memories)
+        Ok(memories.into_iter().map(py_memory).collect())
     }
 
     #[pyo3(signature = (query, top_k, mmr_lambda = 0.5))]
@@ -94,20 +131,7 @@ impl PyMemoire {
             .inner
             .recall_mmr(query, top_k, mmr_lambda)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        let py_memories = memories
-            .into_iter()
-            .map(|m| PyMemory {
-                id: m.id,
-                content: m.content,
-                score: m.score,
-                trust: m.trust,
-                uncertainty: m.uncertainty,
-                state: m.state,
-                created_at: m.created_at,
-                last_used_at: m.last_used_at,
-            })
-            .collect();
-        Ok(py_memories)
+        Ok(memories.into_iter().map(py_memory).collect())
     }
 
     fn recall_reranked(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
@@ -115,22 +139,34 @@ impl PyMemoire {
             .inner
             .recall_reranked(query, top_k)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        let py_memories = memories
-            .into_iter()
-            .map(|m| PyMemory {
-                id: m.id,
-                content: m.content,
-                score: m.score,
-                trust: m.trust,
-                uncertainty: m.uncertainty,
-                state: m.state,
-                created_at: m.created_at,
-                last_used_at: m.last_used_at,
-            })
-            .collect();
-        Ok(py_memories)
+        Ok(memories.into_iter().map(py_memory).collect())
     }
 
+    fn recall_explained(&self, query: &str, top_k: usize) -> PyResult<Vec<PyRecallAttribution>> {
+        let attributions = self
+            .inner
+            .recall_explained(query, top_k)
+            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
+        Ok(attributions
+            .into_iter()
+            .map(|a| PyRecallAttribution {
+                memory: py_memory(a.memory),
+                semantic_score: a.semantic_score,
+                trust: a.trust,
+                uncertainty: a.uncertainty,
+                effective_weight: a.effective_weight,
+                rank_score: a.rank_score,
+                reasons: a.reasons,
+            })
+            .collect())
+    }
+
+    fn recompute_prototypes(&self) -> PyResult<()> {
+        self.inner
+            .recompute_prototypes()
+            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
+        Ok(())
+    }
     fn forget(&self, memory_id: i64) -> PyResult<bool> {
         let deleted = self
             .inner
@@ -182,15 +218,17 @@ impl PyMemoire {
         Ok(true)
     }
 
+    #[pyo3(signature = (memory_id, agent_output, task_succeeded, session_id = None))]
     fn reinforce_if_used(
         &self,
         memory_id: i64,
         agent_output: &str,
         task_succeeded: bool,
+        session_id: Option<&str>,
     ) -> PyResult<bool> {
         let reinforced = self
             .inner
-            .reinforce_if_used(memory_id, agent_output, task_succeeded)
+            .reinforce_if_used_with_session(memory_id, agent_output, task_succeeded, session_id)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(reinforced)
     }
@@ -210,6 +248,7 @@ impl PyMemoire {
 fn memoire(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemoire>()?;
     m.add_class::<PyMemory>()?;
+    m.add_class::<PyRecallAttribution>()?;
     m.add("MemoireError", m.py().get_type_bound::<MemoireError>())?;
     Ok(())
 }

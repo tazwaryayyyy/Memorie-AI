@@ -1,4 +1,4 @@
-"""
+﻿"""
 Core Python client for Memoire. Wraps the PyO3 native extension.
 """
 from __future__ import annotations
@@ -93,7 +93,7 @@ class Memoire:
             content: Any text.
 
         Returns:
-            Number of chunks stored (≥ 1).
+            Number of chunks stored (â‰¥ 1).
         """
         self._check_open()
         if not isinstance(content, str):
@@ -114,7 +114,7 @@ class Memoire:
             top_k: Maximum number of results to return (default 5).
 
         Returns:
-            List of Memory objects, sorted by score descending (0–1).
+            List of Memory objects, sorted by score descending (0â€“1).
         """
         self._check_open()
         if not isinstance(query, str):
@@ -131,13 +131,14 @@ class Memoire:
         memory_id: int,
         agent_output: str,
         task_succeeded: bool,
+        session_id: Optional[str] = None,
     ) -> bool:
         """
         Conditionally reinforce a memory based on actual use.
         """
         self._check_open()
         try:
-            return self._impl.reinforce_if_used(memory_id, agent_output, task_succeeded)
+            return self._impl.reinforce_if_used(memory_id, agent_output, task_succeeded, session_id)
         except Exception as e:
             raise MemoireError(f"reinforce_if_used() failed: {e}") from e
 
@@ -158,6 +159,27 @@ class Memoire:
         except Exception as e:
             raise MemoireError(f"penalize_if_used() failed: {e}") from e
 
+    def recall_explained(self, query: str, top_k: int = 5) -> List[object]:
+        """
+        Return recalled memories with attribution signals explaining their ranking.
+        """
+        self._check_open()
+        if not isinstance(query, str):
+            raise TypeError(f"query must be str, got {type(query).__name__}")
+        if top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
+        try:
+            return self._impl.recall_explained(query, top_k)
+        except Exception as e:
+            raise MemoireError(f"recall_explained() failed: {e}") from e
+
+    def recompute_prototypes(self) -> None:
+        """Recompute semantic scoring prototypes for the current embedder."""
+        self._check_open()
+        try:
+            self._impl.recompute_prototypes()
+        except Exception as e:
+            raise MemoireError(f"recompute_prototypes() failed: {e}") from e
     def forget(self, memory_id: int) -> bool:
         """
         Delete a memory by its id (from Memory.id).
@@ -220,7 +242,7 @@ class Memoire:
         if self._impl is None:
             raise MemoireError("This Memoire instance has been closed.")
 
-    # ─── Convenience helpers ──────────────────────────────────────────────────
+    # â”€â”€â”€ Convenience helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def remember_lines(self, text: str) -> int:
         """
@@ -304,3 +326,4 @@ class MemoryPolicy:
             if d.prompt_injection is not None:
                 lines.append(d.prompt_injection)
         return "\n".join(lines)
+

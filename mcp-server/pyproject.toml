@@ -12,6 +12,8 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]==1.27.1",
     "memoire==0.1.0",
+    "scikit-learn>=1.4.0",
+    "numpy>=1.26.0",
 ]
 
 [project.optional-dependencies]

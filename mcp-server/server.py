@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import json
 from memoire.client import _get_lib
 from memoire import Memoire
@@ -85,6 +85,26 @@ def error_response(code: str, message: str, **details: Any) -> Dict[str, Any]:
         },
     }
 
+
+
+def serialize_memory(memory: Any) -> Dict[str, Any]:
+    """Serialize native/PyO3 Memory objects while tolerating older bindings."""
+    return {
+        "id": memory.id,
+        "content": memory.content,
+        "score": memory.score,
+        "trust": memory.trust,
+        "trust_variance": getattr(memory, "trust_variance", 0.0),
+        "trust_samples": getattr(memory, "trust_samples", 0),
+        "trust_last_session_id": getattr(memory, "trust_last_session_id", None),
+        "effective_weight": getattr(memory, "effective_weight", 0.0),
+        "reinforcement_count": getattr(memory, "reinforcement_count", 0),
+        "ingestion_driver": getattr(memory, "ingestion_driver", "Unknown"),
+        "uncertainty": memory.uncertainty,
+        "state": memory.state,
+        "created_at": memory.created_at,
+        "last_used_at": getattr(memory, "last_used_at", None),
+    }
 
 def run_memoire(ctx: Context, operation: Callable[[Memoire], T], namespace: str = "default") -> T:
     """Run one operation against the per-DB Memoire handle under its lock."""
@@ -324,6 +344,122 @@ def memoire_batch_feedback(memory_ids: List[int], task_succeeded: bool, task_out
         return error_response("batch_feedback_failed", str(e))
 
 
+
+@mcp.tool()
+def memoire_recall_explained(query: str, ctx: Context, top_k: int = 5, namespace: str = "default") -> dict:
+    """
+    Recall memories with attribution signals explaining the ranking.
+    """
+    if not query or not query.strip():
+        return error_response("invalid_argument", "query must not be empty")
+    if top_k < 1 or top_k > 50:
+        return error_response("invalid_argument", "top_k must be between 1 and 50", top_k=top_k)
+
+    try:
+        def op(memoire: Memoire) -> List[Dict[str, Any]]:
+            if hasattr(memoire, "recall_explained"):
+                explained = memoire.recall_explained(query, top_k=top_k)
+                return [
+                    {
+                        "memory": serialize_memory(item.memory),
+                        "semantic_score": item.semantic_score,
+                        "trust": item.trust,
+                        "uncertainty": item.uncertainty,
+                        "effective_weight": item.effective_weight,
+                        "rank_score": item.rank_score,
+                        "reasons": list(item.reasons),
+                    }
+                    for item in explained
+                ]
+            return [
+                {
+                    "memory": serialize_memory(memory),
+                    "semantic_score": memory.score,
+                    "trust": memory.trust,
+                    "uncertainty": memory.uncertainty,
+                    "effective_weight": getattr(memory, "effective_weight", 0.0),
+                    "rank_score": memory.score,
+                    "reasons": ["legacy binding fallback"],
+                }
+                for memory in memoire.recall(query, top_k=top_k)
+            ]
+
+        return ok_response(attributions=run_memoire(ctx, op, namespace=namespace))
+    except Exception as e:
+        logger.exception("event=memoire_recall_explained_failed")
+        return error_response("recall_explained_failed", str(e))
+
+
+@mcp.tool()
+def memoire_identify_gaps(queries: List[str], ctx: Context, top_k: int = 3, min_trust: float = 0.45, namespace: str = "default") -> dict:
+    """
+    Identify queries whose recalled memories are missing or below the trust threshold.
+    """
+    if not queries:
+        return error_response("invalid_argument", "queries must not be empty")
+    if top_k < 1 or top_k > 20:
+        return error_response("invalid_argument", "top_k must be between 1 and 20", top_k=top_k)
+
+    try:
+        def op(memoire: Memoire) -> List[Dict[str, Any]]:
+            gaps = []
+            for query in queries:
+                if not isinstance(query, str) or not query.strip():
+                    continue
+                memories = memoire.recall(query, top_k=top_k)
+                best_trust = max((m.trust for m in memories), default=0.0)
+                best_score = max((m.score for m in memories), default=0.0)
+                if not memories or best_trust < min_trust:
+                    gaps.append({
+                        "query": query,
+                        "reason": "no_recall" if not memories else "low_trust",
+                        "best_trust": best_trust,
+                        "best_score": best_score,
+                        "candidate_count": len(memories),
+                    })
+            return gaps
+
+        return ok_response(gaps=run_memoire(ctx, op, namespace=namespace))
+    except Exception as e:
+        logger.exception("event=memoire_identify_gaps_failed")
+        return error_response("identify_gaps_failed", str(e))
+
+
+@mcp.tool()
+def memoire_namespace_health(ctx: Context, probes: List[str] | None = None, namespace: str = "default") -> dict:
+    """
+    Summarize namespace recall health and optional probe coverage.
+    """
+    try:
+        def op(memoire: Memoire) -> Dict[str, Any]:
+            total = memoire.count()
+            probe_rows = []
+            if probes:
+                for probe in probes:
+                    if not isinstance(probe, str) or not probe.strip():
+                        continue
+                    memories = memoire.recall(probe, top_k=3)
+                    probe_rows.append({
+                        "query": probe,
+                        "hits": len(memories),
+                        "best_score": max((m.score for m in memories), default=0.0),
+                        "best_trust": max((m.trust for m in memories), default=0.0),
+                    })
+            covered = sum(1 for row in probe_rows if row["hits"] > 0 and row["best_trust"] >= 0.45)
+            coverage = covered / len(probe_rows) if probe_rows else None
+            return {
+                "namespace": namespace,
+                "total_memories": total,
+                "probe_count": len(probe_rows),
+                "coverage": coverage,
+                "probes": probe_rows,
+            }
+
+        return ok_response(health=run_memoire(ctx, op, namespace=namespace))
+    except Exception as e:
+        logger.exception("event=memoire_namespace_health_failed")
+        return error_response("namespace_health_failed", str(e))
+
 @mcp.tool()
 def memoire_status(ctx: Context, namespace: str = "default") -> dict:
     """
@@ -454,3 +590,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

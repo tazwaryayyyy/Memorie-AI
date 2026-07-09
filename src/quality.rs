@@ -1,6 +1,14 @@
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+#[cfg(not(target_arch = "wasm32"))]
+use ort::{
+    session::{builder::GraphOptimizationLevel, Session},
+    value::Tensor,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// ─── NLI-style Contradiction Detection ───────────────────────────────────────
+// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ NLI-style Contradiction Detection ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
 
 /// Result of an NLI-style entailment check between two memories.
 #[derive(Debug, Clone, PartialEq)]
@@ -15,7 +23,7 @@ pub enum NliLabel {
 
 /// Lightweight NLI-style contradiction detector.
 ///
-/// Uses a three-signal ensemble — no external model required:
+/// Uses a three-signal ensemble ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no external model required:
 ///
 /// 1. **Cosine geometry**: requires high cosine similarity (same topic cluster).
 /// 2. **Polarity opposition**: lexical negation heuristic (fast, high-precision).
@@ -24,19 +32,127 @@ pub enum NliLabel {
 ///
 /// This is intentionally cheaper than loading an ONNX NLI model at runtime
 /// while providing more signal than pure keyword polarity used before.
-/// For production use with an actual NLI model, replace `nli_score` with
-/// ONNX inference and preserve the same `NliLabel` output contract.
-pub struct NliChecker;
+#[derive(Clone)]
+pub struct NliChecker {
+    pub(crate) onnx: Option<Arc<OnnxNliChecker>>,
+}
 
+#[cfg(not(target_arch = "wasm32"))]
+pub struct OnnxNliChecker {
+    session: Mutex<Session>,
+    tokenizer: tokenizers::Tokenizer,
+    max_tokens: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OnnxNliChecker {
+    pub fn from_path(model_path: &Path) -> anyhow::Result<Self> {
+        if !model_path.exists() {
+            anyhow::bail!("onnx model path does not exist: {}", model_path.display());
+        }
+        let session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .commit_from_file(model_path)?;
+
+        let parent = model_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid model path"))?;
+        let tokenizer_path = parent.join("tokenizer.json");
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load tokenizer from {}: {}",
+                tokenizer_path.display(),
+                e
+            )
+        })?;
+
+        Ok(Self {
+            session: Mutex::new(session),
+            tokenizer,
+            max_tokens: 512,
+        })
+    }
+
+    pub fn check_contradiction(&self, text_a: &str, text_b: &str) -> anyhow::Result<bool> {
+        let mut tokenizer = self.tokenizer.clone();
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: self.max_tokens,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("Failed to configure tokenizer truncation: {}", e))?;
+
+        let encoding = tokenizer
+            .encode((text_a, text_b), true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+
+        let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+        let mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let len = ids.len();
+
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ONNX NLI session lock poisoned"))?;
+        let has_token_type_ids = session
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids");
+
+        let ids_arr = Tensor::from_array(([1usize, len], ids.into_boxed_slice()))?;
+        let mask_arr = Tensor::from_array(([1usize, len], mask.into_boxed_slice()))?;
+
+        let mut session_inputs = ort::inputs![
+            "input_ids" => ids_arr,
+            "attention_mask" => mask_arr,
+        ];
+
+        if has_token_type_ids {
+            let type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&x| x as i64).collect();
+            let type_ids_arr = Tensor::from_array(([1usize, len], type_ids.into_boxed_slice()))?;
+            session_inputs.push(("token_type_ids".into(), type_ids_arr.upcast().into()));
+        }
+
+        let outputs = session.run(session_inputs)?;
+        if outputs.len() == 0 {
+            anyhow::bail!("No output returned from NLI model");
+        }
+        let output_value = outputs.get("logits").unwrap_or(&outputs[0]);
+        let (_, logits) = output_value.try_extract_tensor::<f32>()?;
+
+        let mut max_idx = 0;
+        let mut max_val = f32::NEG_INFINITY;
+        for i in 0..3 {
+            if let Some(&val) = logits.get(i) {
+                if val > max_val {
+                    max_val = val;
+                    max_idx = i;
+                }
+            }
+        }
+
+        Ok(max_idx == 0)
+    }
+}
 impl NliChecker {
     pub fn new() -> Self {
-        NliChecker
+        Self { onnx: None }
+    }
+
+    pub fn with_onnx(onnx: OnnxNliChecker) -> Self {
+        Self {
+            onnx: Some(Arc::new(onnx)),
+        }
     }
 
     /// Compute an NLI label for the pair (premise, hypothesis).
     ///
     /// Returns `Contradiction` when both texts are on the same topic
-    /// (cosine ≥ threshold) AND their polarity opposes each other.
+    /// (cosine ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥ threshold) AND their polarity opposes each other.
     pub fn check(
         &self,
         premise_text: &str,
@@ -45,6 +161,12 @@ impl NliChecker {
         hypothesis_emb: &[f32],
         cosine_threshold: f32,
     ) -> NliLabel {
+        if let Some(onnx) = &self.onnx {
+            if let Ok(true) = onnx.check_contradiction(premise_text, hypothesis_text) {
+                return NliLabel::Contradiction;
+            }
+        }
+
         // Gate 1: same topic cluster.
         let sim = cosine_similarity(premise_emb, hypothesis_emb);
         if sim < cosine_threshold {
@@ -55,11 +177,11 @@ impl NliChecker {
         let pol_a = detect_polarity(premise_text);
         let pol_b = detect_polarity(hypothesis_text);
         if pol_a == Polarity::Neutral || pol_b == Polarity::Neutral {
-            // One text has no strong polarity — cannot assert contradiction.
+            // One text has no strong polarity ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â cannot assert contradiction.
             return NliLabel::Neutral;
         }
         if !pol_a.opposes(&pol_b) {
-            // Same polarity direction — possibly entailment.
+            // Same polarity direction ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â possibly entailment.
             return NliLabel::Entailment;
         }
 
@@ -71,7 +193,7 @@ impl NliChecker {
             return NliLabel::Contradiction;
         }
 
-        // Polarity opposes but no clear negation asymmetry — conservative fallback.
+        // Polarity opposes but no clear negation asymmetry ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â conservative fallback.
         NliLabel::Contradiction
     }
 }
@@ -125,7 +247,7 @@ fn negation_asymmetry(a: &str, b: &str) -> usize {
     NEGATORS.iter().filter(|t| in_a(t) != in_b(t)).count()
 }
 
-// ─── Configuration ────────────────────────────────────────────────────────────
+// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Configuration ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
 
 /// Configuration for trust scoring and reinforcement attribution.
 ///
@@ -136,7 +258,7 @@ fn negation_asymmetry(a: &str, b: &str) -> usize {
 pub struct ScoringConfig {
     /// Weight applied to the newly computed trust value in EMA updates.
     /// Range: (0.0, 1.0). Default 0.3 (30% new value, 70% historical EMA).
-    /// Lower values → slower trust changes, more stable but less responsive.
+    /// Lower values ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ slower trust changes, more stable but less responsive.
     pub ema_new_weight: f32,
     /// Saturation constant `k` in the reinforcement term `rc / (rc + k)`.
     /// Default 3.0: rc=3 reaches ~0.5, rc=9 reaches ~0.75 of the reinforcement ceiling.
@@ -144,7 +266,7 @@ pub struct ScoringConfig {
     pub rc_saturation: f32,
     /// Minimum Jaccard token overlap required to attribute reinforcement to a memory.
     /// Range: [0.0, 1.0]. Default 0.35.
-    /// Higher → stricter attribution, fewer false-positive trust inflations.
+    /// Higher ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ stricter attribution, fewer false-positive trust inflations.
     pub jaccard_threshold: f32,
     /// Memory count above which HNSW approximate search is used instead of linear scan.
     /// Default 500. Below this, a linear scan over the in-memory embedding cache is
@@ -152,7 +274,7 @@ pub struct ScoringConfig {
     pub hnsw_threshold: usize,
     /// Multiplied by quality_score to compute the initial trust_ema for a new memory
     /// that has no reinforcement history (reinforcement_count == 0).
-    /// Range: 0.0–1.0. Default: 0.5
+    /// Range: 0.0ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“1.0. Default: 0.5
     /// Set to 0.0 to disable cold-start trust (original behavior).
     pub cold_start_weight: f32,
     /// Exponential decay rate applied to trust_ema per day since last use.
@@ -185,7 +307,7 @@ impl Default for ScoringConfig {
     }
 }
 
-// ─── Semantic Prototypes ──────────────────────────────────────────────────────
+// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Semantic Prototypes ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
 
 /// Pre-computed centroid vectors for semantic quality feature scoring.
 ///
@@ -194,7 +316,7 @@ impl Default for ScoringConfig {
 /// Computed once at `Memoire` initialisation time and reused for every ingestion.
 ///
 /// Using semantic centroids rather than keyword lists means semantically
-/// equivalent phrases ("safeguard" ≈ "security", "mandate" ≈ "always") score
+/// equivalent phrases ("safeguard" ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  "security", "mandate" ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  "always") score
 /// similarly without maintaining a vocabulary list.
 pub struct ScoringPrototypes {
     /// Centroid for high-consequence memories (security incidents, outages, data loss).
@@ -220,7 +342,7 @@ impl ScoringPrototypes {
     }
 }
 
-// ─── Polarity Detection ───────────────────────────────────────────────────────
+// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Polarity Detection ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
 
 /// Polarity of a memory's claim: whether it asserts or negates a practice.
 ///
@@ -244,7 +366,7 @@ impl Polarity {
 
     /// Parse the stored polarity tag back to its enum variant.
     ///
-    /// `detect_polarity` must NOT be called on the stored string — it scans for
+    /// `detect_polarity` must NOT be called on the stored string ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â it scans for
     /// tokens like "never"/"always" which don't appear in "affirmative"/"negative".
     /// Always use this method to deserialise a polarity stored in `claim_value`.
     pub fn from_stored(s: &str) -> Self {
@@ -268,7 +390,7 @@ impl Polarity {
 /// Detect whether a text asserts or negates a practice.
 ///
 /// This is a lightweight lexical heuristic over a small, high-precision token set.
-/// It is intentionally documented as a heuristic — not NLI-level inference.
+/// It is intentionally documented as a heuristic ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â not NLI-level inference.
 /// Its role is to flag *potential* contradictions for quality-weighted resolution.
 /// False negatives (missed contradictions) are harmless; false positives are handled
 /// by the quality-weighted archiving step in `resolve_contradictions_for_id`.
@@ -354,11 +476,12 @@ pub fn detect_polarity(text: &str) -> Polarity {
     }
 }
 
-// ─── Core Types ───────────────────────────────────────────────────────────────
+// ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Core Types ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IngestDecision {
     Active,
+    Probationary,
     Shadow,
     Reject,
 }
@@ -460,7 +583,7 @@ pub fn normalize_text(text: &str) -> String {
         .join(" ")
 }
 
-/// ✅ FIX #2 — Stable content fingerprint using BLAKE3.
+/// ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ FIX #2 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Stable content fingerprint using BLAKE3.
 ///
 /// BLAKE3 produces a deterministic 256-bit hash regardless of Rust version,
 /// platform, or compiler flags. The previous `DefaultHasher` was explicitly
@@ -517,7 +640,7 @@ pub fn recency_bonus(created_at: i64, now: i64) -> f32 {
     (1.0 / (1.0 + age_days / 7.0)).clamp(0.0, 1.0)
 }
 
-/// ✅ FIX #3 — Semantic feature extraction via prototype cosine similarity.
+/// ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ FIX #3 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Semantic feature extraction via prototype cosine similarity.
 ///
 /// Each quality dimension is scored as the cosine similarity between the memory's
 /// embedding and a pre-computed centroid for that category. This replaces the
@@ -578,16 +701,16 @@ pub fn extract_features(
 /// Compute a trust score in [0.0, 1.0] at recall time.
 ///
 /// Weight rationale (heuristic defaults, tunable via ScoringConfig):
-///   0.35 reinforcement — most direct signal: memory was acted on and helped
-///   0.25 confidence    — initial quality signal from ingestion evidence
-///   0.20 age_term      — fresh memories are more likely to still be accurate
-///   0.15 importance    — ingestion-time importance score
-///   0.05 contradiction — small bonus for surviving a contradiction resolution
+///   0.35 reinforcement ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â most direct signal: memory was acted on and helped
+///   0.25 confidence    ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â initial quality signal from ingestion evidence
+///   0.20 age_term      ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â fresh memories are more likely to still be accurate
+///   0.15 importance    ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ingestion-time importance score
+///   0.05 contradiction ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â small bonus for surviving a contradiction resolution
 ///
 /// Trust interpretation:
-///   ≥ 0.75 → FOLLOW (act on it)
-///   ≥ 0.45 → HINT (verify before acting)
-///   < 0.45 → IGNORE
+///   ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥ 0.75 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ FOLLOW (act on it)
+///   ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥ 0.45 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ HINT (verify before acting)
+///   < 0.45 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ IGNORE
 pub fn compute_trust(
     reinforcement_count: i64,
     contradiction_survived: bool,
@@ -634,9 +757,25 @@ pub fn compute_trust(
     (base_trust + fast_track).clamp(0.0, 1.0)
 }
 
+pub fn compute_gravity_radius(trust_ema: f64, reinforcement_count: i64, age_days: f64) -> f64 {
+    let trust = trust_ema.clamp(0.0, 1.0);
+    let reinforcement_factor = (1.0_f64 + reinforcement_count as f64).ln();
+    let age_stability = match age_days {
+        d if d < 7.0 => 0.3,
+        d if d < 30.0 => 0.6,
+        _ => 1.0,
+    };
+    trust * reinforcement_factor * age_stability
+}
+
+pub fn should_supersede(incoming_importance: f64, existing_gravity: f64) -> bool {
+    let threshold = 0.50 + 0.40 * existing_gravity.clamp(0.0, 1.0);
+    incoming_importance > threshold
+}
+
 /// Build quality metadata for a memory chunk.
 ///
-/// ✅ FIX #3 / #4: Takes the pre-computed embedding for semantic feature scoring
+/// ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ FIX #3 / #4: Takes the pre-computed embedding for semantic feature scoring
 /// and stores the polarity tag for generalised contradiction detection.
 /// The `claim_key`/`claim_value` fields are populated later by
 /// `resolve_contradictions_for_id` when a contradiction is confirmed.
@@ -655,6 +794,7 @@ pub fn build_quality_meta(
 
     let state = match decision {
         IngestDecision::Active => "active",
+        IngestDecision::Probationary => "probationary",
         IngestDecision::Shadow => "shadow",
         IngestDecision::Reject => "rejected",
     }
@@ -683,6 +823,202 @@ pub fn build_quality_meta(
     };
 
     (meta, decision)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct WeakVerifyResult {
+    pub passed: bool,
+    pub reason: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct StrongVerifyResult {
+    pub confidence: f64,
+    pub coverage: f64,
+    pub consistency: f64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub trait IngestionOracle: Send + Sync {
+    fn verify_weak(&self, content: &str, embedding: &[f32]) -> WeakVerifyResult;
+
+    fn verify_strong(
+        &self,
+        content: &str,
+        embedding: &[f32],
+        namespace_sample: &[crate::store::Memory],
+    ) -> StrongVerifyResult;
+
+    fn decide(
+        &self,
+        content: &str,
+        embedding: &[f32],
+        namespace_sample: &[crate::store::Memory],
+    ) -> IngestDecision {
+        let weak = self.verify_weak(content, embedding);
+        if !weak.passed {
+            return IngestDecision::Reject;
+        }
+        let strong = self.verify_strong(content, embedding, namespace_sample);
+        match strong.confidence {
+            c if c >= 0.95 => IngestDecision::Active,
+            c if c >= 0.80 => IngestDecision::Probationary,
+            _ => IngestDecision::Reject,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct DefaultOracle {
+    pub weights: ScoringWeights,
+    pub prototypes: ScoringPrototypes,
+    pub embedder: Option<Arc<dyn crate::embedder::EmbedProvider>>,
+    pub nli_checker: Option<NliChecker>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl IngestionOracle for DefaultOracle {
+    fn verify_weak(&self, content: &str, embedding: &[f32]) -> WeakVerifyResult {
+        if let Some(lang) = crate::chunker::detect_language(content) {
+            let ts_lang = match lang {
+                crate::chunker::CodeLanguage::Python => Some(tree_sitter_python::LANGUAGE.into()),
+                crate::chunker::CodeLanguage::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+                crate::chunker::CodeLanguage::JavaScript => {
+                    Some(tree_sitter_javascript::LANGUAGE.into())
+                }
+                crate::chunker::CodeLanguage::TypeScript => {
+                    Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+                }
+                crate::chunker::CodeLanguage::Generic => None,
+            };
+            if let Some(ts_lang) = ts_lang {
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&ts_lang).is_ok() {
+                    let mut code = content.to_string();
+                    if code.contains("```") {
+                        let mut inside = false;
+                        let mut extracted = Vec::new();
+                        for line in content.lines() {
+                            if line.trim().starts_with("```") {
+                                inside = !inside;
+                                continue;
+                            }
+                            if inside {
+                                extracted.push(line);
+                            }
+                        }
+                        if !extracted.is_empty() {
+                            code = extracted.join("\n");
+                        }
+                    }
+                    let parsed = parser.parse(&code, None);
+                    if parsed.is_none() || parsed.map(|t| t.root_node().has_error()).unwrap_or(true)
+                    {
+                        return WeakVerifyResult {
+                            passed: false,
+                            reason: Some("syntax error detected by tree-sitter".to_string()),
+                        };
+                    }
+                }
+            }
+        }
+
+        let features = extract_features(embedding, content, &self.prototypes, 0.5);
+        let score = score_importance(&features, &self.weights);
+        let passed = score >= 0.50;
+        WeakVerifyResult {
+            passed,
+            reason: if passed {
+                None
+            } else {
+                Some("importance score below 0.50".to_string())
+            },
+        }
+    }
+
+    fn verify_strong(
+        &self,
+        content: &str,
+        embedding: &[f32],
+        namespace_sample: &[crate::store::Memory],
+    ) -> StrongVerifyResult {
+        if namespace_sample.is_empty() {
+            return StrongVerifyResult {
+                confidence: 1.0,
+                coverage: 1.0,
+                consistency: 1.0,
+            };
+        }
+
+        // This check only runs if we have an NLI checker; otherwise always pass.
+        let nli = match &self.nli_checker {
+            Some(n) => n,
+            None => {
+                return StrongVerifyResult {
+                    confidence: 1.0,
+                    coverage: 1.0,
+                    consistency: 1.0,
+                }
+            }
+        };
+
+        // Find top-5 most similar memories with cosine sim > 0.80
+        let mut scored: Vec<(f32, &crate::store::Memory)> = namespace_sample
+            .iter()
+            .map(|m| {
+                // We don't have embeddings on Memory, so use content word-overlap as proxy
+                let tokens_a: std::collections::HashSet<&str> =
+                    content.split_whitespace().collect();
+                let tokens_b: std::collections::HashSet<&str> =
+                    m.content.split_whitespace().collect();
+                let intersection = tokens_a.intersection(&tokens_b).count();
+                let union = tokens_a.union(&tokens_b).count();
+                let jaccard = if union > 0 {
+                    intersection as f32 / union as f32
+                } else {
+                    0.0
+                };
+                (jaccard, m)
+            })
+            .filter(|(sim, _)| *sim > 0.30) // use jaccard 0.30 as proxy for cosine 0.80
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(5);
+
+        if scored.is_empty() {
+            return StrongVerifyResult {
+                confidence: 1.0,
+                coverage: 1.0,
+                consistency: 1.0,
+            };
+        }
+
+        let total = scored.len() as f64;
+        let mut non_contradictory = 0usize;
+        for (_, mem) in &scored {
+            match nli
+                .onnx
+                .as_ref()
+                .and_then(|onnx| onnx.check_contradiction(content, &mem.content).ok())
+            {
+                Some(true) => {
+                    // contradiction found ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â immediate reject
+                    return StrongVerifyResult {
+                        confidence: 0.0,
+                        coverage: 0.0,
+                        consistency: 0.0,
+                    };
+                }
+                _ => non_contradictory += 1,
+            }
+        }
+        let confidence = non_contradictory as f64 / total;
+        StrongVerifyResult {
+            confidence,
+            coverage: confidence,
+            consistency: confidence,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -717,7 +1053,7 @@ mod tests {
     #[test]
     fn test_nli_neutral_low_cosine() {
         let checker = NliChecker::new();
-        // Orthogonal embeddings = cosine 0 < threshold → Neutral regardless of polarity
+        // Orthogonal embeddings = cosine 0 < threshold ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Neutral regardless of polarity
         let a = unit_vec(3, 0);
         let b = unit_vec(3, 1);
         let label = checker.check("never use float for money", "always use int", &a, &b, 0.80);
@@ -739,7 +1075,7 @@ mod tests {
             &emb,
             0.80,
         );
-        // Both affirmative — should be Entailment, not Contradiction
+        // Both affirmative ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â should be Entailment, not Contradiction
         assert_ne!(
             label,
             NliLabel::Contradiction,
@@ -751,7 +1087,7 @@ mod tests {
     fn test_nli_neutral_when_no_polarity() {
         let checker = NliChecker::new();
         let emb = vec![0.577_f32, 0.577, 0.577];
-        // Neutral polarity text — no strong signal in either direction
+        // Neutral polarity text ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no strong signal in either direction
         let label = checker.check(
             "the model is a transformer architecture",
             "the model is a recurrent network",
@@ -785,10 +1121,13 @@ mod tests {
     fn test_cosine_similarity() {
         let a = vec![1.0_f32, 0.0, 0.0];
         let b = vec![0.0_f32, 1.0, 0.0];
-        assert!((cosine_similarity(&a, &b)).abs() < 1e-6, "orthogonal → 0");
+        assert!(
+            (cosine_similarity(&a, &b)).abs() < 1e-6,
+            "orthogonal ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 0"
+        );
         assert!(
             (cosine_similarity(&a, &a) - 1.0).abs() < 1e-6,
-            "identical → 1"
+            "identical ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 1"
         );
     }
 }

@@ -8,6 +8,18 @@ pub enum CodeLanguage {
     Generic,
 }
 
+impl CodeLanguage {
+    fn as_lang_name(&self) -> &'static str {
+        match self {
+            CodeLanguage::Python => "python",
+            CodeLanguage::Rust => "rust",
+            CodeLanguage::JavaScript => "javascript",
+            CodeLanguage::TypeScript => "typescript",
+            CodeLanguage::Generic => "generic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum ChunkerMode {
     /// Sliding-window word tokeniser (original behavior).
@@ -39,7 +51,7 @@ impl Default for ChunkerConfig {
 
 /// Detect code language from triple-backtick fences.
 /// Returns None if no fences are found (prose fallback).
-fn detect_language(text: &str) -> Option<CodeLanguage> {
+pub fn detect_language(text: &str) -> Option<CodeLanguage> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("```python") || trimmed.starts_with("```py") {
@@ -69,7 +81,7 @@ fn detect_language(text: &str) -> Option<CodeLanguage> {
 /// Boundaries are lines matching common top-level declaration patterns.
 /// A chunk is all lines from one boundary (inclusive) to the next (exclusive).
 /// Chunks that exceed `chunk_size * 2` characters are further split by line count.
-fn chunk_code(text: &str, lang: &CodeLanguage, config: &ChunkerConfig) -> Vec<String> {
+fn chunk_code_regex(text: &str, lang: &CodeLanguage, config: &ChunkerConfig) -> Vec<String> {
     // Boundary patterns — prefixes that start a new logical code unit
     let is_boundary = |line: &str| -> bool {
         let s = line.trim_start();
@@ -175,6 +187,151 @@ fn chunk_code(text: &str, lang: &CodeLanguage, config: &ChunkerConfig) -> Vec<St
     result
 }
 
+fn node_text(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let span = node.byte_range();
+    source.get(span.start..span.end).map(str::to_string)
+}
+
+fn collect_ast_chunks(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    chunk_size: usize,
+    current: &mut Vec<String>,
+) {
+    let text = match node_text(node, source) {
+        Some(text) => text,
+        None => return,
+    };
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let node_kind = node.kind();
+    let is_boundary_node = matches!(
+        node_kind,
+        "function_definition"
+            | "class_definition"
+            | "decorated_definition"
+            | "function_item"
+            | "impl_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "mod_item"
+            | "function_declaration"
+            | "class_declaration"
+            | "export_statement"
+            | "arrow_function"
+            | "lexical_declaration"
+            | "variable_declaration"
+            | "variable_declarator"
+            | "expression_statement"
+    );
+
+    if is_boundary_node {
+        let normalized = trimmed.to_string();
+        if normalized.len() <= chunk_size * 3 {
+            current.push(normalized);
+            return;
+        }
+    }
+
+    let child_count = node.child_count();
+    if child_count == 0 {
+        if trimmed.len() > chunk_size * 3 {
+            for line in trimmed.lines() {
+                let line_trim = line.trim();
+                if !line_trim.is_empty() {
+                    current.push(line_trim.to_string());
+                }
+            }
+        } else if is_boundary_node {
+            current.push(trimmed.to_string());
+        }
+        return;
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_ast_chunks(child, source, chunk_size, current);
+    }
+}
+
+/// Returns chunks split at AST-meaningful boundaries.
+/// Falls back to the regex-based code chunker if tree-sitter parsing fails.
+pub fn chunk_code_ast(source: &str, lang: &str, chunk_size: usize) -> Vec<String> {
+    let mut parser = tree_sitter::Parser::new();
+    let language = match lang {
+        "python" | "py" => tree_sitter_python::LANGUAGE.into(),
+        "rust" | "rs" => tree_sitter_rust::LANGUAGE.into(),
+        "javascript" | "js" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" | "ts" | "tsx" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        _ => {
+            return chunk_code_regex(
+                source,
+                &CodeLanguage::Generic,
+                &ChunkerConfig {
+                    chunk_size,
+                    overlap: 0,
+                    mode: ChunkerMode::Prose,
+                },
+            )
+        }
+    };
+
+    if parser.set_language(&language).is_err() {
+        return chunk_code_regex(
+            source,
+            &CodeLanguage::Generic,
+            &ChunkerConfig {
+                chunk_size,
+                overlap: 0,
+                mode: ChunkerMode::Prose,
+            },
+        );
+    }
+
+    let tree = match parser.parse(source, None) {
+        Some(tree) => tree,
+        None => {
+            return chunk_code_regex(
+                source,
+                &CodeLanguage::Generic,
+                &ChunkerConfig {
+                    chunk_size,
+                    overlap: 0,
+                    mode: ChunkerMode::Prose,
+                },
+            );
+        }
+    };
+
+    let mut chunks = Vec::new();
+    let root = tree.root_node();
+    for child in root.children(&mut root.walk()) {
+        collect_ast_chunks(child, source, chunk_size, &mut chunks);
+    }
+
+    if chunks.is_empty() {
+        if source.trim().is_empty() {
+            vec![]
+        } else {
+            chunk_code_regex(
+                source,
+                &CodeLanguage::Generic,
+                &ChunkerConfig {
+                    chunk_size,
+                    overlap: 0,
+                    mode: ChunkerMode::Prose,
+                },
+            )
+        }
+    } else {
+        chunks
+    }
+}
+
 /// Original sliding-window word tokeniser — behavior is unchanged.
 fn sliding_window(text: &str, config: &ChunkerConfig) -> Vec<String> {
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -211,9 +368,9 @@ fn sliding_window(text: &str, config: &ChunkerConfig) -> Vec<String> {
 pub fn chunk_text(text: &str, config: &ChunkerConfig) -> Vec<String> {
     match &config.mode {
         ChunkerMode::Prose => sliding_window(text, config),
-        ChunkerMode::Code(lang) => chunk_code(text, lang, config),
+        ChunkerMode::Code(lang) => chunk_code_ast(text, lang.as_lang_name(), config.chunk_size),
         ChunkerMode::Auto => match detect_language(text) {
-            Some(lang) => chunk_code(text, &lang, config),
+            Some(lang) => chunk_code_ast(text, lang.as_lang_name(), config.chunk_size),
             None => sliding_window(text, config),
         },
     }
@@ -289,5 +446,34 @@ mod tests {
         );
         assert!(chunks[0].contains("fn alpha"));
         assert!(chunks[1].contains("fn beta"));
+    }
+
+    #[test]
+    fn test_js_code_chunker_splits_arrow_functions() {
+        let code = "const sum = (a, b) => {\n  return a + b;\n};\n\nconst diff = (a, b) => {\n  return a - b;\n};\n";
+        let cfg = ChunkerConfig {
+            chunk_size: 128,
+            overlap: 20,
+            mode: ChunkerMode::Code(CodeLanguage::JavaScript),
+        };
+        let chunks = chunk_text(code, &cfg);
+        assert!(
+            chunks.len() >= 2,
+            "expected at least 2 chunks, got {}",
+            chunks.len()
+        );
+        assert!(chunks[0].contains("const sum"));
+        assert!(chunks[1].contains("const diff"));
+    }
+
+    #[test]
+    fn test_chunk_code_ast_handles_empty_input() {
+        assert!(chunk_code_ast("", "python", 64).is_empty());
+    }
+
+    #[test]
+    fn test_chunk_code_ast_falls_back_for_unsupported_language() {
+        let chunks = chunk_code_ast("fn alpha() {\n  let x = 1;\n}\n", "unknown", 64);
+        assert!(!chunks.is_empty());
     }
 }
