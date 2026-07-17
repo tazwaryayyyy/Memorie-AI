@@ -362,6 +362,21 @@ impl Store {
         let manager = Self::pooled_file_manager(path);
         let pool = Pool::builder().max_size(20).build(manager)?;
         let conn = pool.get()?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if path != ":memory:" {
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    let mut perms = metadata.permissions();
+                    if perms.mode() & 0o777 != 0o600 {
+                        perms.set_mode(0o600);
+                        let _ = std::fs::set_permissions(path, perms);
+                    }
+                }
+            }
+        }
+
         conn.execute_batch(SCHEMA)?;
         Self::ensure_quality_columns(&conn)?;
         let current_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
