@@ -121,7 +121,9 @@ impl PyMemoire {
             Memoire::new_ns(db_path, namespace)
         }
         .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(Self { inner: Arc::new(Mutex::new(inner)) })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+        })
     }
 
     fn remember(&self, content: &str) -> PyResult<usize> {
@@ -252,8 +254,7 @@ impl PyMemoire {
     /// Uses `&self` (not `&mut self`) because inner is behind a Mutex,
     /// so thread safety is provided by the lock, not exclusive access.
     fn start_background_maintenance(&self, interval_secs: u64, threshold: u32) -> PyResult<()> {
-        lock!(self)
-            .start_background_maintenance(interval_secs, threshold);
+        lock!(self).start_background_maintenance(interval_secs, threshold);
         Ok(())
     }
 }

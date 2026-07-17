@@ -37,10 +37,7 @@ use memoire::Memoire;
 /// Set `MEMOIRE_API_TOKEN` to a secret string. Every request to a protected
 /// route must include `Authorization: Bearer <token>`. If the env var is unset
 /// or empty, the middleware is a no-op and all requests pass through.
-async fn auth_middleware(
-    req: axum::extract::Request,
-    next: Next,
-) -> impl IntoResponse {
+async fn auth_middleware(req: axum::extract::Request, next: Next) -> impl IntoResponse {
     if let Ok(expected) = env::var("MEMOIRE_API_TOKEN") {
         if !expected.trim().is_empty() {
             let provided = req
@@ -403,13 +400,14 @@ async fn main() {
         .with_state(cache);
 
     // /health is always public so load-balancers and CI can reach it.
-    let app = Router::new()
-        .route("/health", get(health))
-        .merge(protected);
+    let app = Router::new().route("/health", get(health)).merge(protected);
 
     let addr = format!("127.0.0.1:{port}");
     println!("memoire-server listening on http://{addr}");
-    if env::var("MEMOIRE_API_TOKEN").map(|t| !t.trim().is_empty()).unwrap_or(false) {
+    if env::var("MEMOIRE_API_TOKEN")
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false)
+    {
         println!("Token auth enabled (MEMOIRE_API_TOKEN is set).");
     } else {
         println!("Warning: MEMOIRE_API_TOKEN not set — server is unauthenticated.");
