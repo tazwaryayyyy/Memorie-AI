@@ -239,6 +239,23 @@ cd dashboard && npm install && npm run dev  # → http://localhost:3000
 
 Set `MEMOIRE_ALLOWED_PATHS` in `dashboard/.env.local` to restrict which database paths the dashboard may open.
 
+### Token authentication
+
+All routes except `GET /health` are protected by an optional bearer-token guard.
+
+```bash
+# Enable auth — set this before starting the server
+export MEMOIRE_API_TOKEN="your-strong-secret"
+./target/release/memoire-server
+# → "Token auth enabled (MEMOIRE_API_TOKEN is set)."
+
+# Every call must include the header:
+curl -H "Authorization: Bearer your-strong-secret" \
+     http://localhost:6779/recall -d '{"db":"agent.db","ns":"default","query":"billing"}'
+```
+
+If `MEMOIRE_API_TOKEN` is unset the server prints a warning and allows all traffic — appropriate for local-only usage. Never expose the server on a public interface without setting the token.
+
 ## WASM Build
 
 The `quality` module (NLI, scoring, polarity detection) compiles to `wasm32-unknown-unknown` without SQLite or ONNX:
@@ -275,6 +292,24 @@ cd mcp-server && uv sync --locked --extra dev && uv run pytest
 - [FFI guide](docs/FFI_GUIDE.md)
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
+
+## Security
+
+### Database file permissions
+
+On Unix, Memoire restricts the `.db` file to `0600` (owner read/write only) at pool initialisation. No extra steps are needed. On Windows, use filesystem ACLs or NTFS permissions to achieve equivalent isolation.
+
+### HTTP server authentication
+
+Set `MEMOIRE_API_TOKEN` to a strong secret before running `memoire-server`. Every request to a protected route must include `Authorization: Bearer <token>`. The `/health` endpoint is always public. See [HTTP API Server](#http-api-server--dashboard) for usage.
+
+For production deployments over a network, place `memoire-server` behind a reverse proxy (nginx, Caddy) with TLS.
+
+### Python thread safety
+
+`PyMemoire` wraps the inner `Memoire` in an `Arc<Mutex>`. Concurrent calls from multiple Python threads block on the lock instead of raising PyO3 borrow errors. No additional user-side locking is required.
+
+---
 
 ## Status
 

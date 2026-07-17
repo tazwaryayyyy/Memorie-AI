@@ -1,6 +1,7 @@
 use crate::{store::Memory, Memoire};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
+use std::sync::{Arc, Mutex};
 
 pyo3::create_exception!(memoire, MemoireError, PyException);
 
@@ -92,7 +93,21 @@ pub struct PyRecallAttribution {
 
 #[pyclass(name = "Memoire")]
 pub struct PyMemoire {
-    inner: Memoire,
+    /// Wrapped in Arc<Mutex> so the Python object is safe to share across
+    /// threads and concurrent &mut self calls block instead of panicking.
+    inner: Arc<Mutex<Memoire>>,
+}
+
+/// Convenience: lock the inner Memoire and surface any poisoning as a
+/// Python RuntimeError (poisoning is only possible on a panic, which
+/// shouldn't happen in normal operation).
+macro_rules! lock {
+    ($self:expr) => {
+        $self
+            .inner
+            .lock()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+    };
 }
 
 #[pymethods]
@@ -106,20 +121,18 @@ impl PyMemoire {
             Memoire::new_ns(db_path, namespace)
         }
         .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self { inner: Arc::new(Mutex::new(inner)) })
     }
 
     fn remember(&self, content: &str) -> PyResult<usize> {
-        let ids = self
-            .inner
+        let ids = lock!(self)
             .remember(content)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(ids.len())
     }
 
     fn recall(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
-        let memories = self
-            .inner
+        let memories = lock!(self)
             .recall(query, top_k)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(memories.into_iter().map(py_memory).collect())
@@ -127,24 +140,21 @@ impl PyMemoire {
 
     #[pyo3(signature = (query, top_k, mmr_lambda = 0.5))]
     fn recall_mmr(&self, query: &str, top_k: usize, mmr_lambda: f32) -> PyResult<Vec<PyMemory>> {
-        let memories = self
-            .inner
+        let memories = lock!(self)
             .recall_mmr(query, top_k, mmr_lambda)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(memories.into_iter().map(py_memory).collect())
     }
 
     fn recall_reranked(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
-        let memories = self
-            .inner
+        let memories = lock!(self)
             .recall_reranked(query, top_k)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(memories.into_iter().map(py_memory).collect())
     }
 
     fn recall_explained(&self, query: &str, top_k: usize) -> PyResult<Vec<PyRecallAttribution>> {
-        let attributions = self
-            .inner
+        let attributions = lock!(self)
             .recall_explained(query, top_k)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(attributions
@@ -162,37 +172,35 @@ impl PyMemoire {
     }
 
     fn recompute_prototypes(&self) -> PyResult<()> {
-        self.inner
+        lock!(self)
             .recompute_prototypes()
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(())
     }
+
     fn forget(&self, memory_id: i64) -> PyResult<bool> {
-        let deleted = self
-            .inner
+        let deleted = lock!(self)
             .forget(memory_id)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(deleted)
     }
 
     fn count(&self) -> PyResult<i64> {
-        let count = self
-            .inner
+        let count = lock!(self)
             .count()
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(count)
     }
 
     fn clear(&self) -> PyResult<()> {
-        self.inner
+        lock!(self)
             .clear()
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(())
     }
 
     fn export_namespace(&self) -> PyResult<String> {
-        let value = self
-            .inner
+        let value = lock!(self)
             .export_namespace()
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         let json = serde_json::to_string(&value)
@@ -203,15 +211,14 @@ impl PyMemoire {
     fn import_namespace(&self, snapshot_str: &str) -> PyResult<usize> {
         let snapshot: serde_json::Value = serde_json::from_str(snapshot_str)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        let count = self
-            .inner
+        let count = lock!(self)
             .import_namespace(&snapshot)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(count)
     }
 
     fn resolve_contradictions(&self, memory_id: i64) -> PyResult<bool> {
-        self.inner
+        lock!(self)
             .store
             .resolve_contradictions_for_id(memory_id)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
@@ -226,16 +233,14 @@ impl PyMemoire {
         task_succeeded: bool,
         session_id: Option<&str>,
     ) -> PyResult<bool> {
-        let reinforced = self
-            .inner
+        let reinforced = lock!(self)
             .reinforce_if_used_with_session(memory_id, agent_output, task_succeeded, session_id)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(reinforced)
     }
 
     fn penalize_if_used(&self, memory_ids: Vec<i64>, failure_severity: f32) -> PyResult<String> {
-        let outcomes = self
-            .inner
+        let outcomes = lock!(self)
             .penalize_if_used(&memory_ids, failure_severity)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         let json = serde_json::to_string(&outcomes)
@@ -243,8 +248,11 @@ impl PyMemoire {
         Ok(json)
     }
 
-    fn start_background_maintenance(&mut self, interval_secs: u64, threshold: u32) -> PyResult<()> {
-        self.inner
+    /// Spawn the background maintenance task.
+    /// Uses `&self` (not `&mut self`) because inner is behind a Mutex,
+    /// so thread safety is provided by the lock, not exclusive access.
+    fn start_background_maintenance(&self, interval_secs: u64, threshold: u32) -> PyResult<()> {
+        lock!(self)
             .start_background_maintenance(interval_secs, threshold);
         Ok(())
     }

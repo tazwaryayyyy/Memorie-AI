@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -28,6 +29,44 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use memoire::Memoire;
+
+// ─── Auth middleware ──────────────────────────────────────────────────────────
+
+/// Optional bearer-token guard.
+///
+/// Set `MEMOIRE_API_TOKEN` to a secret string. Every request to a protected
+/// route must include `Authorization: Bearer <token>`. If the env var is unset
+/// or empty, the middleware is a no-op and all requests pass through.
+async fn auth_middleware(
+    req: axum::extract::Request,
+    next: Next,
+) -> impl IntoResponse {
+    if let Ok(expected) = env::var("MEMOIRE_API_TOKEN") {
+        if !expected.trim().is_empty() {
+            let provided = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| {
+                    if h.starts_with("Bearer ") {
+                        h["Bearer ".len()..].trim().to_string()
+                    } else {
+                        h.trim().to_string()
+                    }
+                })
+                .unwrap_or_default();
+
+            if provided != expected.trim() {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Unauthorized: invalid or missing token" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
 
 // ─── Shared state ─────────────────────────────────────────────────────────────
 
@@ -349,8 +388,8 @@ async fn main() {
 
     let cache: InstanceCache = Arc::new(Mutex::new(HashMap::new()));
 
-    let app = Router::new()
-        .route("/health", get(health))
+    // Protected routes — require bearer token when MEMOIRE_API_TOKEN is set.
+    let protected = Router::new()
         .route("/remember", post(remember))
         .route("/recall", post(recall))
         .route("/reinforce", post(reinforce))
@@ -360,10 +399,21 @@ async fn main() {
         .route("/info", get(info_handler))
         .route("/export", get(export_handler))
         .route("/import", post(import_handler))
+        .layer(axum::middleware::from_fn(auth_middleware))
         .with_state(cache);
+
+    // /health is always public so load-balancers and CI can reach it.
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(protected);
 
     let addr = format!("127.0.0.1:{port}");
     println!("memoire-server listening on http://{addr}");
+    if env::var("MEMOIRE_API_TOKEN").map(|t| !t.trim().is_empty()).unwrap_or(false) {
+        println!("Token auth enabled (MEMOIRE_API_TOKEN is set).");
+    } else {
+        println!("Warning: MEMOIRE_API_TOKEN not set — server is unauthenticated.");
+    }
     println!("Set MEMOIRE_SERVER_PORT to override port 6779.");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
