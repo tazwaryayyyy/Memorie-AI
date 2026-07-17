@@ -1097,10 +1097,11 @@ impl Store {
             },
         );
 
-        let (new_content, new_blob, imp, _conf, _ev, _created_at, stored_polarity) = match target_row {
-            Ok(v) => v,
-            Err(_) => return Ok(()),
-        };
+        let (new_content, new_blob, imp, _conf, _ev, _created_at, stored_polarity) =
+            match target_row {
+                Ok(v) => v,
+                Err(_) => return Ok(()),
+            };
 
         let new_emb = match blob_to_vec(&new_blob) {
             Some(v) => v,
