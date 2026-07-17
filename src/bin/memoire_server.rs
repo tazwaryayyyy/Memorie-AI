@@ -44,12 +44,7 @@ async fn auth_middleware(req: axum::extract::Request, next: Next) -> impl IntoRe
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|h| h.to_str().ok())
-                .map(|h| {
-                    h.strip_prefix("Bearer ")
-                        .unwrap_or(h)
-                        .trim()
-                        .to_string()
-                })
+                .map(|h| h.strip_prefix("Bearer ").unwrap_or(h).trim().to_string())
                 .unwrap_or_default();
 
             if provided != expected.trim() {
