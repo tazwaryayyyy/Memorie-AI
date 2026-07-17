@@ -121,18 +121,24 @@ Trust combines: reinforcement history (35%), confidence (25%), recency (20%), im
 ### Rust
 
 ```rust
-let m = Memoire::new("agent.db")?;
+let mut m = Memoire::new("agent.db")?;
 
 // Store, recall, recall with MMR dedup, cross-encoder reranking
-let ids      = m.remember("lesson text")?;
-let results  = m.recall("query", 5)?;
-let diverse  = m.recall_mmr("query", 5, 0.5)?;
-let reranked = m.recall_reranked("query", 5)?;
+let ids       = m.remember("lesson text")?;
+let results   = m.recall("query", 5)?;
+let diverse   = m.recall_mmr("query", 5, 0.5)?;
+let reranked  = m.recall_reranked("query", 5)?;
+let explained = m.recall_explained("query", 5)?; // Detailed rank attribution
 
-// Feedback
+// Feedback and optimization
 m.reinforce_if_used(ids[0], "agent output", true)?;
 m.penalize_if_used(&[ids[0]], 1.0)?;
+m.recompute_prototypes()?; // Re-align centroids with updated embeddings
 m.forget(ids[0])?;
+
+// Background Maintenance Scheduler
+// Triggers maintenance_pass() every 300s or after 10 insertions
+m.start_background_maintenance(300, 10);
 
 // Export / import
 let snapshot = m.export_namespace()?;
@@ -144,13 +150,16 @@ target.import_namespace(&snapshot)?;
 
 ```python
 with Memoire("agent.db") as m:
-    count    = m.remember("lesson text")
-    memories = m.recall("query", top_k=5)
-    diverse  = m.recall_mmr("query", top_k=5, mmr_lambda=0.5)
-    ok       = m.reinforce_if_used(memories[0].id, "output", True)
-    outcomes = m.penalize_if_used([memories[0].id], failure_severity=1.0)
-    deleted  = m.forget(memories[0].id)
-    snapshot = m.export_namespace()
+    count     = m.remember("lesson text")
+    memories  = m.recall("query", top_k=5)
+    diverse   = m.recall_mmr("query", top_k=5, mmr_lambda=0.5)
+    explained = m.recall_explained("query", top_k=5) # List of attribution breakdowns
+    ok        = m.reinforce_if_used(memories[0].id, "output", True)
+    outcomes  = m.penalize_if_used([memories[0].id], failure_severity=1.0)
+    m.recompute_prototypes() # Re-align centroids
+    m.start_background_maintenance(interval_secs=300, threshold=10)
+    deleted   = m.forget(memories[0].id)
+    snapshot  = m.export_namespace()
 ```
 
 For C/FFI consumers: [docs/FFI_GUIDE.md](docs/FFI_GUIDE.md).
@@ -219,7 +228,7 @@ Claude Desktop config:
 }
 ```
 
-Available tools: `memoire_health`, `memoire_remember`, `memoire_recall`, `memoire_reinforce`, `memoire_penalize`, `memoire_batch_feedback`, `memoire_resolve_conflicts`, `memoire_forget`, `memoire_count`, `memoire_status`, `memoire_clear`, `memoire_export`, `memoire_import`. All accept a `namespace` parameter.
+Available tools: `memoire_health`, `memoire_remember`, `memoire_recall`, `memoire_reinforce`, `memoire_penalize`, `memoire_batch_feedback`, `memoire_resolve_conflicts`, `memoire_forget`, `memoire_count`, `memoire_status`, `memoire_clear`, `memoire_export`, `memoire_import`, `memoire_identify_gaps`, `memoire_namespace_health`. All accept a `namespace` parameter.
 
 ## HTTP API Server + Dashboard
 

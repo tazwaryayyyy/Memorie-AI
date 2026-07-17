@@ -1097,7 +1097,7 @@ impl Store {
             },
         );
 
-        let (new_content, new_blob, imp, conf, ev, created_at, stored_polarity) = match target_row {
+        let (new_content, new_blob, imp, _conf, _ev, _created_at, stored_polarity) = match target_row {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
@@ -1208,7 +1208,7 @@ impl Store {
 
         drop(stmt);
 
-        for (other_id, _o_imp, _o_conf, _o_ev, o_created) in contradictions {
+        for (other_id, _o_imp, _o_conf, _o_ev, _o_created) in contradictions {
             let existing = conn
                 .query_row(
                     "SELECT trust_ema, reinforcement_count, created_at FROM memories WHERE id = ?1",

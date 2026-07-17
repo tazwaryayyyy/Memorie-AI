@@ -939,7 +939,7 @@ impl IngestionOracle for DefaultOracle {
     fn verify_strong(
         &self,
         content: &str,
-        embedding: &[f32],
+        _embedding: &[f32],
         namespace_sample: &[crate::store::Memory],
     ) -> StrongVerifyResult {
         if namespace_sample.is_empty() {

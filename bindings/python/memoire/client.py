@@ -1,4 +1,4 @@
-﻿"""
+"""
 Core Python client for Memoire. Wraps the PyO3 native extension.
 """
 from __future__ import annotations
@@ -233,6 +233,18 @@ class Memoire:
             return self._impl.import_namespace(snapshot_str)
         except Exception as e:
             raise MemoireError(f"import_namespace() failed: {e}") from e
+
+    def start_background_maintenance(self, interval_secs: int, threshold: int) -> None:
+        """
+        Start scheduled background maintenance.
+        - interval_secs: Interval in seconds for time-based maintenance.
+        - threshold: Number of insertions that triggers maintenance.
+        """
+        self._check_open()
+        try:
+            self._impl.start_background_maintenance(interval_secs, threshold)
+        except Exception as e:
+            raise MemoireError(f"start_background_maintenance() failed: {e}") from e
 
     def close(self) -> None:
         """Release the native instance."""

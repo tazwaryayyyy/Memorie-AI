@@ -458,3 +458,34 @@ Build:
 ```bash
 cargo build --target wasm32-unknown-unknown --no-default-features --features wasm
 ```
+
+---
+
+## Background Maintenance Scheduler (Component 6)
+
+Memoire includes an asynchronous background maintenance scheduler that cleans up, updates indices (HNSW), and handles other routine tasks. 
+- **Scheduler Actions**: Runs `Store::maintenance_pass()` automatically.
+- **Triggers**: Supports both time-based (e.g. run every `interval_secs` seconds) and count-based triggers (e.g. run when insertion counter reaches `threshold` inserts).
+- **Wiring**: Handled via `spawn_maintenance_scheduler` and `spawn_count_watcher` in `src/background.rs`. They are automatically aborted when the `Memoire` instance is dropped.
+
+---
+
+## Prototype Recomputation (Component 7)
+
+- **Purpose**: Over time, as embedding models evolve or are fine-tuned, the original scoring prototype centroids can drift.
+- **Action**: `recompute_prototypes()` re-embeds the 15 fixed prototype sentences (covering consequence, actionability, and reusability dimensions) using the current embedder. This updates the centroids stored in `self.prototypes` in-place, keeping quality scoring aligned with the latest embedding space.
+
+---
+
+## Recall Attribution and Explanation (Component 8)
+
+- **Method**: `recall_explained(query, top_k)` returns a list of `RecallAttribution` structs.
+- **Fields**:
+  - `memory`: The retrieved memory chunk.
+  - `semantic_score`: Cosine similarity of the query and memory.
+  - `trust`: Decayed Trust EMA score.
+  - `uncertainty`: The memory's uncertainty rating.
+  - `effective_weight`: Final weighted scoring used for search ranking.
+  - `rank_score`: Ensemble score combining `0.65 * score + 0.25 * trust + 0.10 * effective_weight`.
+  - `reasons`: Human-readable tags describing why the memory was retrieved/ranked this way (e.g., "high semantic relevance", "hint-level trust", "high uncertainty").
+

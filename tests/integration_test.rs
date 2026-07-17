@@ -337,3 +337,28 @@ fn test_semantic_contradiction_detection() {
         );
     }
 }
+
+#[test]
+fn test_recompute_prototypes() {
+    let mem = m();
+    assert!(mem.recompute_prototypes().is_ok());
+}
+
+#[test]
+fn test_background_scheduler() {
+    let mut mem = m();
+    mem.start_background_maintenance(60, 5);
+}
+
+#[test]
+fn test_recall_explained() {
+    let mem = m();
+    mem.remember("Fixed the database connection pool leak in production").unwrap();
+    let attributions = mem.recall_explained("database leak", 5).unwrap();
+    assert!(!attributions.is_empty());
+    let attr = &attributions[0];
+    assert!(attr.semantic_score > 0.0);
+    assert!(!attr.reasons.is_empty());
+    assert_eq!(attr.memory.content, "Fixed the database connection pool leak in production");
+}
+

@@ -242,6 +242,11 @@ impl PyMemoire {
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(json)
     }
+
+    fn start_background_maintenance(&mut self, interval_secs: u64, threshold: u32) -> PyResult<()> {
+        self.inner.start_background_maintenance(interval_secs, threshold);
+        Ok(())
+    }
 }
 
 #[pymodule]
