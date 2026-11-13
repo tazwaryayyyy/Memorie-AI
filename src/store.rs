@@ -4,7 +4,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::error::{MemoireError, Result};
 use crate::quality::{
@@ -47,7 +47,9 @@ pub struct PenaltyOutcome {
 
 pub struct Store {
     pool: Pool<SqliteConnectionManager>,
-    inner: RwLock<StoreInner>,
+    /// Shared between clones so a cloned `Store` (e.g. the background
+    /// maintenance handle) mutates the same cache/HNSW/fingerprint state.
+    inner: Arc<RwLock<StoreInner>>,
     pub config: ScoringConfig,
     /// Namespace this store instance is scoped to. All reads/writes are filtered
     /// by this value. Defaults to `"default"`. Set via `Store::open_ns()`.
@@ -56,20 +58,13 @@ pub struct Store {
 }
 
 impl Clone for Store {
+    /// Cheap handle clone: shares the connection pool **and** the in-memory
+    /// cache (`StoreInner`) with the original. Mutations through any clone
+    /// (insert, forget, `maintenance_pass`) are visible to all of them.
     fn clone(&self) -> Self {
-        let fingerprints = self
-            .read_lock()
-            .map(|inner| inner.fingerprints.clone())
-            .unwrap_or_default();
         Self {
             pool: self.pool.clone(),
-            inner: RwLock::new(StoreInner {
-                embedding_cache: Vec::new(),
-                embedding_cache_loaded: false,
-                fingerprints,
-                hnsw: None,
-                hnsw_dirty: false,
-            }),
+            inner: Arc::clone(&self.inner),
             config: self.config.clone(),
             namespace: self.namespace.clone(),
             nli_checker: self.nli_checker.clone(),
@@ -414,13 +409,13 @@ impl Store {
         );
         Ok(Self {
             pool,
-            inner: RwLock::new(StoreInner {
+            inner: Arc::new(RwLock::new(StoreInner {
                 embedding_cache: Vec::new(),
                 embedding_cache_loaded: false,
                 fingerprints,
                 hnsw: None,
                 hnsw_dirty: false,
-            }),
+            })),
             config,
             namespace: namespace.to_string(),
             nli_checker: NliChecker::new(),
@@ -476,14 +471,14 @@ impl Store {
         drop(conn);
         Ok(Self {
             pool,
-            inner: RwLock::new(StoreInner {
+            inner: Arc::new(RwLock::new(StoreInner {
                 embedding_cache: Vec::new(),
                 // In-memory store starts empty â€” no deferred load needed.
                 embedding_cache_loaded: true,
                 fingerprints: HashSet::new(),
                 hnsw: None,
                 hnsw_dirty: false,
-            }),
+            })),
             config,
             namespace: namespace.to_string(),
             nli_checker: NliChecker::new(),
@@ -1828,6 +1823,22 @@ mod tests {
         let results = store.search(&[0.9_f32, 0.1, 0.0], 2, false).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].content, "memory one");
+    }
+
+    #[test]
+    fn test_clone_shares_cache_state() {
+        // Regression: Store::clone() used to build a detached, empty StoreInner,
+        // so deletes performed through a clone (background maintenance) never
+        // reached the original's embedding cache.
+        let store = Store::in_memory().unwrap();
+        let id = store.insert("memory one", &[1.0_f32, 0.0, 0.0]).unwrap();
+        assert!(store.max_similarity(&[1.0_f32, 0.0, 0.0]).unwrap() > 0.99);
+
+        let clone = store.clone();
+        assert!(clone.forget(id).unwrap());
+
+        assert_eq!(store.max_similarity(&[1.0_f32, 0.0, 0.0]).unwrap(), 0.0);
+        assert!(store.search(&[1.0_f32, 0.0, 0.0], 3, false).unwrap().is_empty());
     }
 
     #[test]
