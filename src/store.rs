@@ -1,6 +1,6 @@
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use std::collections::{HashMap, HashSet};
@@ -227,6 +227,32 @@ fn load_fingerprints_from_db(conn: &Connection, namespace: &str) -> Result<HashS
     Ok(fingerprints)
 }
 
+/// Drop `fp` from the in-memory dedup set after the row that owned it was
+/// deleted, unless another live row in this namespace still carries the same
+/// fingerprint. "Live" matches `load_fingerprints_from_db`
+/// (`archived = 0 AND superseded_by IS NULL`). Call *after* the row is gone.
+fn release_fingerprint(
+    inner: &mut StoreInner,
+    conn: &Connection,
+    namespace: &str,
+    fp: &str,
+) -> Result<()> {
+    if fp.is_empty() {
+        return Ok(());
+    }
+    let still_live: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories
+                       WHERE namespace = ?1 AND fingerprint = ?2
+                         AND archived = 0 AND superseded_by IS NULL)",
+        params![namespace, fp],
+        |r| r.get(0),
+    )?;
+    if !still_live {
+        inner.fingerprints.remove(fp);
+    }
+    Ok(())
+}
+
 /// Rebuild the HNSW index from the current in-memory embedding cache.
 fn rebuild_hnsw(inner: &mut StoreInner) {
     if inner.embedding_cache.is_empty() {
@@ -355,7 +381,9 @@ impl Store {
 
     pub fn open_ns_with_config(path: &str, namespace: &str, config: ScoringConfig) -> Result<Self> {
         let manager = Self::pooled_file_manager(path);
-        let pool = Pool::builder().max_size(20).build(manager)?;
+        // min_idle(1): do not open 20 connections concurrently at startup; the first
+        // connection converts a fresh file to WAL on its own, the rest are created lazily.
+        let pool = Pool::builder().max_size(20).min_idle(Some(1)).build(manager)?;
         let conn = pool.get()?;
 
         #[cfg(unix)]
@@ -1269,38 +1297,49 @@ impl Store {
         Ok(())
     }
 
+    /// Archive superseded rows and prune stale ones. Strictly scoped to
+    /// `self.namespace`: another namespace sharing the same SQLite file is never touched.
     pub fn maintenance_pass(&self) -> Result<()> {
         let conn = self.pool.get()?;
         let mut inner = self.write_lock()?;
+        let ns = &self.namespace;
 
-        conn.execute_batch(
+        conn.execute(
             "UPDATE memories
              SET archived = 1
-             WHERE superseded_by IS NOT NULL
-               AND archived = 0;",
+             WHERE namespace = ?1
+               AND superseded_by IS NOT NULL
+               AND archived = 0",
+            params![ns],
         )?;
 
         let mut stmt = conn.prepare(
-            "SELECT id FROM memories
-             WHERE archived = 1
+            "SELECT id, fingerprint FROM memories
+             WHERE namespace = ?1
+               AND archived = 1
                AND (strftime('%s', 'now') - created_at) > 7 * 86400
              UNION ALL
-             SELECT id FROM memories
-             WHERE archived = 0
+             SELECT id, fingerprint FROM memories
+             WHERE namespace = ?1
+               AND archived = 0
                AND superseded_by IS NULL
                AND reinforcement_count = 0
                AND importance_base < 0.12
                AND (strftime('%s', 'now') - created_at) > 30 * 86400",
         )?;
-        let to_delete: Vec<i64> = stmt
-            .query_map([], |r| r.get(0))?
+        let to_delete: Vec<(i64, String)> = stmt
+            .query_map(params![ns], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
             .filter_map(|r| r.ok())
             .collect();
         drop(stmt);
 
-        for del_id in to_delete {
-            conn.execute("DELETE FROM memories WHERE id = ?1", params![del_id])?;
+        for (del_id, fp) in to_delete {
+            conn.execute(
+                "DELETE FROM memories WHERE id = ?1 AND namespace = ?2",
+                params![del_id, ns],
+            )?;
             inner.remove_from_cache(del_id);
+            release_fingerprint(&mut inner, &conn, ns, &fp)?;
         }
 
         Ok(())
@@ -1483,9 +1522,25 @@ impl Store {
     pub fn forget(&self, id: i64) -> Result<bool> {
         let conn = self.pool.get()?;
         let mut inner = self.write_lock()?;
-        let rows = conn.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+        let ns = &self.namespace;
+        // Scoped to this namespace: an id owned by another namespace is "not found".
+        let fp: Option<String> = conn
+            .query_row(
+                "SELECT fingerprint FROM memories WHERE id = ?1 AND namespace = ?2",
+                params![id, ns],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(fp) = fp else {
+            return Ok(false);
+        };
+        let rows = conn.execute(
+            "DELETE FROM memories WHERE id = ?1 AND namespace = ?2",
+            params![id, ns],
+        )?;
         if rows > 0 {
             inner.remove_from_cache(id);
+            release_fingerprint(&mut inner, &conn, ns, &fp)?;
         }
         Ok(rows > 0)
     }
@@ -1502,7 +1557,10 @@ impl Store {
     pub fn clear(&self) -> Result<()> {
         let conn = self.pool.get()?;
         let mut inner = self.write_lock()?;
-        conn.execute_batch("DELETE FROM memories;")?;
+        conn.execute(
+            "DELETE FROM memories WHERE namespace = ?1",
+            params![self.namespace],
+        )?;
         inner.embedding_cache.clear();
         inner.embedding_cache_loaded = true; // empty store is coherent â€” no load needed
         inner.fingerprints.clear();
@@ -1823,6 +1881,73 @@ mod tests {
         let results = store.search(&[0.9_f32, 0.1, 0.0], 2, false).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].content, "memory one");
+    }
+
+    #[test]
+    fn test_forget_releases_fingerprint() {
+        let store = Store::in_memory().unwrap();
+        let meta = QualityMeta::default_active("fingerprint release check");
+        let id = store
+            .insert_with_quality("fingerprint release check", &[1.0_f32, 0.0, 0.0], &meta)
+            .unwrap();
+        assert!(store.fingerprint_exists(&meta.fingerprint).unwrap());
+        assert!(store.forget(id).unwrap());
+        assert!(!store.fingerprint_exists(&meta.fingerprint).unwrap());
+    }
+
+    /// Two namespaces sharing one SQLite file. Rows are made prune-eligible with
+    /// raw SQL (low importance, 40 days old, never reinforced).
+    fn two_tenant_stores(dir: &std::path::Path) -> (Store, Store) {
+        let p = dir.join("isolation.db");
+        let p = p.to_str().unwrap();
+        (
+            Store::open_ns(p, "tenant_a").unwrap(),
+            Store::open_ns(p, "tenant_b").unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_maintenance_pass_is_namespace_scoped_and_releases_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = two_tenant_stores(dir.path());
+        let meta_a = QualityMeta::default_active("tenant a stale note");
+        let meta_b = QualityMeta::default_active("tenant b stale note");
+        a.insert_with_quality("tenant a stale note", &[1.0_f32, 0.0], &meta_a)
+            .unwrap();
+        b.insert_with_quality("tenant b stale note", &[0.0_f32, 1.0], &meta_b)
+            .unwrap();
+
+        a.pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET importance_base = 0.05, created_at = created_at - 40 * 86400",
+                [],
+            )
+            .unwrap();
+
+        a.maintenance_pass().unwrap();
+
+        assert_eq!(a.count().unwrap(), 0, "tenant_a stale row must be pruned");
+        assert_eq!(b.count().unwrap(), 1, "tenant_b must be untouched");
+        assert_eq!(b.all().unwrap()[0].content, "tenant b stale note");
+        assert!(!a.fingerprint_exists(&meta_a.fingerprint).unwrap());
+        assert!(b.fingerprint_exists(&meta_b.fingerprint).unwrap());
+    }
+
+    #[test]
+    fn test_forget_and_clear_are_namespace_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = two_tenant_stores(dir.path());
+        let id_a = a.insert("tenant a item", &[1.0_f32, 0.0]).unwrap();
+        b.insert("tenant b item", &[0.0_f32, 1.0]).unwrap();
+
+        assert!(!b.forget(id_a).unwrap(), "b must not forget a's row");
+        assert_eq!(a.count().unwrap(), 1);
+
+        a.clear().unwrap();
+        assert_eq!(a.count().unwrap(), 0);
+        assert_eq!(b.count().unwrap(), 1, "a.clear() must not wipe tenant_b");
     }
 
     #[test]
