@@ -1,3 +1,4 @@
+use memoire::text::truncate_chars;
 use memoire::Memoire;
 
 fn main() -> anyhow::Result<()> {
@@ -28,7 +29,11 @@ fn main() -> anyhow::Result<()> {
     println!("Storing {} sessions...", sessions.len());
     for s in &sessions {
         let ids = m.remember(s)?;
-        println!("  stored {} chunk(s): {}...", ids.len(), &s[..60]);
+        println!(
+            "  stored {} chunk(s): {}...",
+            ids.len(),
+            truncate_chars(s, 60)
+        );
     }
     println!("\nTotal chunks in store: {}\n", m.count()?);
 
@@ -47,7 +52,7 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "  [{i}] score={:.4}  {}",
                 r.score,
-                &r.content[..80.min(r.content.len())]
+                truncate_chars(&r.content, 80)
             );
         }
         println!();

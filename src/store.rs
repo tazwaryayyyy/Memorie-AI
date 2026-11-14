@@ -383,7 +383,10 @@ impl Store {
         let manager = Self::pooled_file_manager(path);
         // min_idle(1): do not open 20 connections concurrently at startup; the first
         // connection converts a fresh file to WAL on its own, the rest are created lazily.
-        let pool = Pool::builder().max_size(20).min_idle(Some(1)).build(manager)?;
+        let pool = Pool::builder()
+            .max_size(20)
+            .min_idle(Some(1))
+            .build(manager)?;
         let conn = pool.get()?;
 
         #[cfg(unix)]
@@ -1331,7 +1334,9 @@ impl Store {
                AND (strftime('%s', 'now') - created_at) > 30 * 86400",
         )?;
         let to_delete: Vec<(i64, String)> = stmt
-            .query_map(params![ns], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .query_map(params![ns], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
             .filter_map(|r| r.ok())
             .collect();
         drop(stmt);
@@ -2004,7 +2009,10 @@ mod tests {
         assert!(clone.forget(id).unwrap());
 
         assert_eq!(store.max_similarity(&[1.0_f32, 0.0, 0.0]).unwrap(), 0.0);
-        assert!(store.search(&[1.0_f32, 0.0, 0.0], 3, false).unwrap().is_empty());
+        assert!(store
+            .search(&[1.0_f32, 0.0, 0.0], 3, false)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

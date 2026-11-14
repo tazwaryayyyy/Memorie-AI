@@ -41,11 +41,7 @@ pub struct PyMemory {
 #[pymethods]
 impl PyMemory {
     fn __repr__(&self) -> String {
-        let preview = if self.content.len() > 60 {
-            format!("{}...", &self.content[..60])
-        } else {
-            self.content.clone()
-        };
+        let preview = crate::text::preview(&self.content, 60);
         format!(
             "Memory(id={}, score={:.3}, trust={:.3}, uncertainty={:.3}, state={:?}, content={:?})",
             self.id, self.score, self.trust, self.uncertainty, self.state, preview

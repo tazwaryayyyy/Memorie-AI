@@ -1,22 +1,14 @@
-[build]
-# Use all available cores for compilation
-jobs = 4
-
-[target.x86_64-unknown-linux-gnu]
-# Enable AVX2 for faster cosine similarity SIMD on modern x86 CPUs.
-# Remove if targeting older hardware (pre-2013 CPUs).
-rustflags = ["-C", "target-feature=+avx2,+fma"]
-
 [target.aarch64-unknown-linux-gnu]
 # ARM NEON is always available on AArch64 — LLVM enables it automatically.
 rustflags = []
 
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "target-feature=+avx2,+fma"]
-
 [target.aarch64-apple-darwin]
 # Apple Silicon — NEON enabled by default
 rustflags = []
+
+# NOTE: no `-C target-feature=+avx2,+fma` on x86_64. Binaries built here are
+# distributed (GitHub Releases, wheels) and must run on any x86_64 CPU/VM; a
+# hard-coded AVX2 baseline raises SIGILL on CPUs or hypervisors without it.
 
 # Alias for common workflows
 [alias]

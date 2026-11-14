@@ -1,5 +1,8 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
 
 #[cfg(not(target_arch = "wasm32"))]
 use ort::{
@@ -265,6 +268,7 @@ impl NliChecker {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_onnx(onnx: OnnxNliChecker) -> Self {
         Self {
             onnx: Some(Arc::new(onnx)),
@@ -296,9 +300,9 @@ impl NliChecker {
         if let Some(classifier) = &self.onnx {
             match classifier.classify(premise_text, hypothesis_text) {
                 Ok(label) => return label,
-                Err(e) => log::warn!(
-                    "ONNX NLI inference failed ({e}); falling back to lexical heuristic"
-                ),
+                Err(e) => {
+                    log::warn!("ONNX NLI inference failed ({e}); falling back to lexical heuristic")
+                }
             }
         }
 
@@ -1281,31 +1285,58 @@ mod tests {
     #[test]
     fn id2label_contradiction_at_index_0() {
         // facebook/bart-large-mnli ordering
-        let m = map_from(&[("0", "contradiction"), ("1", "neutral"), ("2", "entailment")]).unwrap();
+        let m = map_from(&[
+            ("0", "contradiction"),
+            ("1", "neutral"),
+            ("2", "entailment"),
+        ])
+        .unwrap();
         assert_eq!(
             m.label_for_logits(&[2.0, 0.1, -1.0]).unwrap(),
             NliLabel::Contradiction
         );
-        assert_eq!(m.label_for_logits(&[0.0, 0.2, 3.0]).unwrap(), NliLabel::Entailment);
+        assert_eq!(
+            m.label_for_logits(&[0.0, 0.2, 3.0]).unwrap(),
+            NliLabel::Entailment
+        );
     }
 
     #[test]
     fn id2label_contradiction_at_index_2() {
         // MoritzLaurer/* ordering: the old `max_idx == 0` would invert these.
-        let m = map_from(&[("0", "entailment"), ("1", "neutral"), ("2", "contradiction")]).unwrap();
+        let m = map_from(&[
+            ("0", "entailment"),
+            ("1", "neutral"),
+            ("2", "contradiction"),
+        ])
+        .unwrap();
         assert_eq!(
             m.label_for_logits(&[-1.0, 0.0, 3.0]).unwrap(),
             NliLabel::Contradiction
         );
-        assert_eq!(m.label_for_logits(&[3.0, 0.0, -1.0]).unwrap(), NliLabel::Entailment);
+        assert_eq!(
+            m.label_for_logits(&[3.0, 0.0, -1.0]).unwrap(),
+            NliLabel::Entailment
+        );
     }
 
     #[test]
     fn id2label_other_order_and_case_insensitive() {
         // cross-encoder/nli-* ordering, upper-case names
-        let m = map_from(&[("0", "CONTRADICTION"), ("1", "Entailment"), ("2", " neutral ")]).unwrap();
-        assert_eq!(m.label_for_logits(&[0.1, 3.0, 0.2]).unwrap(), NliLabel::Entailment);
-        assert_eq!(m.label_for_logits(&[0.1, 0.2, 3.0]).unwrap(), NliLabel::Neutral);
+        let m = map_from(&[
+            ("0", "CONTRADICTION"),
+            ("1", "Entailment"),
+            ("2", " neutral "),
+        ])
+        .unwrap();
+        assert_eq!(
+            m.label_for_logits(&[0.1, 3.0, 0.2]).unwrap(),
+            NliLabel::Entailment
+        );
+        assert_eq!(
+            m.label_for_logits(&[0.1, 0.2, 3.0]).unwrap(),
+            NliLabel::Neutral
+        );
     }
 
     #[test]
@@ -1326,13 +1357,23 @@ mod tests {
                 "must reject: {json}"
             );
         }
-        let err = NliLabelMap::from_id2label_json("{}").unwrap_err().to_string();
-        assert!(err.contains("id2label"), "error should name id2label: {err}");
+        let err = NliLabelMap::from_id2label_json("{}")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("id2label"),
+            "error should name id2label: {err}"
+        );
     }
 
     #[test]
     fn logits_must_be_three_finite_values() {
-        let m = map_from(&[("0", "contradiction"), ("1", "neutral"), ("2", "entailment")]).unwrap();
+        let m = map_from(&[
+            ("0", "contradiction"),
+            ("1", "neutral"),
+            ("2", "entailment"),
+        ])
+        .unwrap();
         assert!(m.label_for_logits(&[1.0, 2.0]).is_err());
         assert!(m.label_for_logits(&[1.0, 2.0, 3.0, 4.0]).is_err());
         assert!(m.label_for_logits(&[1.0, f32::NAN, 3.0]).is_err());

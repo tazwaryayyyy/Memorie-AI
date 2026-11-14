@@ -11,12 +11,15 @@ pub mod py_ffi;
 pub mod quality;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod store;
+pub mod text;
 
 #[cfg(not(target_arch = "wasm32"))]
 use chunker::{chunk_text, ChunkerConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use embedder::{EmbedProvider, Embedder, FastEmbedReranker, Reranker};
+#[cfg(not(target_arch = "wasm32"))]
 use error::{MemoireError, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use quality::{
     build_quality_meta, fingerprint, IngestDecision, IngestionOracle, ScoringConfig,
     ScoringPrototypes, ScoringWeights,

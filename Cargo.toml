@@ -26,30 +26,15 @@ name = "memoire"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# ─── Shared (all targets) ─────────────────────────────────────────────────────
+# ─── Shared (all targets, including wasm32) ──────────────────────────────────
 blake3 = "1"
-instant-distance = "0.6"
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
-env_logger = "0.11"
-clap = { version = "4.4", features = ["derive"] }
-colored = "2.0"
-walkdir = "2.4"
-rayon = "1.9"
-once_cell = "1.19"
-dirs = "5.0"
-tree-sitter = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-rust = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-typescript = { version = "0.23", features = [] }
-ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
-tokenizers = { version = "0.19.1", default-features = false, features = ["onig"] }
 
-# ─── Native-only (optional, activated by target cfg below) ───────────────────
+# ─── Native-only (optional, activated by the `native` feature) ───────────────
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 r2d2 = { version = "0.8", optional = true }
 r2d2_sqlite = { version = "0.24", optional = true }
@@ -61,6 +46,20 @@ tokio = { version = "1", features = ["full"], optional = true }
 pyo3 = { version = "0.21", features = ["extension-module", "abi3-py310"], optional = true }
 # WASM random number generation (activated by `wasm` feature)
 getrandom = { version = "0.2", features = ["js"], optional = true }
+
+# ─── Not on wasm32: ONNX, C parsers, SQLite-side helpers ─────────────────────
+# Mirrors the `cfg(not(target_arch = "wasm32"))` gates in src/. (clap, colored,
+# walkdir, rayon, once_cell and dirs were declared but never used; removed.)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11"
+instant-distance = "0.6"
+tree-sitter = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = { version = "0.23", features = [] }
+ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
+tokenizers = { version = "0.19.1", default-features = false, features = ["onig"] }
 
 [features]
 default = ["native"]
@@ -80,18 +79,22 @@ rand = "0.8"
 [[example]]
 name = "basic_usage"
 path = "examples/basic_usage.rs"
+required-features = ["native"]
 
 [[bin]]
 name = "memoire-cli"
 path = "src/bin/cli.rs"
+required-features = ["native"]
 
 [[bin]]
 name = "memoire-server"
 path = "src/bin/memoire_server.rs"
+required-features = ["native"]
 
 [[bench]]
 name = "core_bench"
 harness = false
+required-features = ["native"]
 
 [build-dependencies]
 # Uncomment to auto-generate include/memoire.h from FFI source:

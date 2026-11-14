@@ -2,9 +2,11 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum MemoireError {
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("database pool error: {0}")]
     DatabasePool(#[from] r2d2::Error),
 
