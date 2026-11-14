@@ -11,9 +11,10 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]==1.27.1",
-    "memoire==0.1.0",
-    "scikit-learn>=1.4.0",
-    "numpy>=1.26.0",
+    # PROVISIONAL distribution name for the Python SDK (import name stays
+    # `memoire`). The unrelated PyPI project "memoire" must not be used here.
+    # Final name is an owner decision; do not publish before it is made.
+    "memoire-engine>=0.1.0,<0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -34,8 +35,9 @@ Changelog = "https://github.com/tazwaryayyyy/Memorie-AI/blob/main/CHANGELOG.md"
 py-modules = ["server"]
 
 [tool.uv.sources]
-memoire = { path = "../bindings/python", editable = true }
+memoire-engine = { path = "../bindings/python", editable = true }
 
 [tool.pytest.ini_options]
 addopts = "-p no:cacheprovider"
 testpaths = ["tests"]
+pythonpath = ["."]

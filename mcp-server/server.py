@@ -1,27 +1,48 @@
-﻿from pathlib import Path
 import json
-from memoire.client import _get_lib
-from memoire import Memoire
 import logging
+import math
 import os
 import sys
 import threading
-from typing import Any, Callable, Dict, List, Tuple, TypeVar
-from urllib.parse import urlparse, unquote
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from urllib.parse import unquote, urlparse
 
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import Context, FastMCP
 
-# Add local bindings to path so IDE and runtime can find the memoire module
-sys.path.append(os.path.abspath(os.path.join(
-    os.path.dirname(__file__), "..", "bindings", "python")))
+# Prefer an installed `memoire` (pip / uv / `maturin develop`). Only when it is
+# not importable at all do we fall back to the source checkout's
+# bindings/python, appended (not inserted) so an installed copy always wins.
+# In a packaged install that directory does not exist and nothing is added.
+_SOURCE_BINDINGS = Path(__file__).resolve().parent.parent / "bindings" / "python"
+try:
+    import memoire  # noqa: F401
+except ModuleNotFoundError as _exc:
+    if _exc.name != "memoire":
+        raise
+    if (_SOURCE_BINDINGS / "memoire").is_dir():
+        sys.path.append(str(_SOURCE_BINDINGS))
+    # Otherwise the import below raises the normal ModuleNotFoundError.
 
+from memoire import Memoire  # noqa: E402
+from memoire.client import _get_lib  # noqa: E402
 
 # Setup structured logging
 
 class JsonFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None) -> str:
+        # time.strftime has no %f and formatTime uses local time, so build a
+        # genuine UTC ISO-8601 timestamp explicitly.
+        return (
+            datetime.fromtimestamp(record.created, tz=timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
     def format(self, record: logging.LogRecord) -> str:
         log_data = {
-            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%fZ"),
+            "timestamp": self.formatTime(record),
             "levelname": record.levelname,
             "name": record.name,
             "message": record.getMessage(),
@@ -31,11 +52,18 @@ class JsonFormatter(logging.Formatter):
         for key, val in record.__dict__.items():
             if key not in {"args", "asctime", "created", "exc_info", "exc_text", "filename", "funcName", "levelname", "levelno", "lineno", "module", "msecs", "msg", "name", "pathname", "process", "processName", "relativeCreated", "stack_info", "thread", "threadName"}:
                 log_data[key] = val
-        return json.dumps(log_data)
+        return json.dumps(log_data, default=str)
+
+
+def _resolve_log_level(raw: Optional[str]) -> int:
+    """Map MEMOIRE_LOG_LEVEL to a logging level; unknown values mean INFO."""
+    level = logging.getLevelName((raw or "INFO").strip().upper())
+    return level if isinstance(level, int) else logging.INFO
 
 
 logger = logging.getLogger("memoire.mcp")
-logger.setLevel(os.environ.get("MEMOIRE_LOG_LEVEL", "INFO"))
+_raw_log_level = os.environ.get("MEMOIRE_LOG_LEVEL")
+logger.setLevel(_resolve_log_level(_raw_log_level))
 
 # Console handler logging raw messages to stderr for immediate agent visibility
 console_handler = logging.StreamHandler(sys.stderr)
@@ -44,6 +72,10 @@ console_formatter = logging.Formatter(
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 logger.propagate = False
+
+if _raw_log_level and not isinstance(
+        logging.getLevelName(_raw_log_level.strip().upper()), int):
+    logger.warning("Unknown MEMOIRE_LOG_LEVEL=%r; using INFO", _raw_log_level)
 
 # File handler logging structured JSON lines under user directory
 try:
@@ -106,6 +138,18 @@ def serialize_memory(memory: Any) -> Dict[str, Any]:
         "last_used_at": getattr(memory, "last_used_at", None),
     }
 
+# The native recall applies top_k before the Python-side shadow gate (and the
+# core `include_shadow=False` flag still returns 'shadow' rows), so over-fetch
+# and trim afterwards. Heuristic factor: if more than ~2/3 of the candidates
+# are shadow, fewer than top_k results can still come back.
+_SHADOW_OVERFETCH = 3
+_MAX_FETCH = 150
+
+
+def _fetch_k(top_k: int, include_shadow: bool) -> int:
+    return top_k if include_shadow else min(top_k * _SHADOW_OVERFETCH, _MAX_FETCH)
+
+
 def run_memoire(ctx: Context, operation: Callable[[Memoire], T], namespace: str = "default") -> T:
     """Run one operation against the per-DB Memoire handle under its lock."""
     db_path = get_db_path(ctx)
@@ -114,50 +158,73 @@ def run_memoire(ctx: Context, operation: Callable[[Memoire], T], namespace: str 
         return operation(memoire)
 
 
+_NATIVE_EXTENSION_HINT = (
+    "The native Memoire extension (memoire.memoire, built with PyO3/maturin) "
+    "could not be loaded. From a source checkout, activate a virtualenv and run "
+    "`maturin develop --release` inside bindings/python (needs a Rust toolchain), "
+    "then start this server with that virtualenv's Python. MEMOIRE_LIB and "
+    "`cargo build --release` are not used by the Python package."
+)
+
+
 def startup_health_check() -> Dict[str, Any]:
-    """Verify that the native Memoire shared library can be loaded."""
+    """Verify that the native Memoire extension (PyO3) is importable.
+
+    This does not open a database or load the embedding model.
+    """
     try:
         _get_lib()
     except Exception as exc:
         logger.exception("event=startup_health_failed")
         return error_response(
             "native_library_unavailable",
-            "Failed to load the native Memoire shared library. Build it with `cargo build --release` or set MEMOIRE_LIB.",
+            _NATIVE_EXTENSION_HINT,
             exception=repr(exc),
         )
 
     return ok_response(status="ready")
 
 
+def _file_uri_to_path(uri: Any) -> Optional[str]:
+    """Convert a file:// URI to a local path; None for anything else."""
+    if not isinstance(uri, str):
+        return None
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        return None
+    path = unquote(parsed.path)
+    # Windows file URIs look like file:///C:/...
+    if os.name == "nt" and path.startswith("/"):
+        path = path[1:]
+    return path
+
+
 def get_db_path(ctx: Context) -> str:
-    """Extract the workspace path from MCP Context and resolve the DB path."""
+    """Resolve the database path.
+
+    Workspace root: the MCP spec's initialize params carry no workspace folder,
+    so this normally falls back to the server's cwd. Clients that send
+    non-standard `workspaceFolders` / `rootUri` extras in initialize are
+    honoured via `session.client_params` (pydantic keeps extras).
+
+    DB path precedence: `<root>/.memoire_path` > MEMOIRE_DB_PATH > MEMOIRE_DB
+    > `<root>/memoire.db`.
+    """
     project_root = os.getcwd()
 
     try:
-        # Try to extract from FastMCP Context
-        if hasattr(ctx, "request_context") and ctx.request_context:
-            session = ctx.request_context.session
-            if hasattr(session, "init_params") and session.init_params:
-                # Check workspaceFolders first
-                if getattr(session.init_params, "workspaceFolders", None):
-                    uri = session.init_params.workspaceFolders[0].uri
-                    parsed = urlparse(uri)
-                    # Convert file:// uri to local path
-                    if parsed.scheme == "file":
-                        # Handle Windows paths correctly (e.g. file:///C:/...)
-                        path = unquote(parsed.path)
-                        if os.name == 'nt' and path.startswith('/'):
-                            path = path[1:]
-                        project_root = path
-                # Fallback to rootUri
-                elif getattr(session.init_params, "rootUri", None):
-                    uri = session.init_params.rootUri
-                    parsed = urlparse(uri)
-                    if parsed.scheme == "file":
-                        path = unquote(parsed.path)
-                        if os.name == 'nt' and path.startswith('/'):
-                            path = path[1:]
-                        project_root = path
+        request_context = getattr(ctx, "request_context", None)
+        session = getattr(request_context, "session", None)
+        params = getattr(session, "client_params", None)
+        if params is not None:
+            candidate = None
+            folders = getattr(params, "workspaceFolders", None)
+            if folders:
+                candidate = _file_uri_to_path(getattr(folders[0], "uri", None))
+            if candidate is None:
+                candidate = _file_uri_to_path(getattr(params, "rootUri", None))
+            if candidate:
+                project_root = candidate
     except Exception as e:
         # Safe fallback
         logger.warning("event=context_path_fallback error=%r", e)
@@ -225,14 +292,17 @@ def memoire_recall(query: str, ctx: Context, top_k: int = 5, include_shadow: boo
 
     try:
         results = run_memoire(ctx, lambda memoire: memoire.recall(
-            query, top_k=top_k), namespace=namespace)
+            query, top_k=_fetch_k(top_k, include_shadow)), namespace=namespace)
         final_results = []
 
         for r in results:
             if not include_shadow and r.state == "shadow":
                 continue
+            if len(final_results) >= top_k:
+                break
 
-            status_msg = "Active and Trusted."
+            # "active" only means "not shadow"; confidence is in trust/uncertainty.
+            status_msg = "Active. Judge confidence from trust and uncertainty."
             if r.state == "shadow":
                 status_msg = "WARNING: This is a shadow memory with low trust. Use with caution."
 
@@ -287,7 +357,7 @@ def memoire_penalize(memory_ids: List[int], failure_severity: float, ctx: Contex
         return error_response("invalid_argument", "memory_ids must not be empty")
     if any(memory_id < 1 for memory_id in memory_ids):
         return error_response("invalid_argument", "all memory_ids must be positive", memory_ids=memory_ids)
-    if failure_severity < 0.0 or failure_severity > 1.0:
+    if not math.isfinite(failure_severity) or not 0.0 <= failure_severity <= 1.0:
         return error_response(
             "invalid_argument",
             "failure_severity must be between 0.0 and 1.0",
@@ -346,9 +416,10 @@ def memoire_batch_feedback(memory_ids: List[int], task_succeeded: bool, task_out
 
 
 @mcp.tool()
-def memoire_recall_explained(query: str, ctx: Context, top_k: int = 5, namespace: str = "default") -> dict:
+def memoire_recall_explained(query: str, ctx: Context, top_k: int = 5, include_shadow: bool = False, namespace: str = "default") -> dict:
     """
     Recall memories with attribution signals explaining the ranking.
+    Shadow memories are excluded unless include_shadow is True.
     """
     if not query or not query.strip():
         return error_response("invalid_argument", "query must not be empty")
@@ -358,7 +429,11 @@ def memoire_recall_explained(query: str, ctx: Context, top_k: int = 5, namespace
     try:
         def op(memoire: Memoire) -> List[Dict[str, Any]]:
             if hasattr(memoire, "recall_explained"):
-                explained = memoire.recall_explained(query, top_k=top_k)
+                explained = [
+                    item for item in memoire.recall_explained(
+                        query, top_k=_fetch_k(top_k, include_shadow))
+                    if include_shadow or item.memory.state != "shadow"
+                ][:top_k]
                 return [
                     {
                         "memory": serialize_memory(item.memory),
@@ -381,7 +456,11 @@ def memoire_recall_explained(query: str, ctx: Context, top_k: int = 5, namespace
                     "rank_score": memory.score,
                     "reasons": ["legacy binding fallback"],
                 }
-                for memory in memoire.recall(query, top_k=top_k)
+                for memory in [
+                    m for m in memoire.recall(
+                        query, top_k=_fetch_k(top_k, include_shadow))
+                    if include_shadow or m.state != "shadow"
+                ][:top_k]
             ]
 
         return ok_response(attributions=run_memoire(ctx, op, namespace=namespace))
@@ -463,7 +542,7 @@ def memoire_namespace_health(ctx: Context, probes: List[str] | None = None, name
 @mcp.tool()
 def memoire_status(ctx: Context, namespace: str = "default") -> dict:
     """
-    Get the overall health, stats, and top trusted lessons from the database.
+    Report the resolved database path, its size on disk, and the memory count for the namespace.
     """
     db_path = get_db_path(ctx)
     try:
@@ -485,7 +564,7 @@ def memoire_status(ctx: Context, namespace: str = "default") -> dict:
 @mcp.tool()
 def memoire_health() -> dict:
     """
-    Verify that the MCP server can load the native Memoire shared library.
+    Verify that the MCP server can import the native Memoire extension.
     """
     return startup_health_check()
 
@@ -556,9 +635,11 @@ def memoire_clear(ctx: Context, namespace: str = "default") -> dict:
 def memoire_export(ctx: Context, namespace: str = "default") -> dict:
     """
     Export all non-archived memories in the specified namespace.
+    The snapshot is returned under the `snapshot` key; pass that value to memoire_import.
     """
     try:
-        return run_memoire(ctx, lambda memoire: memoire.export_namespace(), namespace=namespace)
+        snapshot = run_memoire(ctx, lambda memoire: memoire.export_namespace(), namespace=namespace)
+        return ok_response(snapshot=snapshot)
     except Exception as e:
         logger.exception("event=memoire_export_failed")
         return error_response("export_failed", str(e))
@@ -567,13 +648,18 @@ def memoire_export(ctx: Context, namespace: str = "default") -> dict:
 @mcp.tool()
 def memoire_import(snapshot: dict, ctx: Context, namespace: str = "default") -> dict:
     """
-    Import a memory snapshot into the specified namespace.
+    Import a memory snapshot (the `snapshot` value from memoire_export) into the specified namespace.
     """
     if not isinstance(snapshot, dict):
         return error_response("invalid_argument", "snapshot must be a dict")
+    if not isinstance(snapshot.get("memories"), list):
+        return error_response(
+            "invalid_argument",
+            "snapshot must contain a 'memories' list, as returned by memoire_export",
+        )
     try:
         count = run_memoire(ctx, lambda memoire: memoire.import_namespace(snapshot), namespace=namespace)
-        return {"ok": True, "imported": count}
+        return ok_response(imported=count)
     except Exception as e:
         logger.exception("event=memoire_import_failed")
         return error_response("import_failed", str(e))
