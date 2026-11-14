@@ -1,5 +1,7 @@
 [package]
-name = "memoire"
+# Package (crates.io) name. The library target keeps `name = "memoire"` below so
+# `use memoire::...`, libmemoire.so and the C ABI are unchanged.
+name = "memoire-engine"
 version = "0.1.0"
 edition = "2021"
 description = "A local-first, embeddable long-term memory engine for AI coding agents"

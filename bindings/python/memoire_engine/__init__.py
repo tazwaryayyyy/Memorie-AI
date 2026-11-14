@@ -1,14 +1,14 @@
 """
-memoire — Python bindings for the Memoire semantic memory engine.
+memoire_engine — Python bindings for the Memoire semantic memory engine.
 
-Install:
-    pip install memoire   (once published to PyPI)
+Install from a source checkout (needs a Rust toolchain), inside a virtualenv:
+    cd bindings/python && maturin develop --release
 
-Or use directly from the source tree — just build the Rust library first:
-    cargo build --release
+The PyPI distribution name (provisionally ``memoire-engine``) is not published
+yet. The unrelated PyPI project ``memoire`` is a different package.
 
 Usage:
-    from memoire import Memoire
+    from memoire_engine import Memoire
 
     with Memoire("agent.db") as m:
         m.remember("Fixed the JWT issuer validation bug in auth middleware")
@@ -26,6 +26,6 @@ __all__ = [
     "MemoryPolicy",
     "PolicyDecision",
     # Framework adapters (opt-in — requires langchain or llama-index-core)
-    # from memoire.adapters import MemoireRetriever, MemoireIndex
+    # from memoire_engine.adapters import MemoireRetriever, MemoireIndex
 ]
 __version__ = "0.1.0"

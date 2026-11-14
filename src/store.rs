@@ -155,6 +155,10 @@ impl StoreInner {
     }
 }
 
+/// Largest `reinforcement_count` accepted from an imported snapshot. A sanity
+/// bound against absurd values, not a claim about how much trust is deserved.
+pub const IMPORT_MAX_REINFORCEMENT: i64 = 1_000;
+
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS memories (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1620,6 +1624,12 @@ impl Store {
         }))
     }
 
+    /// Overwrite metadata on freshly imported rows. Every value is clamped here,
+    /// at the only write site, so no caller can store out-of-range metadata:
+    /// `trust_ema` and `confidence`/`importance_base` to `[0, 1]` (non-finite
+    /// `trust_ema` becomes NULL, i.e. "recompute"), `reinforcement_count` to
+    /// `[0, IMPORT_MAX_REINFORCEMENT]` and `created_at` to `[0, now]`.
+    /// These are sanity bounds, not a trust model.
     pub fn update_imported_metadata(
         &self,
         ids: &[i64],
@@ -1632,6 +1642,24 @@ impl Store {
         if ids.is_empty() {
             return Ok(());
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let unit = |v: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
+        };
+        let trust_ema = trust_ema
+            .filter(|t| t.is_finite())
+            .map(|t| t.clamp(0.0, 1.0));
+        let reinforcement_count = reinforcement_count.clamp(0, IMPORT_MAX_REINFORCEMENT);
+        let importance_base = unit(importance_base);
+        let confidence = unit(confidence);
+        let created_at = created_at.map(|c| c.clamp(0, now));
         let conn = self.pool.get()?;
         let placeholders = ids
             .iter()

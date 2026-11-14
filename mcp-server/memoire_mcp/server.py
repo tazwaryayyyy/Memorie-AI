@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import math
@@ -11,22 +12,23 @@ from urllib.parse import unquote, urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
 
-# Prefer an installed `memoire` (pip / uv / `maturin develop`). Only when it is
-# not importable at all do we fall back to the source checkout's
+# Prefer an installed `memoire_engine` (pip / uv / `maturin develop`). Only when
+# it is not importable at all do we fall back to the source checkout's
 # bindings/python, appended (not inserted) so an installed copy always wins.
 # In a packaged install that directory does not exist and nothing is added.
-_SOURCE_BINDINGS = Path(__file__).resolve().parent.parent / "bindings" / "python"
+# Layout: <repo>/mcp-server/memoire_mcp/server.py -> parents[2] is the repo root.
+_SOURCE_BINDINGS = Path(__file__).resolve().parents[2] / "bindings" / "python"
 try:
-    import memoire  # noqa: F401
+    import memoire_engine  # noqa: F401
 except ModuleNotFoundError as _exc:
-    if _exc.name != "memoire":
+    if _exc.name != "memoire_engine":
         raise
-    if (_SOURCE_BINDINGS / "memoire").is_dir():
+    if (_SOURCE_BINDINGS / "memoire_engine").is_dir():
         sys.path.append(str(_SOURCE_BINDINGS))
     # Otherwise the import below raises the normal ModuleNotFoundError.
 
-from memoire import Memoire  # noqa: E402
-from memoire.client import _get_lib  # noqa: E402
+from memoire_engine import Memoire  # noqa: E402
+from memoire_engine.client import _get_lib  # noqa: E402
 
 # Setup structured logging
 
@@ -150,6 +152,40 @@ def _fetch_k(top_k: int, include_shadow: bool) -> int:
     return top_k if include_shadow else min(top_k * _SHADOW_OVERFETCH, _MAX_FETCH)
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def admin_tools_enabled() -> bool:
+    """Destructive / trust-affecting tools are opt-in, set by the operator."""
+    return os.environ.get("MEMOIRE_ENABLE_ADMIN_TOOLS", "").strip().lower() in _TRUTHY
+
+
+def admin_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Expose `fn` as an MCP tool only if MEMOIRE_ENABLE_ADMIN_TOOLS is truthy.
+
+    An LLM agent (and anything that can steer it, such as injected text in a
+    fetched page) must not be able to wipe or bulk-load memory by default.
+    The flag is read when the module is imported, which decides whether the
+    tool is listed at all, and again on every call as defence in depth.
+    """
+    @functools.wraps(fn)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        if not admin_tools_enabled():
+            logger.warning("event=admin_tool_denied tool=%s", fn.__name__)
+            return error_response(
+                "admin_tools_disabled",
+                f"{fn.__name__} is disabled by server configuration; the operator "
+                "can enable it with MEMOIRE_ENABLE_ADMIN_TOOLS=1.",
+            )
+        return fn(*args, **kwargs)
+
+    return mcp.tool()(guarded) if admin_tools_enabled() else guarded
+
+
+# Upper bound on one memoire_import call: every entry is re-embedded.
+_MAX_IMPORT_MEMORIES = 1000
+
+
 def run_memoire(ctx: Context, operation: Callable[[Memoire], T], namespace: str = "default") -> T:
     """Run one operation against the per-DB Memoire handle under its lock."""
     db_path = get_db_path(ctx)
@@ -159,7 +195,7 @@ def run_memoire(ctx: Context, operation: Callable[[Memoire], T], namespace: str 
 
 
 _NATIVE_EXTENSION_HINT = (
-    "The native Memoire extension (memoire.memoire, built with PyO3/maturin) "
+    "The native Memoire extension (memoire_engine.memoire_engine, built with PyO3/maturin) "
     "could not be loaded. From a source checkout, activate a virtualenv and run "
     "`maturin develop --release` inside bindings/python (needs a Rust toolchain), "
     "then start this server with that virtualenv's Python. MEMOIRE_LIB and "
@@ -199,17 +235,70 @@ def _file_uri_to_path(uri: Any) -> Optional[str]:
     return path
 
 
+class DbPathError(ValueError):
+    """The database location is not acceptable."""
+
+
+_MAX_MEMOIRE_PATH_FILE_CHARS = 4096
+
+
+def _read_memoire_path_override(project_root: str) -> Optional[str]:
+    """Return the resolved `.memoire_path` target, or None if not configured.
+
+    `.memoire_path` lives in the workspace, which may be a freshly cloned and
+    untrusted repository, so its target must resolve (symlinks included) to a
+    location inside the workspace root. Pointing elsewhere is what the explicit
+    MEMOIRE_DB_PATH / MEMOIRE_DB environment variables are for. The target is
+    deliberately not echoed in errors: the file could be a symlink to some
+    unrelated file whose first line would otherwise be disclosed.
+    """
+    marker = os.path.join(project_root, ".memoire_path")
+    if not os.path.isfile(marker):
+        return None
+    with open(marker, "r", encoding="utf-8", errors="replace") as f:
+        raw = f.read(_MAX_MEMOIRE_PATH_FILE_CHARS + 1)
+    if len(raw) > _MAX_MEMOIRE_PATH_FILE_CHARS:
+        raise DbPathError(".memoire_path is too large")
+    first_line = next((line.strip() for line in raw.splitlines() if line.strip()), "")
+    if not first_line:
+        return None
+    if "\x00" in first_line:
+        raise DbPathError(".memoire_path contains an invalid path")
+
+    root_real = os.path.realpath(project_root)
+    # An absolute first_line replaces root_real in join(); containment decides.
+    target = os.path.realpath(os.path.join(root_real, first_line))
+    try:
+        inside = os.path.commonpath([root_real, target]) == root_real
+    except ValueError:  # e.g. different drives on Windows
+        inside = False
+    if not inside or target == root_real:
+        raise DbPathError(
+            ".memoire_path must name a file inside the workspace root. To use a "
+            "database elsewhere, set MEMOIRE_DB_PATH explicitly."
+        )
+    return target
+
+
 def get_db_path(ctx: Context) -> str:
     """Resolve the database path.
+
+    Precedence, highest first:
+      1. MEMOIRE_DB_PATH, then MEMOIRE_DB: explicit operator configuration,
+         trusted as given (any location).
+      2. `<root>/.memoire_path`: workspace-controlled, so it must resolve
+         inside `<root>` (DbPathError otherwise).
+      3. `<root>/memoire.db`.
 
     Workspace root: the MCP spec's initialize params carry no workspace folder,
     so this normally falls back to the server's cwd. Clients that send
     non-standard `workspaceFolders` / `rootUri` extras in initialize are
     honoured via `session.client_params` (pydantic keeps extras).
-
-    DB path precedence: `<root>/.memoire_path` > MEMOIRE_DB_PATH > MEMOIRE_DB
-    > `<root>/memoire.db`.
     """
+    explicit = os.environ.get("MEMOIRE_DB_PATH") or os.environ.get("MEMOIRE_DB")
+    if explicit:
+        return os.path.normpath(explicit)
+
     project_root = os.getcwd()
 
     try:
@@ -229,18 +318,11 @@ def get_db_path(ctx: Context) -> str:
         # Safe fallback
         logger.warning("event=context_path_fallback error=%r", e)
 
-    custom_path_file = os.path.join(project_root, ".memoire_path")
-    if os.path.exists(custom_path_file):
-        with open(custom_path_file, "r", encoding="utf-8") as f:
-            path_override = f.read().strip()
-            if not os.path.isabs(path_override):
-                path_override = os.path.join(project_root, path_override)
-            return os.path.normpath(path_override)
+    override = _read_memoire_path_override(project_root)
+    if override:
+        return override
 
-    return os.path.normpath(os.environ.get(
-        "MEMOIRE_DB_PATH",
-        os.environ.get("MEMOIRE_DB", os.path.join(project_root, "memoire.db")),
-    ))
+    return os.path.normpath(os.path.join(project_root, "memoire.db"))
 
 
 def get_memoire(db_path: str, namespace: str = "default") -> Memoire:
@@ -544,8 +626,9 @@ def memoire_status(ctx: Context, namespace: str = "default") -> dict:
     """
     Report the resolved database path, its size on disk, and the memory count for the namespace.
     """
-    db_path = get_db_path(ctx)
+    db_path = None
     try:
+        db_path = get_db_path(ctx)
         total_memories = run_memoire(
             ctx, lambda memoire: memoire.count(), namespace=namespace)
 
@@ -618,10 +701,11 @@ def memoire_count(ctx: Context, namespace: str = "default") -> dict:
         return error_response("count_failed", str(e))
 
 
-@mcp.tool()
+@admin_tool
 def memoire_clear(ctx: Context, namespace: str = "default") -> dict:
     """
     Erase ALL memories. This cannot be undone.
+    Admin tool: only available when the server runs with MEMOIRE_ENABLE_ADMIN_TOOLS=1.
     """
     try:
         run_memoire(ctx, lambda memoire: memoire.clear(), namespace=namespace)
@@ -645,10 +729,13 @@ def memoire_export(ctx: Context, namespace: str = "default") -> dict:
         return error_response("export_failed", str(e))
 
 
-@mcp.tool()
+@admin_tool
 def memoire_import(snapshot: dict, ctx: Context, namespace: str = "default") -> dict:
     """
     Import a memory snapshot (the `snapshot` value from memoire_export) into the specified namespace.
+    Only each memory's content is used: trust metadata in the snapshot is ignored, so imported
+    memories start as untrusted as freshly remembered ones.
+    Admin tool: only available when the server runs with MEMOIRE_ENABLE_ADMIN_TOOLS=1.
     """
     if not isinstance(snapshot, dict):
         return error_response("invalid_argument", "snapshot must be a dict")
@@ -657,8 +744,17 @@ def memoire_import(snapshot: dict, ctx: Context, namespace: str = "default") -> 
             "invalid_argument",
             "snapshot must contain a 'memories' list, as returned by memoire_export",
         )
+    if len(snapshot["memories"]) > _MAX_IMPORT_MEMORIES:
+        return error_response(
+            "invalid_argument",
+            f"snapshot has more than {_MAX_IMPORT_MEMORIES} memories; import it in smaller batches",
+        )
     try:
-        count = run_memoire(ctx, lambda memoire: memoire.import_namespace(snapshot), namespace=namespace)
+        count = run_memoire(
+            ctx,
+            lambda memoire: memoire.import_namespace(snapshot, preserve_trust=False),
+            namespace=namespace,
+        )
         return ok_response(imported=count)
     except Exception as e:
         logger.exception("event=memoire_import_failed")

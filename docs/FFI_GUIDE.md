@@ -62,7 +62,7 @@ lib.memoire_free(h_ns)
 Or use the included wrapper (zero boilerplate):
 
 ```python
-from memoire import Memoire  # from bindings/python/
+from memoire_engine import Memoire  # PyO3 package from bindings/python/ (maturin develop)
 
 with Memoire("agent.db") as m:
     m.remember("Fixed the auth bug today")

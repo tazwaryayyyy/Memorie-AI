@@ -6,6 +6,7 @@
 *.so
 *.dylib
 *.dll
+*.pyd
 .fastembed_cache/
 .pytest_cache/
 pytest-cache-files-*/

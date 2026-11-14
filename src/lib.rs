@@ -40,6 +40,28 @@ use store::{Memory, Store};
 #[cfg(target_arch = "wasm32")]
 pub use quality::{cosine_similarity, detect_polarity, NliChecker, NliLabel, ScoringConfig};
 
+/// How much of a snapshot's per-memory metadata an import may carry over.
+///
+/// A snapshot is data from outside the trust boundary: it can come from an
+/// agent, a downloaded file or a prompt-injected tool call. Trust in Memoire is
+/// meant to be *earned locally* through outcome feedback, so by default an
+/// import re-ingests content only.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImportTrust {
+    /// Re-ingest `content` through the normal `remember()` path and ignore every
+    /// metadata field in the snapshot (`trust_ema`, `reinforcement_count`,
+    /// `importance_base`, `confidence`, `created_at`). An imported memory is then
+    /// no more trusted than one stored with `remember()`. This is the default.
+    #[default]
+    Reset,
+    /// Restore the snapshot's metadata, clamped to explicit bounds (see
+    /// [`store::Store::update_imported_metadata`]). Meant for restoring your own
+    /// backup. "Bounded" is not "verified": a hostile snapshot can still claim the
+    /// maximum in-range trust, so never use this for snapshots you did not export.
+    PreserveBounded,
+}
+
 /// The central Memoire instance.
 ///
 /// Not available on `wasm32` targets â€” use the quality module directly for
@@ -417,6 +439,9 @@ impl Memoire {
         self.recall_with_options(query, top_k, false)
     }
 
+    /// `include_shadow` is a legacy name: `false` returns `active` and `shadow`
+    /// rows (shadow rows are ranked with a reduced trust weight), and `true`
+    /// additionally returns `probationary` rows. See `Store::search`.
     pub fn recall_with_options(
         &self,
         query: &str,
@@ -555,8 +580,19 @@ impl Memoire {
         self.store.export_namespace()
     }
 
-    /// Import a memory snapshot into the current namespace.
+    /// Import a memory snapshot into the current namespace, treating it as
+    /// untrusted: only `content` is used ([`ImportTrust::Reset`]).
     pub fn import_namespace(&self, snapshot: &serde_json::Value) -> Result<usize> {
+        self.import_namespace_with(snapshot, ImportTrust::Reset)
+    }
+
+    /// Import a memory snapshot, choosing how much of its metadata to keep.
+    /// See [`ImportTrust`].
+    pub fn import_namespace_with(
+        &self,
+        snapshot: &serde_json::Value,
+        trust: ImportTrust,
+    ) -> Result<usize> {
         let memories = snapshot
             .get("memories")
             .and_then(|v| v.as_array())
@@ -572,28 +608,31 @@ impl Memoire {
                 Some(c) => c,
                 None => continue,
             };
-            let trust_ema = mem
-                .get("trust_ema")
-                .and_then(|v| v.as_f64())
-                .map(|f| f as f32);
-            let reinforcement_count = mem
-                .get("reinforcement_count")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let importance_base = mem
-                .get("importance_base")
-                .and_then(|v| v.as_f64())
-                .map(|f| f as f32)
-                .unwrap_or(0.5);
-            let confidence = mem
-                .get("confidence")
-                .and_then(|v| v.as_f64())
-                .map(|f| f as f32)
-                .unwrap_or(0.5);
-            let created_at = mem.get("created_at").and_then(|v| v.as_i64());
 
             let ids = self.remember(content)?;
-            if !ids.is_empty() {
+            if ids.is_empty() {
+                continue;
+            }
+            if trust == ImportTrust::PreserveBounded {
+                let trust_ema = mem
+                    .get("trust_ema")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32);
+                let reinforcement_count = mem
+                    .get("reinforcement_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let importance_base = mem
+                    .get("importance_base")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32)
+                    .unwrap_or(0.5);
+                let confidence = mem
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32)
+                    .unwrap_or(0.5);
+                let created_at = mem.get("created_at").and_then(|v| v.as_i64());
                 self.store.update_imported_metadata(
                     &ids,
                     trust_ema,
@@ -602,8 +641,8 @@ impl Memoire {
                     confidence,
                     created_at,
                 )?;
-                imported_count += 1;
             }
+            imported_count += 1;
         }
         Ok(imported_count)
     }

@@ -1,32 +1,23 @@
 """
-pytest configuration for the Memoire Python test suite.
-Ensures the compiled library can be found before any test runs.
-"""
-import os
-import sys
-from pathlib import Path
+pytest configuration for the Memoire Python binding tests.
 
+The tests need the compiled PyO3 extension (memoire_engine.memoire_engine).
+Build it into the active virtualenv first:
+
+    cd bindings/python && maturin develop --release
+"""
 import pytest
 
 
 def pytest_configure(config):
-    """Set MEMOIRE_LIB if not already set, searching for the release build."""
-    if os.environ.get("MEMOIRE_LIB"):
-        return  # already set — trust the caller
+    """Fail fast with build instructions if the native extension is missing."""
+    from memoire_engine import client
 
-    repo_root = Path(__file__).parent.parent.parent.parent
-    candidates = {
-        "linux":  repo_root / "target" / "release" / "libmemoire.so",
-        "darwin": repo_root / "target" / "release" / "libmemoire.dylib",
-        "win32":  repo_root / "target" / "release" / "memoire.dll",
-    }
-    lib = candidates.get(sys.platform)
-    if lib and lib.exists():
-        os.environ["MEMOIRE_LIB"] = str(lib)
-    else:
+    if client._NativeMemoire is None:
         pytest.exit(
-            "\nCould not find compiled libmemoire.\n"
-            "Run:  cargo build --release\n"
-            "Then: pytest bindings/python/tests/\n",
+            "\nThe native memoire_engine extension is not importable "
+            f"({client._NATIVE_IMPORT_ERROR!r}).\n"
+            "Run, inside your virtualenv:  cd bindings/python && maturin develop --release\n"
+            "Then:                         pytest tests/\n",
             returncode=1,
         )

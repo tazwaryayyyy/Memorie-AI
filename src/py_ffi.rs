@@ -3,7 +3,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use std::sync::{Arc, Mutex};
 
-pyo3::create_exception!(memoire, MemoireError, PyException);
+pyo3::create_exception!(memoire_engine, MemoireError, PyException);
 
 #[pyclass(name = "Memory")]
 #[derive(Clone)]
@@ -206,11 +206,19 @@ impl PyMemoire {
         Ok(json)
     }
 
-    fn import_namespace(&self, snapshot_str: &str) -> PyResult<usize> {
+    /// `preserve_trust=False` (default) imports content only; `True` restores the
+    /// snapshot's trust metadata within bounds. See `memoire::ImportTrust`.
+    #[pyo3(signature = (snapshot_str, preserve_trust = false))]
+    fn import_namespace(&self, snapshot_str: &str, preserve_trust: bool) -> PyResult<usize> {
         let snapshot: serde_json::Value = serde_json::from_str(snapshot_str)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
+        let policy = if preserve_trust {
+            crate::ImportTrust::PreserveBounded
+        } else {
+            crate::ImportTrust::Reset
+        };
         let count = lock!(self)
-            .import_namespace(&snapshot)
+            .import_namespace_with(&snapshot, policy)
             .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
         Ok(count)
     }
@@ -256,7 +264,7 @@ impl PyMemoire {
 }
 
 #[pymodule]
-fn memoire(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn memoire_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemoire>()?;
     m.add_class::<PyMemory>()?;
     m.add_class::<PyRecallAttribution>()?;

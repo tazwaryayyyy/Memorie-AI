@@ -11,9 +11,9 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]==1.27.1",
-    # PROVISIONAL distribution name for the Python SDK (import name stays
-    # `memoire`). The unrelated PyPI project "memoire" must not be used here.
-    # Final name is an owner decision; do not publish before it is made.
+    # Python SDK (import package `memoire_engine`). The unrelated PyPI project
+    # "memoire" must never be used here. Distribution name `memoire-engine` is
+    # unregistered until the owner publishes it.
     "memoire-engine>=0.1.0,<0.2.0",
 ]
 
@@ -23,7 +23,7 @@ dev = [
 ]
 
 [project.scripts]
-memoire-mcp = "server:main"
+memoire-mcp = "memoire_mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/tazwaryayyyy/Memorie-AI"
@@ -32,7 +32,7 @@ Issues = "https://github.com/tazwaryayyyy/Memorie-AI/issues"
 Changelog = "https://github.com/tazwaryayyyy/Memorie-AI/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
-py-modules = ["server"]
+packages = ["memoire_mcp"]
 
 [tool.uv.sources]
 memoire-engine = { path = "../bindings/python", editable = true }

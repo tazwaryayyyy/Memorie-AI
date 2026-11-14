@@ -136,6 +136,9 @@ struct ImportReq {
     #[serde(default = "default_ns")]
     ns: String,
     snapshot: serde_json::Value,
+    /// Restore the snapshot's trust metadata (clamped). Default: content only.
+    #[serde(default)]
+    preserve_trust: bool,
 }
 
 #[derive(Deserialize)]
@@ -346,7 +349,14 @@ async fn import_handler(
     Json(req): Json<ImportReq>,
 ) -> impl IntoResponse {
     match get_or_create(&cache, &req.db, &req.ns).await {
-        Ok(m) => match m.import_namespace(&req.snapshot) {
+        Ok(m) => match m.import_namespace_with(
+            &req.snapshot,
+            if req.preserve_trust {
+                memoire::ImportTrust::PreserveBounded
+            } else {
+                memoire::ImportTrust::Reset
+            },
+        ) {
             Ok(count) => (
                 StatusCode::OK,
                 Json(json!({ "ok": true, "imported": count })),

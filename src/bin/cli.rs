@@ -36,6 +36,9 @@ COMMANDS:
     clear    [--confirm]          Erase ALL memories in the namespace (requires --confirm)
     export   [--output FILE]      Export namespace snapshot to JSON (stdout or file)
     import   <FILE>               Import a JSON snapshot (use "-" to read stdin)
+             [--preserve-trust]   Restore trust metadata from the snapshot (bounded).
+                                  Default: content only, trust is reset. Use this only
+                                  for snapshots you exported yourself.
     ingest   <FILE>               Ingest memories line-by-line from a plain-text file
     info                          Show database info and stats
     cache-models                  Pre-download embedding models to local cache
@@ -83,6 +86,7 @@ enum Command {
     /// Import a JSON snapshot into the current namespace.
     Import {
         file: String,
+        preserve_trust: bool,
     },
     /// Ingest memories line-by-line from a plain-text file (legacy import).
     Ingest {
@@ -207,11 +211,20 @@ fn parse_args() -> Result<Args, String> {
         }
 
         "import" => {
-            let file = raw
-                .get(i)
-                .cloned()
-                .ok_or("import requires a file path (or \"-\" for stdin)")?;
-            Command::Import { file }
+            let mut file = None;
+            let mut preserve_trust = false;
+            for arg in raw.get(i..).unwrap_or(&[]) {
+                if arg == "--preserve-trust" {
+                    preserve_trust = true;
+                } else if file.is_none() {
+                    file = Some(arg.clone());
+                }
+            }
+            let file = file.ok_or("import requires a file path (or \"-\" for stdin)")?;
+            Command::Import {
+                file,
+                preserve_trust,
+            }
         }
 
         "ingest" => {
@@ -339,7 +352,10 @@ fn run() -> anyhow::Result<()> {
             }
         }
 
-        Command::Import { file } => {
+        Command::Import {
+            file,
+            preserve_trust,
+        } => {
             let json_str = if file == "-" {
                 let mut buf = String::new();
                 io::stdin()
@@ -355,8 +371,21 @@ fn run() -> anyhow::Result<()> {
             let snapshot: serde_json::Value = serde_json::from_str(&json_str)
                 .map_err(|e| anyhow::anyhow!("invalid JSON snapshot: {e}"))?;
 
-            let count = m.import_namespace(&snapshot)?;
-            println!("✓ imported {count} memories into namespace '{}'", args.ns);
+            let policy = if preserve_trust {
+                memoire::ImportTrust::PreserveBounded
+            } else {
+                memoire::ImportTrust::Reset
+            };
+            let count = m.import_namespace_with(&snapshot, policy)?;
+            println!(
+                "✓ imported {count} memories into namespace '{}' ({})",
+                args.ns,
+                if preserve_trust {
+                    "trust metadata restored within bounds"
+                } else {
+                    "content only; trust metadata reset"
+                }
+            );
         }
 
         Command::Ingest { path } => {

@@ -9,20 +9,13 @@ Memoire ships as two layers:
 - Rust native library and CLI from `cargo build --release`
 - Python packages from `bindings/python` and `mcp-server`
 
-The Python packages do not bundle platform-specific native libraries yet. Users must either:
+The Python SDK (`bindings/python`, import name `memoire_engine`) is a PyO3 extension
+built with maturin, so it is compiled per platform; there is no separate native
+library to locate and `MEMOIRE_LIB` / `MEMOIRE_HOME` are not used by it. Until wheels
+are published, users build it from a source checkout with a Rust toolchain.
 
-- build the Rust library locally, or
-- download the matching native-library artifact from a GitHub Release.
-
-Set `MEMOIRE_LIB` to the native library path when running from installed Python packages:
-
-| Platform | Library |
-|---|---|
-| Linux | `libmemoire.so` |
-| macOS | `libmemoire.dylib` |
-| Windows | `memoire.dll` |
-
-`MEMOIRE_HOME` may point to a directory containing the library, a `lib/` directory containing it, or a source checkout with `target/release/`.
+The C library (`libmemoire.so` / `libmemoire.dylib` / `memoire.dll`) is still built
+for the C FFI and attached to GitHub Releases separately.
 
 ## Tag Release
 
@@ -30,7 +23,7 @@ Set `MEMOIRE_LIB` to the native library path when running from installed Python 
    - `Cargo.toml`
    - `bindings/python/pyproject.toml`
    - `mcp-server/pyproject.toml`
-   - `bindings/python/memoire/__init__.py`
+   - `bindings/python/memoire_engine/__init__.py`
 2. Update `CHANGELOG.md`.
 3. Run:
 
@@ -59,24 +52,21 @@ The release workflow builds Linux, macOS, and Windows native-library zip artifac
 ```bash
 git clone https://github.com/tazwaryayyyy/Memorie-AI
 cd Memorie-AI
-cargo build --release
-
 python -m venv .venv
-. .venv/bin/activate
-python -m pip install ./bindings/python
+. .venv/bin/activate                  # Windows: .venv\Scripts\activate
+python -m pip install maturin
+python -m pip install ./bindings/python        # builds the PyO3 extension
 python -m pip install "mcp[cli]==1.27.1"
 python -m pip install --no-deps ./mcp-server
 
-export MEMOIRE_LIB="$PWD/target/release/libmemoire.so"
-python -c "from memoire.client import _get_lib; print(_get_lib())"
-python -c "import server; print(server.startup_health_check())"
+python -c "from memoire_engine.client import _get_lib; print(_get_lib())"
+python -c "import memoire_mcp.server as s; print(s.startup_health_check())"
+python -c "import importlib.util as u; assert u.find_spec('server') is None and u.find_spec('memoire') is None"
 ```
-
-On Windows, set `MEMOIRE_LIB` to `target\release\memoire.dll`.
 
 ## Model Download And Offline Use
 
-The first real `remember()` or `recall()` call initializes FastEmbed and may download `all-MiniLM-L6-v2` into the Hugging Face cache. `memoire_health` only checks the native library; it does not download the model.
+The first real `remember()` or `recall()` call initializes FastEmbed and may download `all-MiniLM-L6-v2` into the Hugging Face cache. `memoire_health` only checks that the native extension imports; it does not download the model.
 
 For offline machines:
 
