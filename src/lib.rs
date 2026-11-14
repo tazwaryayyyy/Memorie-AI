@@ -329,7 +329,7 @@ impl Memoire {
         self
     }
 
-    pub fn with_nli_model(self, path: &std::path::Path) -> anyhow::Result<Self> {
+    pub fn with_nli_model(mut self, path: &std::path::Path) -> anyhow::Result<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let checker = quality::OnnxNliChecker::from_path(path)?;

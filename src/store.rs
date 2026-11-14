@@ -876,8 +876,9 @@ impl Store {
         Ok(id)
     }
 
-    pub fn set_nli_checker(&self, checker: OnnxNliChecker) -> Result<()> {
-        let _ = checker;
+    /// Install an ONNX NLI model. Previously a silent no-op (the checker was dropped).
+    pub fn set_nli_checker(&mut self, checker: OnnxNliChecker) -> Result<()> {
+        self.nli_checker = NliChecker::with_onnx(checker);
         Ok(())
     }
 
@@ -1105,8 +1106,10 @@ impl Store {
 
     /// NLI-enhanced semantic contradiction detection.
     ///
-    /// When `config.use_nli_contradiction` is true (default), uses `NliChecker`
-    /// which applies a three-signal ensemble:
+    /// When `config.use_nli_contradiction` is true (default), uses `NliChecker`.
+    /// If an ONNX NLI model is installed (`Memoire::with_nli_model`) its label is
+    /// authoritative for pairs above the cosine gate; otherwise `NliChecker` applies
+    /// a three-signal lexical ensemble:
     ///   1. Cosine similarity gate (same topic cluster, threshold from config)
     ///   2. Polarity opposition (lexical negation)
     ///   3. Negation asymmetry score (how many negators appear in one but not the other)
@@ -1948,6 +1951,44 @@ mod tests {
         a.clear().unwrap();
         assert_eq!(a.count().unwrap(), 0);
         assert_eq!(b.count().unwrap(), 1, "a.clear() must not wipe tenant_b");
+    }
+
+    #[test]
+    fn test_authoritative_nli_neutral_prevents_supersede() {
+        use crate::quality::{NliChecker, NliClassifier};
+        use std::sync::Arc;
+
+        struct AlwaysNeutral;
+        impl NliClassifier for AlwaysNeutral {
+            fn classify(&self, _p: &str, _h: &str) -> anyhow::Result<NliLabel> {
+                Ok(NliLabel::Neutral)
+            }
+        }
+
+        let emb = [0.577_f32, 0.577, 0.577];
+        let seed = |store: &Store| -> i64 {
+            for text in ["never use float for money", "always use float for money"] {
+                let meta = QualityMeta::default_active(text);
+                let id = store.insert_with_quality(text, &emb, &meta).unwrap();
+                if text.starts_with("always") {
+                    return id;
+                }
+            }
+            unreachable!()
+        };
+
+        // Control: lexical heuristic only -> the pair is a contradiction, one side archived.
+        let lexical = Store::in_memory().unwrap();
+        let id = seed(&lexical);
+        lexical.resolve_contradictions_for_id(id).unwrap();
+        assert_eq!(lexical.count().unwrap(), 1);
+
+        // Authoritative model says Neutral -> nothing is superseded.
+        let mut modelled = Store::in_memory().unwrap();
+        modelled.nli_checker = NliChecker::with_classifier(Arc::new(AlwaysNeutral));
+        let id = seed(&modelled);
+        modelled.resolve_contradictions_for_id(id).unwrap();
+        assert_eq!(modelled.count().unwrap(), 2);
     }
 
     #[test]
