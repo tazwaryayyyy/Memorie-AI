@@ -5,9 +5,9 @@ Shows how to wire Memoire into an OpenAI-compatible coding agent using
 function calling. Works with OpenAI, Groq, Mistral, or any provider
 that follows the OpenAI tools spec.
 
-Install:
-    pip install openai
-    cargo build --release
+Install (inside a virtualenv; needs a Rust toolchain):
+    pip install openai maturin
+    cd bindings/python && maturin develop --release
 
 Set:
     export OPENAI_API_KEY=sk-...    (or GROQ_API_KEY= / MISTRAL_API_KEY= etc.)

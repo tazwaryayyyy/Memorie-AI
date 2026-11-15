@@ -13,8 +13,8 @@ Shows three arms:
 
 The output is designed to be screenshot-worthy for a judge panel.
 
-Usage:
-  cargo build --release
+Usage (inside a virtualenv; needs a Rust toolchain):
+  cd bindings/python && maturin develop --release && cd ../..
   python examples/brutal_moment_demo.py
 """
 
@@ -100,7 +100,7 @@ def run_with_trust() -> None:
                 "Never use float for money. Use Decimal with explicit cent precision. "
                 "Previous billing bug caused by float rounding errors in production."
             )
-            ids = m.remember(lesson)
+            ids = m.remember_ids(lesson)
             stored_id = ids[0] if ids else None
             print(
                 f"    → Failure detected. Stored corrective memory (id={stored_id}).")
@@ -126,7 +126,7 @@ def run_with_trust() -> None:
         for d in decisions:
             mem = d.memory
             print(
-                f"    → \"{mem.content[:55]}{'\u2026' if len(mem.content) > 55 else ''}\" "
+                f"    → \"{mem.content[:55]}{'…' if len(mem.content) > 55 else ''}\" "
                 f"| score={mem.score:.2f} | trust={mem.trust:.2f} "
                 f"| unc={mem.uncertainty:.2f} | action={d.action.upper()}"
             )
@@ -203,7 +203,7 @@ def run_with_failure_feedback() -> None:
             "for production speed. Patched critical performance incident. "
             "Test metrics confirmed improved throughput."
         )
-        wrong_ids = m.remember(wrong_lesson)
+        wrong_ids = m.remember_ids(wrong_lesson)
         wrong_id = wrong_ids[0] if wrong_ids else None
 
         mems_initial = m.recall("money precision billing", top_k=1)
@@ -272,7 +272,7 @@ def run_with_failure_feedback() -> None:
             "Never use float for money. Use Decimal with explicit cent precision. "
             "Previous billing bug caused by float rounding errors in production."
         )
-        correct_ids = m.remember(correct_lesson)
+        correct_ids = m.remember_ids(correct_lesson)
         correct_id = correct_ids[0] if correct_ids else None
         print(f"\n  \u2192 Stored correct lesson (id={correct_id})")
 

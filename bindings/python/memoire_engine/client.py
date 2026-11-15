@@ -99,7 +99,9 @@ class Memoire:
             content: Any text.
 
         Returns:
-            Number of chunks stored (â‰¥ 1).
+            Number of chunks newly stored. This can be 0 for blank input, for
+            exact-duplicate chunks, or for chunks rejected at ingestion. Use
+            :meth:`remember_ids` if you need the ids of what was stored.
         """
         self._check_open()
         if not isinstance(content, str):
@@ -111,6 +113,32 @@ class Memoire:
         except Exception as e:
             raise MemoireError(f"remember() failed: {e}") from e
 
+    def remember_ids(self, content: str) -> List[int]:
+        """
+        Like :meth:`remember`, but return the ids of the chunks actually stored.
+
+        The ids are what :meth:`reinforce_if_used`, :meth:`penalize_if_used`,
+        :meth:`forget` and :meth:`resolve_contradictions` take.
+
+        Args:
+            content: Any text.
+
+        Returns:
+            Row ids in chunk order. The list can be shorter than the number of
+            chunks, or empty, when a chunk is an exact duplicate of an existing
+            memory (the existing id is not returned) or is rejected at
+            ingestion. Blank input returns ``[]``.
+        """
+        self._check_open()
+        if not isinstance(content, str):
+            raise TypeError(f"content must be str, got {type(content).__name__}")
+        if not content.strip():
+            return []
+        try:
+            return list(self._impl.remember_ids(content))
+        except Exception as e:
+            raise MemoireError(f"remember_ids() failed: {e}") from e
+
     def recall(self, query: str, top_k: int = 5) -> List[Memory]:
         """
         Return the `top_k` memories most semantically similar to `query`.
@@ -120,7 +148,7 @@ class Memoire:
             top_k: Maximum number of results to return (default 5).
 
         Returns:
-            List of Memory objects, sorted by score descending (0â€“1).
+            List of Memory objects, sorted by score descending (0–1).
         """
         self._check_open()
         if not isinstance(query, str):
@@ -267,7 +295,7 @@ class Memoire:
         if self._impl is None:
             raise MemoireError("This Memoire instance has been closed.")
 
-    # â”€â”€â”€ Convenience helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── Convenience helpers ──────────────────────────────────────────────────
 
     def remember_lines(self, text: str) -> int:
         """

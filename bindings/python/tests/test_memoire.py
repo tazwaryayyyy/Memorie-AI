@@ -44,6 +44,41 @@ class TestRemember:
             m.remember(42)  # type: ignore
 
 
+# ─── remember_ids ────────────────────────────────────────────────────────────
+
+class TestRememberIds:
+    def test_returns_list_of_int_ids(self, m):
+        ids = m.remember_ids("Fixed null pointer in auth middleware")
+        assert isinstance(ids, list)
+        assert len(ids) >= 1
+        assert all(isinstance(i, int) for i in ids)
+
+    def test_id_matches_recalled_memory(self, m):
+        ids = m.remember_ids("Fixed null pointer in auth middleware")
+        results = m.recall("authentication bug", top_k=1)
+        assert results and results[0].id == ids[0]
+
+    def test_ids_are_usable_with_forget(self, m):
+        ids = m.remember_ids("temporary memory to forget")
+        before = m.count()
+        assert m.forget(ids[0]) is True
+        assert m.count() == before - 1
+
+    def test_blank_input_returns_empty_list(self, m):
+        assert m.remember_ids("   ") == []
+        assert m.count() == 0
+
+    def test_exact_duplicate_returns_empty_list(self, m):
+        text = "Fixed null pointer in auth middleware"
+        assert m.remember_ids(text)
+        assert m.remember_ids(text) == []
+        assert m.remember(text) == 0  # remember() still returns an int count
+
+    def test_type_error_on_non_string(self, m):
+        with pytest.raises(TypeError):
+            m.remember_ids(42)  # type: ignore
+
+
 # ─── recall ──────────────────────────────────────────────────────────────────
 
 class TestRecall:

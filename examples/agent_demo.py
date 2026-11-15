@@ -7,6 +7,12 @@ Usage:
 
 Requirements:
     Compile the library first: cargo build --release
+
+Note:
+    This demo calls the C ABI directly through ctypes (src/ffi.rs,
+    include/memoire.h) and loads target/release/libmemoire.{so,dylib} or
+    memoire.dll. It does NOT use the `memoire_engine` Python package, which is
+    a separate PyO3 build (cd bindings/python && maturin develop --release).
 """
 
 import ctypes
@@ -44,7 +50,9 @@ lib.memoire_remember.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
 lib.memoire_remember.restype  = ctypes.c_int
 
 lib.memoire_recall.argtypes   = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
-lib.memoire_recall.restype    = ctypes.c_char_p
+# c_void_p, NOT c_char_p: ctypes would copy a c_char_p result into a Python
+# bytes object and drop the original pointer, which memoire_free_string needs.
+lib.memoire_recall.restype    = ctypes.c_void_p
 
 lib.memoire_forget.argtypes   = [ctypes.c_void_p, ctypes.c_int64]
 lib.memoire_forget.restype    = ctypes.c_int
@@ -55,7 +63,7 @@ lib.memoire_count.restype     = ctypes.c_int64
 lib.memoire_clear.argtypes    = [ctypes.c_void_p]
 lib.memoire_clear.restype     = ctypes.c_int
 
-lib.memoire_free_string.argtypes = [ctypes.c_char_p]
+lib.memoire_free_string.argtypes = [ctypes.c_void_p]
 lib.memoire_free_string.restype  = None
 
 
@@ -94,13 +102,13 @@ class Memoire:
         return n
 
     def recall(self, query: str, top_k: int = 5) -> list[dict]:
-        raw = lib.memoire_recall(self._h, query.encode(), top_k)
-        if not raw:
+        ptr = lib.memoire_recall(self._h, query.encode(), top_k)
+        if not ptr:
             raise RuntimeError("memoire_recall() failed")
         try:
-            return json.loads(raw.decode())
+            return json.loads(ctypes.string_at(ptr).decode())
         finally:
-            lib.memoire_free_string(raw)
+            lib.memoire_free_string(ptr)
 
     def forget(self, memory_id: int) -> bool:
         r = lib.memoire_forget(self._h, memory_id)

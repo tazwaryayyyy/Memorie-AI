@@ -23,10 +23,17 @@ else
   LIB_FILE := lib$(LIB_NAME).$(LIB_EXT)
 endif
 
+# Binaries are memoire-cli and memoire-server (see [[bin]] in Cargo.toml).
+ifeq ($(OS), Windows_NT)
+  EXE_EXT := .exe
+else
+  EXE_EXT :=
+endif
+
 # ─── Phony targets ───────────────────────────────────────────────────────────
 .PHONY: all build release check test test-unit test-integration test-python \
-        bench fmt lint doc clean help install-dev demo-rust demo-python \
-        demo-node symbols model-info
+        bench fmt lint doc clean help install-dev python-dev demo-rust \
+        demo-python demo-trust demo-node cli symbols model-info
 
 all: release
 
@@ -72,8 +79,13 @@ test-integration:
 test-all:
 	RUST_LOG=$(RUST_LOG) $(CARGO) test -- --nocapture
 
-# Needs the PyO3 extension in the active virtualenv:
-#   cd bindings/python && maturin develop --release
+# The Python package is a PyO3 extension built by maturin into the ACTIVE
+# virtualenv. It does not use MEMOIRE_LIB or target/release/$(LIB_FILE).
+# Needs maturin (make install-dev) and a Rust toolchain.
+python-dev:
+	@echo "→ Building + installing the PyO3 extension into the active virtualenv..."
+	cd bindings/python && maturin develop --release
+
 test-python:
 	@echo "→ Running Python test suite (requires 'maturin develop' in the active venv)..."
 	cd bindings/python && $(PYTHON) -m pytest tests/ -v --tb=short
@@ -102,9 +114,15 @@ demo-rust: release
 	@echo "→ Running Rust example..."
 	RUST_LOG=$(RUST_LOG) $(CARGO) run --release --example basic_usage
 
+# C-ABI demo: ctypes -> $(RELEASE_DIR)/$(LIB_FILE). Independent of the PyO3 package.
 demo-python: release
-	@echo "→ Running Python demo..."
-	MEMOIRE_LIB=$(RELEASE_DIR)/$(LIB_FILE) $(PYTHON) examples/agent_demo.py
+	@echo "→ Running ctypes C-FFI demo..."
+	$(PYTHON) examples/agent_demo.py
+
+# Scripted trust/penalty demo (uses the PyO3 package; run `make python-dev` first).
+demo-trust:
+	@echo "→ Running trust demo (needs 'make python-dev' in the active venv)..."
+	$(PYTHON) examples/brutal_moment_demo.py
 
 demo-node: release
 	@echo "→ Running Node.js demo..."
@@ -113,8 +131,8 @@ demo-node: release
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 cli: release
-	@echo "Binary: $(RELEASE_DIR)/$(LIB_NAME)"
-	@echo "Usage:  ./$(RELEASE_DIR)/$(LIB_NAME) --help"
+	@echo "Binaries: $(RELEASE_DIR)/memoire-cli$(EXE_EXT)  $(RELEASE_DIR)/memoire-server$(EXE_EXT)"
+	@echo "Usage:    ./$(RELEASE_DIR)/memoire-cli$(EXE_EXT) --help"
 
 # ─── Debug helpers ───────────────────────────────────────────────────────────
 
@@ -137,8 +155,9 @@ print('Found:', models[0].name if models else 'NOT CACHED — will download on f
 # ─── Install helpers ─────────────────────────────────────────────────────────
 
 install-dev:
-	@echo "→ Installing Python dev dependencies..."
-	$(PYTHON) -m pip install pytest
+	@echo "→ Installing Python dev dependencies (run inside a virtualenv)..."
+	$(PYTHON) -m pip install maturin pytest
+	@echo "  Next: make python-dev   (builds + installs the PyO3 extension)"
 	@echo "→ Checking Node.js dependencies..."
 	@command -v node >/dev/null 2>&1 && echo "  Node.js: OK" || echo "  Node.js: not found"
 	@command -v go   >/dev/null 2>&1 && echo "  Go:      OK" || echo "  Go:      not found"
@@ -178,7 +197,8 @@ help:
 	@echo "    make test             Unit + integration tests"
 	@echo "    make test-unit        Fast in-memory unit tests only"
 	@echo "    make test-integration Full integration tests (needs model)"
-	@echo "    make test-python      Python binding test suite"
+	@echo "    make python-dev       Build + install the PyO3 extension (maturin)"
+	@echo "    make test-python      Python binding test suite (needs python-dev)"
 	@echo "    make test-all         Everything"
 	@echo ""
 	@echo "  Benchmarks"
@@ -187,7 +207,8 @@ help:
 	@echo ""
 	@echo "  Demos"
 	@echo "    make demo-rust        Run the Rust basic_usage example"
-	@echo "    make demo-python      Run the Python agent demo"
+	@echo "    make demo-python      Run the ctypes C-FFI demo (agent_demo.py)"
+	@echo "    make demo-trust       Run the trust/penalty demo (needs python-dev)"
 	@echo "    make demo-node        Run the Node.js demo"
 	@echo ""
 	@echo "  Debug"
@@ -195,7 +216,7 @@ help:
 	@echo "    make model-info       Check if the embedding model is cached"
 	@echo ""
 	@echo "  Misc"
-	@echo "    make install-dev      Install Python/Node dev deps"
+	@echo "    make install-dev      Install maturin + pytest (use a virtualenv)"
 	@echo "    make clean            Remove build artifacts and .db files"
 	@echo "    make clean-all        Deep clean including __pycache__"
 	@echo ""
