@@ -207,14 +207,11 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn blob_to_vec(blob: &[u8]) -> Option<Vec<f32>> {
-    if !blob.len().is_multiple_of(4) {
+    let (chunks, rem) = blob.as_chunks::<4>();
+    if !rem.is_empty() {
         return None;
     }
-    Some(
-        blob.chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-    )
+    Some(chunks.iter().copied().map(f32::from_le_bytes).collect())
 }
 
 /// Load only fingerprints at startup â€” O(n Ã— 64 bytes) instead of O(n Ã— 1536 bytes).

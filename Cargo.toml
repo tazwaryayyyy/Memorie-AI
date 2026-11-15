@@ -6,8 +6,6 @@ version = "0.1.0"
 edition = "2021"
 description = "A local-first, embeddable long-term memory engine for AI coding agents"
 license = "MIT"
-repository = "https://github.com/tazwaryayyyy/Memorie-AI"
-homepage = "https://github.com/tazwaryayyyy/Memorie-AI"
 readme = "README.md"
 keywords = ["ai", "memory", "embeddings", "sqlite", "ffi"]
 categories = ["database", "science::ml"]
@@ -67,7 +65,8 @@ tree-sitter-typescript = { version = "0.23", features = [] }
 # Default features keep the prebuilt static binaries (`download-binaries`) that
 # fastembed's `ort-download-binaries-native-tls` also selects, so linking works
 # even when `native` (and thus fastembed) is off.
-ort = "2.0.0-rc.11"
+# Keep `load-dynamic` off (breaks Windows/wheels) and `copy-dylibs` off (panics under Cargo 1.100 build-dir layout).
+ort = { version = "2.0.0-rc.11", default-features = false, features = ["std", "download-binaries", "tls-native"] }
 tokenizers = { version = "0.19.1", default-features = false, features = ["onig"] }
 
 [features]
