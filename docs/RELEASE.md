@@ -80,6 +80,25 @@ Copy the Hugging Face cache to the target machine and set:
 export HF_HOME=/path/to/huggingface/cache
 ```
 
+## ONNX Runtime Linking
+
+ONNX Runtime is **linked into** the Rust library, the CLI/server and the Python extension; it is not
+located at runtime. `ort/load-dynamic` must stay disabled: it makes `ort-sys` skip linking and
+`dlopen`/`LoadLibrary` `libonnxruntime`/`onnxruntime.dll` by bare name, which fails wherever no
+runtime is on the loader path and, on Windows, can load an unrelated `System32\onnxruntime.dll`.
+`tests/ort_smoke.rs` guards this on every CI OS.
+
+- **Build needs network** the first time: `ort-sys` downloads pyke's prebuilt static ONNX Runtime
+  (1.23.2) into its cache (`~/.cache/ort.pyke.io`, `~/Library/Caches/ort.pyke.io`, `%LOCALAPPDATA%\ort.pyke.io`). Offline or
+  unsupported targets can set `ORT_LIB_LOCATION` (and `ORT_PREFER_DYNAMIC_LINK=1` for a shared
+  library, which then becomes a runtime dependency).
+- **Prebuilt targets** (ort 2.0.0-rc.11): Windows MSVC x86_64/aarch64, Linux **gnu** x86_64/aarch64,
+  macOS aarch64. No `x86_64-apple-darwin` and no musl: build those with `ORT_LIB_LOCATION`.
+- **Windows:** do not add `-C target-feature=+crt-static`; the prebuilt libraries are expected to use
+  the dynamic CRT (verify before changing).
+- **Size:** artifacts and every test binary now contain ONNX Runtime. Measure the release
+  `memoire_engine` wheel/extension before publishing (PyPI's default per-file limit is 100 MB).
+
 ## Current Non-Goals
 
 - No PyPI wheels with bundled native libraries yet.

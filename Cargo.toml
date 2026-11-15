@@ -60,7 +60,14 @@ tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-typescript = { version = "0.23", features = [] }
-ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
+# ONNX Runtime must be linked, not located at runtime: do NOT enable `load-dynamic`.
+# It makes ort-sys skip linking entirely and `LoadLibrary("onnxruntime.dll")` /
+# dlopen("libonnxruntime.so") by bare name, which fails when no runtime is on the
+# loader path and, on Windows, can pick up an unrelated System32 onnxruntime.dll.
+# Default features keep the prebuilt static binaries (`download-binaries`) that
+# fastembed's `ort-download-binaries-native-tls` also selects, so linking works
+# even when `native` (and thus fastembed) is off.
+ort = "2.0.0-rc.11"
 tokenizers = { version = "0.19.1", default-features = false, features = ["onig"] }
 
 [features]
