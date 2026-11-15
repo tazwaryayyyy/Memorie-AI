@@ -11,7 +11,7 @@ Setup:
           cargo build --release
 
     2. Install the Python binding (from repo root):
-          pip install -e bindings/python/
+          cd bindings/python && maturin develop --release
 
     3. Add to your ~/.aider.conf.yml:
           pre-message-hook:  python examples/aider_plugin.py recall
@@ -34,7 +34,7 @@ from pathlib import Path
 # Allow running from the repo root without installing the package
 sys.path.insert(0, str(Path(__file__).parent.parent / "bindings" / "python"))
 
-from memoire import Memoire, Memory  # noqa: E402
+from memoire_engine import Memoire, Memory  # noqa: E402
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 

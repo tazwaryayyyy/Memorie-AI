@@ -126,6 +126,21 @@ fn test_forget() {
 }
 
 #[test]
+fn test_forget_then_remember_same_text() {
+    // Regression: forget() left the fingerprint in the dedup set, so the same
+    // text could not be remembered again until the process restarted.
+    let mem = m();
+    let ids = mem.remember("temporary memory").unwrap();
+    assert_eq!(ids.len(), 1);
+    assert!(mem.forget(ids[0]).unwrap());
+    assert_eq!(mem.count().unwrap(), 0);
+
+    let again = mem.remember("temporary memory").unwrap();
+    assert_eq!(again.len(), 1, "re-remembering forgotten text must succeed");
+    assert_eq!(mem.count().unwrap(), 1);
+}
+
+#[test]
 fn test_clear() {
     let mem = m();
     mem.remember("one").unwrap();

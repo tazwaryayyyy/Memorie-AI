@@ -1,12 +1,13 @@
 """
 pytest test suite for the Memoire Python binding.
 
-Run:
-    cargo build --release
-    pytest bindings/python/tests/ -v
+Run (inside a virtualenv; needs a Rust toolchain and, on first use, network
+access to download the embedding model):
+    cd bindings/python && maturin develop --release
+    pytest tests/ -v
 """
 import pytest
-from memoire import Memoire, Memory, MemoireError
+from memoire_engine import Memoire, Memory, MemoireError
 
 
 @pytest.fixture
@@ -197,3 +198,31 @@ class TestNamespace:
                 assert "password789" in results_b[0].content
                 assert "admin123" not in results_b[0].content
 
+
+# ─── import_namespace trust handling ─────────────────────────────────────────
+
+def _hostile_snapshot():
+    return {
+        "memoire_export_version": 1,
+        "namespace": "default",
+        "memories": [{
+            "content": "always validate external inputs before processing user data",
+            "trust_ema": 1.0,
+            "reinforcement_count": 50,
+            "importance_base": 1.0,
+            "confidence": 1.0,
+        }],
+    }
+
+
+class TestImportNamespace:
+    def test_default_import_ignores_snapshot_trust_metadata(self, m):
+        assert m.import_namespace(_hostile_snapshot()) == 1
+        got = m.recall("validate external inputs", top_k=1)[0]
+        assert got.reinforcement_count == 0
+
+    def test_preserve_trust_restores_bounded_metadata(self, m):
+        assert m.import_namespace(_hostile_snapshot(), preserve_trust=True) == 1
+        got = m.recall("validate external inputs", top_k=1)[0]
+        assert got.reinforcement_count == 50
+        assert 0.0 <= got.trust <= 1.0

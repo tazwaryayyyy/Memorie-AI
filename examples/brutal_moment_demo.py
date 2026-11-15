@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "bindings" / "python"))
-from memoire import Memoire, MemoryPolicy  # noqa: E402  # pylint: disable=import-error,wrong-import-position
+from memoire_engine import Memoire, MemoryPolicy  # noqa: E402  # pylint: disable=import-error,wrong-import-position
 
 # ─── Agent simulation ─────────────────────────────────────────────────────────
 

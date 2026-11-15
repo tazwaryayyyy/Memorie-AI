@@ -1,5 +1,8 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
 
 #[cfg(not(target_arch = "wasm32"))]
 use ort::{
@@ -21,6 +24,12 @@ pub enum NliLabel {
     Entailment,
 }
 
+/// Pairwise NLI classifier. Implemented by [`OnnxNliChecker`]; unit tests use stubs
+/// so no model download is needed.
+pub(crate) trait NliClassifier: Send + Sync {
+    fn classify(&self, premise: &str, hypothesis: &str) -> anyhow::Result<NliLabel>;
+}
+
 /// Lightweight NLI-style contradiction detector.
 ///
 /// Uses a three-signal ensemble ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no external model required:
@@ -32,9 +41,109 @@ pub enum NliLabel {
 ///
 /// This is intentionally cheaper than loading an ONNX NLI model at runtime
 /// while providing more signal than pure keyword polarity used before.
+///
+/// If an ONNX NLI model is installed, its label is **authoritative** for pairs that
+/// pass the cosine topic gate; the lexical heuristics only run when no model is
+/// installed or the model errors at inference time.
 #[derive(Clone)]
 pub struct NliChecker {
-    pub(crate) onnx: Option<Arc<OnnxNliChecker>>,
+    pub(crate) onnx: Option<Arc<dyn NliClassifier>>,
+}
+
+/// Maps ONNX NLI logit indices to labels, read from the model's `config.json`
+/// `id2label`. Label order differs between models (e.g. `bart-large-mnli`:
+/// 0=contradiction; `MoritzLaurer/*`: 2=contradiction), so it is never assumed.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub(crate) struct NliLabelMap {
+    by_index: [NliLabel; 3],
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NliLabelMap {
+    /// Parse `id2label` (case-insensitive `contradiction` / `entailment` / `neutral`).
+    /// Errors on anything missing, ambiguous or unrecognised instead of guessing.
+    pub(crate) fn from_id2label_json(config_json: &str) -> anyhow::Result<Self> {
+        let root: serde_json::Value = serde_json::from_str(config_json)
+            .map_err(|e| anyhow::anyhow!("config.json is not valid JSON: {e}"))?;
+        let id2label = root
+            .get("id2label")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config.json has no `id2label` object; cannot tell which logit is contradiction"
+                )
+            })?;
+        if id2label.len() != 3 {
+            anyhow::bail!(
+                "id2label must have exactly 3 entries (contradiction, entailment, neutral), found {}",
+                id2label.len()
+            );
+        }
+
+        let mut slots: [Option<NliLabel>; 3] = [None, None, None];
+        for (key, value) in id2label {
+            let idx: usize = key
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("id2label key {key:?} is not an integer index"))?;
+            if idx >= 3 {
+                anyhow::bail!("id2label index {idx} is out of range (expected 0..=2)");
+            }
+            let name = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("id2label[{idx}] is not a string"))?;
+            let label = match name.trim().to_ascii_lowercase().as_str() {
+                "contradiction" => NliLabel::Contradiction,
+                "entailment" => NliLabel::Entailment,
+                "neutral" => NliLabel::Neutral,
+                _ => anyhow::bail!(
+                    "id2label[{idx}] = {name:?} is not contradiction/entailment/neutral \
+                     (case-insensitive); refusing to guess the label order"
+                ),
+            };
+            if slots[idx].is_some() {
+                anyhow::bail!("id2label index {idx} appears more than once");
+            }
+            slots[idx] = Some(label);
+        }
+
+        let [Some(l0), Some(l1), Some(l2)] = slots else {
+            anyhow::bail!("id2label must define indices 0, 1 and 2");
+        };
+        if l0 == l1 || l0 == l2 || l1 == l2 {
+            anyhow::bail!("id2label maps two indices to the same label");
+        }
+        Ok(Self {
+            by_index: [l0, l1, l2],
+        })
+    }
+
+    pub(crate) fn from_config_file(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read {}: {e}. An NLI model directory must contain config.json \
+                 (with id2label) next to the .onnx file",
+                path.display()
+            )
+        })?;
+        Self::from_id2label_json(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    }
+
+    /// Argmax over exactly three finite logits, mapped through `id2label`.
+    pub(crate) fn label_for_logits(&self, logits: &[f32]) -> anyhow::Result<NliLabel> {
+        if logits.len() != 3 {
+            anyhow::bail!("NLI model returned {} logits, expected 3", logits.len());
+        }
+        if logits.iter().any(|v| !v.is_finite()) {
+            anyhow::bail!("NLI model returned non-finite logits");
+        }
+        let best = logits
+            .iter()
+            .enumerate()
+            .fold(0, |b, (i, v)| if *v > logits[b] { i } else { b });
+        Ok(self.by_index[best].clone())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,21 +151,27 @@ pub struct OnnxNliChecker {
     session: Mutex<Session>,
     tokenizer: tokenizers::Tokenizer,
     max_tokens: usize,
+    labels: NliLabelMap,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl OnnxNliChecker {
+    /// Load `model_path` plus `tokenizer.json` and `config.json` from the same
+    /// directory. Fails if `config.json` / `id2label` is missing or ambiguous.
     pub fn from_path(model_path: &Path) -> anyhow::Result<Self> {
         if !model_path.exists() {
             anyhow::bail!("onnx model path does not exist: {}", model_path.display());
         }
+        let parent = model_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid model path"))?;
+        // Cheap checks first: fail before building the ONNX session.
+        let labels = NliLabelMap::from_config_file(&parent.join("config.json"))?;
+
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_file(model_path)?;
 
-        let parent = model_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("Invalid model path"))?;
         let tokenizer_path = parent.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
             anyhow::anyhow!(
@@ -70,10 +185,12 @@ impl OnnxNliChecker {
             session: Mutex::new(session),
             tokenizer,
             max_tokens: 512,
+            labels,
         })
     }
 
-    pub fn check_contradiction(&self, text_a: &str, text_b: &str) -> anyhow::Result<bool> {
+    /// Classify `(text_a, text_b)` as contradiction / entailment / neutral.
+    pub fn classify(&self, text_a: &str, text_b: &str) -> anyhow::Result<NliLabel> {
         let mut tokenizer = self.tokenizer.clone();
         tokenizer
             .with_truncation(Some(tokenizers::TruncationParams {
@@ -124,18 +241,19 @@ impl OnnxNliChecker {
         let output_value = outputs.get("logits").unwrap_or(&outputs[0]);
         let (_, logits) = output_value.try_extract_tensor::<f32>()?;
 
-        let mut max_idx = 0;
-        let mut max_val = f32::NEG_INFINITY;
-        for i in 0..3 {
-            if let Some(&val) = logits.get(i) {
-                if val > max_val {
-                    max_val = val;
-                    max_idx = i;
-                }
-            }
-        }
+        self.labels.label_for_logits(logits)
+    }
 
-        Ok(max_idx == 0)
+    /// `true` iff the model's label for the pair is `Contradiction`.
+    pub fn check_contradiction(&self, text_a: &str, text_b: &str) -> anyhow::Result<bool> {
+        Ok(self.classify(text_a, text_b)? == NliLabel::Contradiction)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NliClassifier for OnnxNliChecker {
+    fn classify(&self, premise: &str, hypothesis: &str) -> anyhow::Result<NliLabel> {
+        OnnxNliChecker::classify(self, premise, hypothesis)
     }
 }
 impl NliChecker {
@@ -143,6 +261,14 @@ impl NliChecker {
         Self { onnx: None }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_classifier(classifier: Arc<dyn NliClassifier>) -> Self {
+        Self {
+            onnx: Some(classifier),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_onnx(onnx: OnnxNliChecker) -> Self {
         Self {
             onnx: Some(Arc::new(onnx)),
@@ -151,8 +277,13 @@ impl NliChecker {
 
     /// Compute an NLI label for the pair (premise, hypothesis).
     ///
-    /// Returns `Contradiction` when both texts are on the same topic
-    /// (cosine ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥ threshold) AND their polarity opposes each other.
+    /// 1. **Topic gate** (cosine < `cosine_threshold` -> `Neutral`). Runs first on
+    ///    both paths: it is cheap, and it bounds ONNX cost because the store calls
+    ///    this against every live memory in the namespace.
+    /// 2. **ONNX model**, if installed: its label is returned as-is (including
+    ///    `Neutral` / `Entailment`). The lexical heuristics never override it. On an
+    ///    inference error a warning is logged and step 3 is used instead.
+    /// 3. **Lexical heuristics** (polarity opposition + negation asymmetry).
     pub fn check(
         &self,
         premise_text: &str,
@@ -161,27 +292,35 @@ impl NliChecker {
         hypothesis_emb: &[f32],
         cosine_threshold: f32,
     ) -> NliLabel {
-        if let Some(onnx) = &self.onnx {
-            if let Ok(true) = onnx.check_contradiction(premise_text, hypothesis_text) {
-                return NliLabel::Contradiction;
-            }
-        }
-
-        // Gate 1: same topic cluster.
         let sim = cosine_similarity(premise_emb, hypothesis_emb);
         if sim < cosine_threshold {
             return NliLabel::Neutral;
         }
 
+        if let Some(classifier) = &self.onnx {
+            match classifier.classify(premise_text, hypothesis_text) {
+                Ok(label) => return label,
+                Err(e) => {
+                    log::warn!("ONNX NLI inference failed ({e}); falling back to lexical heuristic")
+                }
+            }
+        }
+
+        Self::lexical_label(premise_text, hypothesis_text)
+    }
+
+    /// Lexical fallback: polarity opposition + negation asymmetry. Assumes the
+    /// topic gate has already passed.
+    fn lexical_label(premise_text: &str, hypothesis_text: &str) -> NliLabel {
         // Gate 2: polarity opposition.
         let pol_a = detect_polarity(premise_text);
         let pol_b = detect_polarity(hypothesis_text);
         if pol_a == Polarity::Neutral || pol_b == Polarity::Neutral {
-            // One text has no strong polarity ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â cannot assert contradiction.
+            // One text has no strong polarity - cannot assert contradiction.
             return NliLabel::Neutral;
         }
         if !pol_a.opposes(&pol_b) {
-            // Same polarity direction ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â possibly entailment.
+            // Same polarity direction - possibly entailment.
             return NliLabel::Entailment;
         }
 
@@ -193,7 +332,7 @@ impl NliChecker {
             return NliLabel::Contradiction;
         }
 
-        // Polarity opposes but no clear negation asymmetry ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â conservative fallback.
+        // Polarity opposes but no clear negation asymmetry - conservative fallback.
         NliLabel::Contradiction
     }
 }
@@ -999,9 +1138,9 @@ impl IngestionOracle for DefaultOracle {
             match nli
                 .onnx
                 .as_ref()
-                .and_then(|onnx| onnx.check_contradiction(content, &mem.content).ok())
+                .and_then(|onnx| onnx.classify(content, &mem.content).ok())
             {
-                Some(true) => {
+                Some(NliLabel::Contradiction) => {
                     // contradiction found ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â immediate reject
                     return StrongVerifyResult {
                         confidence: 0.0,
@@ -1129,5 +1268,210 @@ mod tests {
             (cosine_similarity(&a, &a) - 1.0).abs() < 1e-6,
             "identical ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 1"
         );
+    }
+
+    // --- ONNX label mapping + authoritative-model behaviour (no model download) ---
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn map_from(pairs: &[(&str, &str)]) -> anyhow::Result<NliLabelMap> {
+        let body: Vec<String> = pairs
+            .iter()
+            .map(|(k, v)| format!("\"{k}\": \"{v}\""))
+            .collect();
+        NliLabelMap::from_id2label_json(&format!("{{\"id2label\": {{{}}}}}", body.join(", ")))
+    }
+
+    #[test]
+    fn id2label_contradiction_at_index_0() {
+        // facebook/bart-large-mnli ordering
+        let m = map_from(&[
+            ("0", "contradiction"),
+            ("1", "neutral"),
+            ("2", "entailment"),
+        ])
+        .unwrap();
+        assert_eq!(
+            m.label_for_logits(&[2.0, 0.1, -1.0]).unwrap(),
+            NliLabel::Contradiction
+        );
+        assert_eq!(
+            m.label_for_logits(&[0.0, 0.2, 3.0]).unwrap(),
+            NliLabel::Entailment
+        );
+    }
+
+    #[test]
+    fn id2label_contradiction_at_index_2() {
+        // MoritzLaurer/* ordering: the old `max_idx == 0` would invert these.
+        let m = map_from(&[
+            ("0", "entailment"),
+            ("1", "neutral"),
+            ("2", "contradiction"),
+        ])
+        .unwrap();
+        assert_eq!(
+            m.label_for_logits(&[-1.0, 0.0, 3.0]).unwrap(),
+            NliLabel::Contradiction
+        );
+        assert_eq!(
+            m.label_for_logits(&[3.0, 0.0, -1.0]).unwrap(),
+            NliLabel::Entailment
+        );
+    }
+
+    #[test]
+    fn id2label_other_order_and_case_insensitive() {
+        // cross-encoder/nli-* ordering, upper-case names
+        let m = map_from(&[
+            ("0", "CONTRADICTION"),
+            ("1", "Entailment"),
+            ("2", " neutral "),
+        ])
+        .unwrap();
+        assert_eq!(
+            m.label_for_logits(&[0.1, 3.0, 0.2]).unwrap(),
+            NliLabel::Entailment
+        );
+        assert_eq!(
+            m.label_for_logits(&[0.1, 0.2, 3.0]).unwrap(),
+            NliLabel::Neutral
+        );
+    }
+
+    #[test]
+    fn id2label_rejects_missing_or_ambiguous_mapping() {
+        let bad: [&str; 8] = [
+            "{}",
+            "not json",
+            r#"{"id2label": []}"#,
+            r#"{"id2label": {"0": "LABEL_0", "1": "LABEL_1", "2": "LABEL_2"}}"#,
+            r#"{"id2label": {"0": "entailment", "1": "not_entailment"}}"#,
+            r#"{"id2label": {"0": "neutral", "1": "neutral", "2": "contradiction"}}"#,
+            r#"{"id2label": {"0": "entailment", "1": "neutral", "3": "contradiction"}}"#,
+            r#"{"id2label": {"a": "entailment", "1": "neutral", "2": "contradiction"}}"#,
+        ];
+        for json in bad {
+            assert!(
+                NliLabelMap::from_id2label_json(json).is_err(),
+                "must reject: {json}"
+            );
+        }
+        let err = NliLabelMap::from_id2label_json("{}")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("id2label"),
+            "error should name id2label: {err}"
+        );
+    }
+
+    #[test]
+    fn logits_must_be_three_finite_values() {
+        let m = map_from(&[
+            ("0", "contradiction"),
+            ("1", "neutral"),
+            ("2", "entailment"),
+        ])
+        .unwrap();
+        assert!(m.label_for_logits(&[1.0, 2.0]).is_err());
+        assert!(m.label_for_logits(&[1.0, 2.0, 3.0, 4.0]).is_err());
+        assert!(m.label_for_logits(&[1.0, f32::NAN, 3.0]).is_err());
+    }
+
+    struct StubClassifier {
+        result: Result<NliLabel, String>,
+        calls: AtomicUsize,
+    }
+
+    impl StubClassifier {
+        fn new(result: Result<NliLabel, String>) -> Arc<Self> {
+            Arc::new(Self {
+                result,
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl NliClassifier for StubClassifier {
+        fn classify(&self, _p: &str, _h: &str) -> anyhow::Result<NliLabel> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.result.clone().map_err(|e| anyhow::anyhow!(e))
+        }
+    }
+
+    const LEX_CONTRA_A: &str = "never use float for money";
+    const LEX_CONTRA_B: &str = "always use float for money";
+    const LEX_NEUTRAL_A: &str = "the model is a transformer architecture";
+    const LEX_NEUTRAL_B: &str = "the model is a recurrent network";
+
+    fn same_topic() -> Vec<f32> {
+        vec![0.577_f32, 0.577, 0.577]
+    }
+
+    #[test]
+    fn authoritative_onnx_neutral_is_not_overridden_by_lexical_polarity() {
+        let emb = same_topic();
+        // Sanity: the lexical path alone WOULD say Contradiction for this pair.
+        assert_eq!(
+            NliChecker::new().check(LEX_CONTRA_A, LEX_CONTRA_B, &emb, &emb, 0.80),
+            NliLabel::Contradiction
+        );
+        let stub = StubClassifier::new(Ok(NliLabel::Neutral));
+        let checker = NliChecker::with_classifier(stub.clone());
+        assert_eq!(
+            checker.check(LEX_CONTRA_A, LEX_CONTRA_B, &emb, &emb, 0.80),
+            NliLabel::Neutral
+        );
+        assert_eq!(stub.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn authoritative_onnx_entailment_is_not_overridden_by_lexical_polarity() {
+        let emb = same_topic();
+        let checker = NliChecker::with_classifier(StubClassifier::new(Ok(NliLabel::Entailment)));
+        assert_eq!(
+            checker.check(LEX_CONTRA_A, LEX_CONTRA_B, &emb, &emb, 0.80),
+            NliLabel::Entailment
+        );
+    }
+
+    #[test]
+    fn onnx_contradiction_is_returned_even_when_lexical_sees_none() {
+        let emb = same_topic();
+        let checker = NliChecker::with_classifier(StubClassifier::new(Ok(NliLabel::Contradiction)));
+        assert_eq!(
+            checker.check(LEX_NEUTRAL_A, LEX_NEUTRAL_B, &emb, &emb, 0.80),
+            NliLabel::Contradiction
+        );
+    }
+
+    #[test]
+    fn onnx_error_falls_back_to_lexical_heuristic() {
+        let emb = same_topic();
+        let checker = NliChecker::with_classifier(StubClassifier::new(Err("boom".into())));
+        assert_eq!(
+            checker.check(LEX_CONTRA_A, LEX_CONTRA_B, &emb, &emb, 0.80),
+            NliLabel::Contradiction
+        );
+        assert_eq!(
+            checker.check(LEX_NEUTRAL_A, LEX_NEUTRAL_B, &emb, &emb, 0.80),
+            NliLabel::Neutral
+        );
+    }
+
+    #[test]
+    fn low_cosine_skips_onnx_inference_entirely() {
+        let stub = StubClassifier::new(Ok(NliLabel::Contradiction));
+        let checker = NliChecker::with_classifier(stub.clone());
+        let label = checker.check(
+            LEX_CONTRA_A,
+            LEX_CONTRA_B,
+            &unit_vec(3, 0),
+            &unit_vec(3, 1),
+            0.80,
+        );
+        assert_eq!(label, NliLabel::Neutral);
+        assert_eq!(stub.calls.load(AtomicOrdering::SeqCst), 0);
     }
 }

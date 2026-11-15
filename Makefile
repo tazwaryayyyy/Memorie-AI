@@ -72,11 +72,11 @@ test-integration:
 test-all:
 	RUST_LOG=$(RUST_LOG) $(CARGO) test -- --nocapture
 
-test-python: release
-	@echo "→ Running Python test suite..."
-	cd bindings/python && \
-	  MEMOIRE_LIB=../../$(RELEASE_DIR)/$(LIB_FILE) \
-	  $(PYTHON) -m pytest tests/ -v --tb=short
+# Needs the PyO3 extension in the active virtualenv:
+#   cd bindings/python && maturin develop --release
+test-python:
+	@echo "→ Running Python test suite (requires 'maturin develop' in the active venv)..."
+	cd bindings/python && $(PYTHON) -m pytest tests/ -v --tb=short
 
 # ─── Benchmarks ──────────────────────────────────────────────────────────────
 

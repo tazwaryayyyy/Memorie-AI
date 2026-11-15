@@ -7,11 +7,15 @@ import json
 from dataclasses import dataclass
 from typing import List, Optional
 
-# Import the compiled PyO3 native module
+# Import the compiled PyO3 native module (memoire_engine.memoire_engine)
+_NATIVE_IMPORT_ERROR: Optional[BaseException] = None
 try:
-    from .memoire import Memoire as _NativeMemoire, Memory as _NativeMemory, MemoireError
-except ImportError:
-    # If the native module is not compiled yet, import placeholder exceptions
+    from .memoire_engine import Memoire as _NativeMemoire, Memory as _NativeMemory, MemoireError
+except ImportError as _exc:
+    # If the native module is not compiled yet, import placeholder exceptions.
+    # Keep the original error: it also covers a present-but-unloadable extension.
+    _NATIVE_IMPORT_ERROR = _exc
+
     class MemoireError(Exception):
         """Raised when the Memoire library returns an error."""
     _NativeMemoire = None
@@ -33,8 +37,10 @@ def _get_lib():
     """
     if _NativeMemoire is None:
         raise MemoireError(
-            "Native compiled memoire extension is not installed.\n"
-            "Please run `pip install .` or `maturin dev` in bindings/python."
+            "The native memoire_engine extension could not be imported "
+            f"({_NATIVE_IMPORT_ERROR!r}).\n"
+            "Run `maturin develop --release` in bindings/python inside the "
+            "active virtualenv (needs a Rust toolchain)."
         )
     return _NativeMemoire
 
@@ -225,12 +231,19 @@ class Memoire:
         except Exception as e:
             raise MemoireError(f"export_namespace() failed: {e}") from e
 
-    def import_namespace(self, snapshot: dict) -> int:
-        """Import memories from a namespace snapshot dict."""
+    def import_namespace(self, snapshot: dict, preserve_trust: bool = False) -> int:
+        """Import memories from a namespace snapshot dict.
+
+        By default only each memory's ``content`` is used and trust metadata
+        (trust_ema, reinforcement_count, importance_base, confidence, created_at)
+        is ignored, because a snapshot is untrusted input. Pass
+        ``preserve_trust=True`` only to restore a snapshot you exported yourself;
+        values are then clamped to sane bounds, which is not verification.
+        """
         self._check_open()
         try:
             snapshot_str = json.dumps(snapshot)
-            return self._impl.import_namespace(snapshot_str)
+            return self._impl.import_namespace(snapshot_str, preserve_trust)
         except Exception as e:
             raise MemoireError(f"import_namespace() failed: {e}") from e
 

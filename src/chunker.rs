@@ -187,11 +187,13 @@ fn chunk_code_regex(text: &str, lang: &CodeLanguage, config: &ChunkerConfig) -> 
     result
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn node_text(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
     let span = node.byte_range();
     source.get(span.start..span.end).map(str::to_string)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn collect_ast_chunks(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -260,6 +262,7 @@ fn collect_ast_chunks(
 
 /// Returns chunks split at AST-meaningful boundaries.
 /// Falls back to the regex-based code chunker if tree-sitter parsing fails.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn chunk_code_ast(source: &str, lang: &str, chunk_size: usize) -> Vec<String> {
     let mut parser = tree_sitter::Parser::new();
     let language = match lang {
@@ -330,6 +333,21 @@ pub fn chunk_code_ast(source: &str, lang: &str, chunk_size: usize) -> Vec<String
     } else {
         chunks
     }
+}
+
+/// wasm32 build: tree-sitter (C parsers) is unavailable, so always use the
+/// regex-based code chunker.
+#[cfg(target_arch = "wasm32")]
+pub fn chunk_code_ast(source: &str, _lang: &str, chunk_size: usize) -> Vec<String> {
+    chunk_code_regex(
+        source,
+        &CodeLanguage::Generic,
+        &ChunkerConfig {
+            chunk_size,
+            overlap: 0,
+            mode: ChunkerMode::Prose,
+        },
+    )
 }
 
 /// Original sliding-window word tokeniser — behavior is unchanged.

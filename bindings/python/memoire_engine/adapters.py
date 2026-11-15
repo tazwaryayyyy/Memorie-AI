@@ -3,13 +3,13 @@ Zero-config adapters for popular agent frameworks.
 
 LangChain
 ---------
-    from memoire.adapters import MemoireRetriever
+    from memoire_engine.adapters import MemoireRetriever
     retriever = MemoireRetriever(db_path="agent.db")
     docs = retriever.get_relevant_documents("billing precision bug")
 
 LlamaIndex
 ----------
-    from memoire.adapters import MemoireIndex
+    from memoire_engine.adapters import MemoireIndex
     index = MemoireIndex(db_path="agent.db")
     engine = index.as_query_engine()
     response = engine.query("what did we learn about billing?")
@@ -55,7 +55,7 @@ class MemoireRetriever:
 
     Usage::
 
-        from memoire.adapters import MemoireRetriever
+        from memoire_engine.adapters import MemoireRetriever
         from langchain.chains import RetrievalQA
         from langchain_openai import ChatOpenAI
 
@@ -149,7 +149,7 @@ class MemoireIndex:
 
     Usage::
 
-        from memoire.adapters import MemoireIndex
+        from memoire_engine.adapters import MemoireIndex
         from llama_index.llms.openai import OpenAI
 
         index = MemoireIndex(db_path="agent.db")

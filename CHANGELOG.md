@@ -9,6 +9,36 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (breaking, pre-release)
+- Python import package renamed `memoire` -> `memoire_engine` (distribution name `memoire-engine`,
+  provisional and unpublished); native module is `memoire_engine.memoire_engine`. The unrelated
+  PyPI project `memoire` ships an overlapping top-level `memoire` package.
+- MCP server is now the `memoire_mcp` package (`memoire-mcp` / `python -m memoire_mcp`) instead of a
+  generic top-level `server` module. `python mcp-server/server.py` no longer exists.
+- Cargo package name is `memoire-engine`; the library target stays `memoire` (`use memoire::...`,
+  `libmemoire.so` and the C ABI are unchanged).
+- `memoire_export` (MCP) returns `{ok, error, snapshot}`; `memoire_recall_explained` gates shadow
+  memories like `memoire_recall` (`include_shadow`).
+
+### Fixed
+- ONNX Runtime is now linked instead of loaded at runtime: removed `ort`'s `load-dynamic` feature.
+  It disabled linking entirely, so the first `Session`/embedder use panicked with "Failed to load
+  ONNX Runtime dylib" unless a compatible runtime happened to be findable (on Windows it could
+  pick up an unrelated `System32\onnxruntime.dll`). `libloading` is no longer in the dependency graph.
+  Added `tests/ort_smoke.rs`, which runs real ONNX inference, so CI now catches this.
+  Builds now download pyke's prebuilt ONNX Runtime (or use `ORT_LIB_LOCATION`); see `docs/RELEASE.md`.
+
+### Security
+- DB path: `MEMOIRE_DB_PATH` / `MEMOIRE_DB` now override `.memoire_path`, and a `.memoire_path`
+  target must resolve inside the workspace root (symlinks followed); otherwise an error is returned.
+- Imports are untrusted by default: `Memoire::import_namespace`, the Python `import_namespace`, the
+  CLI `import` and the HTTP `/import` re-ingest `content` only and ignore trust metadata. Restoring
+  your own backup is opt-in (`ImportTrust::PreserveBounded`, `preserve_trust=True`,
+  `--preserve-trust`) and clamps every field (`trust_ema`/`confidence`/`importance_base` to [0, 1],
+  `reinforcement_count` to at most `IMPORT_MAX_REINFORCEMENT`, `created_at` to [0, now]).
+- MCP `memoire_clear` and `memoire_import` are not exposed unless `MEMOIRE_ENABLE_ADMIN_TOOLS=1`;
+  `memoire_import` never preserves trust and accepts at most 1000 memories per call.
+
 ### Planned
 - Metadata tagging (`project`, `session_id`, `language`) on stored memories
 - Filtered recall: `recall_where(query, project="my-api")`

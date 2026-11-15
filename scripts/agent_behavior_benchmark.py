@@ -27,7 +27,7 @@ from typing import Callable, Dict, List
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "bindings" / "python"))
-from memoire import Memoire  # noqa: E402  # pylint: disable=import-error,wrong-import-position
+from memoire_engine import Memoire  # noqa: E402  # pylint: disable=import-error,wrong-import-position
 
 
 @dataclass

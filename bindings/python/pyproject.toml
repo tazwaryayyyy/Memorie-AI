@@ -3,7 +3,8 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "memoire"
+# PROVISIONAL distribution name (import name stays `memoire`); see mcp-server/pyproject.toml.
+name = "memoire-engine"
 version = "0.1.0"
 description = "Local-first semantic memory engine for AI coding agents"
 readme = "README.md"
@@ -34,7 +35,7 @@ Changelog = "https://github.com/tazwaryayyyy/Memorie-AI/blob/main/CHANGELOG.md"
 [tool.maturin]
 features = ["pyo3"]
 manifest-path = "../../Cargo.toml"
-module-name = "memoire.memoire"
+module-name = "memoire_engine.memoire_engine"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

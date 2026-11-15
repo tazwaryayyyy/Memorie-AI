@@ -11,12 +11,15 @@ pub mod py_ffi;
 pub mod quality;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod store;
+pub mod text;
 
 #[cfg(not(target_arch = "wasm32"))]
 use chunker::{chunk_text, ChunkerConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use embedder::{EmbedProvider, Embedder, FastEmbedReranker, Reranker};
+#[cfg(not(target_arch = "wasm32"))]
 use error::{MemoireError, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use quality::{
     build_quality_meta, fingerprint, IngestDecision, IngestionOracle, ScoringConfig,
     ScoringPrototypes, ScoringWeights,
@@ -36,6 +39,28 @@ use store::{Memory, Store};
 // and detect contradictions in memory text without SQLite or ONNX.
 #[cfg(target_arch = "wasm32")]
 pub use quality::{cosine_similarity, detect_polarity, NliChecker, NliLabel, ScoringConfig};
+
+/// How much of a snapshot's per-memory metadata an import may carry over.
+///
+/// A snapshot is data from outside the trust boundary: it can come from an
+/// agent, a downloaded file or a prompt-injected tool call. Trust in Memoire is
+/// meant to be *earned locally* through outcome feedback, so by default an
+/// import re-ingests content only.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImportTrust {
+    /// Re-ingest `content` through the normal `remember()` path and ignore every
+    /// metadata field in the snapshot (`trust_ema`, `reinforcement_count`,
+    /// `importance_base`, `confidence`, `created_at`). An imported memory is then
+    /// no more trusted than one stored with `remember()`. This is the default.
+    #[default]
+    Reset,
+    /// Restore the snapshot's metadata, clamped to explicit bounds (see
+    /// [`store::Store::update_imported_metadata`]). Meant for restoring your own
+    /// backup. "Bounded" is not "verified": a hostile snapshot can still claim the
+    /// maximum in-range trust, so never use this for snapshots you did not export.
+    PreserveBounded,
+}
 
 /// The central Memoire instance.
 ///
@@ -64,7 +89,12 @@ pub struct Memoire {
     scoring_weights: ScoringWeights,
     prototypes: Arc<Mutex<ScoringPrototypes>>,
     oracle: Option<Arc<dyn IngestionOracle>>,
-    maintenance_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Background task handles (time scheduler, insert watcher, reinforcement
+    /// watcher). Aborted individually: dropping a `JoinHandle` only detaches.
+    maintenance_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Private runtime, created only when `start_background_maintenance` is
+    /// called with no ambient Tokio runtime (e.g. from Python / the MCP server).
+    maintenance_runtime: Option<tokio::runtime::Runtime>,
     insert_count: Arc<AtomicU32>,
     reinforcement_count: Arc<AtomicU32>,
 }
@@ -83,9 +113,7 @@ pub struct RecallAttribution {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for Memoire {
     fn drop(&mut self) {
-        if let Some(h) = self.maintenance_handle.take() {
-            h.abort();
-        }
+        self.stop_background_maintenance();
     }
 }
 
@@ -141,7 +169,8 @@ impl Memoire {
             scoring_weights: ScoringWeights::default(),
             prototypes: Arc::new(Mutex::new(prototypes)),
             oracle: None,
-            maintenance_handle: None,
+            maintenance_handles: Vec::new(),
+            maintenance_runtime: None,
             insert_count: Arc::new(AtomicU32::new(0)),
             reinforcement_count: Arc::new(AtomicU32::new(0)),
         })
@@ -185,7 +214,8 @@ impl Memoire {
             scoring_weights: ScoringWeights::default(),
             prototypes: Arc::new(Mutex::new(prototypes)),
             oracle: None,
-            maintenance_handle: None,
+            maintenance_handles: Vec::new(),
+            maintenance_runtime: None,
             insert_count: Arc::new(AtomicU32::new(0)),
             reinforcement_count: Arc::new(AtomicU32::new(0)),
         })
@@ -204,19 +234,45 @@ impl Memoire {
     ///
     /// - Runs `maintenance_pass()` every `interval_secs` seconds (time-based).
     /// - Also watches for `threshold` inserts and triggers maintenance early.
+    /// - Recomputes scoring prototypes every 100 reinforcements.
     ///
-    /// Aborts any previous background task before starting a new one.
-    /// The handle is automatically aborted when `Memoire` is dropped.
+    /// If called inside a Tokio runtime, tasks run on that runtime. Otherwise
+    /// (Python, MCP server, plain `fn main`) a private single-worker runtime is
+    /// created and owned by this `Memoire`.
+    ///
+    /// Stops any previous background tasks before starting new ones. Everything
+    /// is stopped automatically when `Memoire` is dropped.
     pub fn start_background_maintenance(&mut self, interval_secs: u64, threshold: u32) {
-        if tokio::runtime::Handle::try_current().is_err() {
-            log::warn!("start_background_maintenance called without a Tokio runtime; scheduler not started");
-            return;
-        }
+        self.stop_background_maintenance();
 
-        if let Some(h) = self.maintenance_handle.take() {
-            h.abort();
-        }
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("memoire-maintenance")
+                    .enable_time()
+                    .build()
+                {
+                    Ok(rt) => {
+                        let h = rt.handle().clone();
+                        self.maintenance_runtime = Some(rt);
+                        h
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "start_background_maintenance: could not create Tokio runtime ({e}); scheduler not started"
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        // `background::spawn_*` call `tokio::spawn`, which needs a runtime context.
+        let _enter = handle.enter();
 
+        // `Store::clone()` shares cache state with `self.store`, so maintenance
+        // deletes are visible to `search`/`max_similarity` on this instance.
         let store_arc = Arc::new(self.store.clone());
         let insert_count = Arc::clone(&self.insert_count);
         let reinforcement_count = Arc::clone(&self.reinforcement_count);
@@ -242,15 +298,20 @@ impl Memoire {
         });
         let h3 = background::spawn_reinforcement_watcher(recompute_fn, reinforcement_count, 100);
 
-        let combined = tokio::spawn(async move {
-            tokio::select! {
-                _ = h1 => {}
-                _ = h2 => {}
-                _ = h3 => {}
-            }
-        });
-        self.maintenance_handle = Some(combined);
+        self.maintenance_handles = vec![h1, h2, h3];
     }
+
+    /// Abort all background tasks and tear down the private runtime, if any.
+    fn stop_background_maintenance(&mut self) {
+        for h in self.maintenance_handles.drain(..) {
+            h.abort();
+        }
+        if let Some(rt) = self.maintenance_runtime.take() {
+            // Non-blocking: dropping a Runtime from async context would panic.
+            rt.shutdown_background();
+        }
+    }
+
     // Builders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Override the scoring config used by the store.
@@ -293,7 +354,7 @@ impl Memoire {
         self
     }
 
-    pub fn with_nli_model(self, path: &std::path::Path) -> anyhow::Result<Self> {
+    pub fn with_nli_model(mut self, path: &std::path::Path) -> anyhow::Result<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let checker = quality::OnnxNliChecker::from_path(path)?;
@@ -378,6 +439,9 @@ impl Memoire {
         self.recall_with_options(query, top_k, false)
     }
 
+    /// `include_shadow` is a legacy name: `false` returns `active` and `shadow`
+    /// rows (shadow rows are ranked with a reduced trust weight), and `true`
+    /// additionally returns `probationary` rows. See `Store::search`.
     pub fn recall_with_options(
         &self,
         query: &str,
@@ -516,8 +580,19 @@ impl Memoire {
         self.store.export_namespace()
     }
 
-    /// Import a memory snapshot into the current namespace.
+    /// Import a memory snapshot into the current namespace, treating it as
+    /// untrusted: only `content` is used ([`ImportTrust::Reset`]).
     pub fn import_namespace(&self, snapshot: &serde_json::Value) -> Result<usize> {
+        self.import_namespace_with(snapshot, ImportTrust::Reset)
+    }
+
+    /// Import a memory snapshot, choosing how much of its metadata to keep.
+    /// See [`ImportTrust`].
+    pub fn import_namespace_with(
+        &self,
+        snapshot: &serde_json::Value,
+        trust: ImportTrust,
+    ) -> Result<usize> {
         let memories = snapshot
             .get("memories")
             .and_then(|v| v.as_array())
@@ -533,28 +608,31 @@ impl Memoire {
                 Some(c) => c,
                 None => continue,
             };
-            let trust_ema = mem
-                .get("trust_ema")
-                .and_then(|v| v.as_f64())
-                .map(|f| f as f32);
-            let reinforcement_count = mem
-                .get("reinforcement_count")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let importance_base = mem
-                .get("importance_base")
-                .and_then(|v| v.as_f64())
-                .map(|f| f as f32)
-                .unwrap_or(0.5);
-            let confidence = mem
-                .get("confidence")
-                .and_then(|v| v.as_f64())
-                .map(|f| f as f32)
-                .unwrap_or(0.5);
-            let created_at = mem.get("created_at").and_then(|v| v.as_i64());
 
             let ids = self.remember(content)?;
-            if !ids.is_empty() {
+            if ids.is_empty() {
+                continue;
+            }
+            if trust == ImportTrust::PreserveBounded {
+                let trust_ema = mem
+                    .get("trust_ema")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32);
+                let reinforcement_count = mem
+                    .get("reinforcement_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let importance_base = mem
+                    .get("importance_base")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32)
+                    .unwrap_or(0.5);
+                let confidence = mem
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| f as f32)
+                    .unwrap_or(0.5);
+                let created_at = mem.get("created_at").and_then(|v| v.as_i64());
                 self.store.update_imported_metadata(
                     &ids,
                     trust_ema,
@@ -563,8 +641,8 @@ impl Memoire {
                     confidence,
                     created_at,
                 )?;
-                imported_count += 1;
             }
+            imported_count += 1;
         }
         Ok(imported_count)
     }
@@ -753,14 +831,80 @@ impl Memoire {
             }
             Err(e) => {
                 log::warn!("compute_prototypes failed â€” falling back to neutral: {e}");
-                ScoringPrototypes::neutral(384)
+                ScoringPrototypes::neutral(embedder.dim())
             }
             Ok(_) => {
                 log::warn!(
                     "compute_prototypes returned unexpected count â€” falling back to neutral"
                 );
-                ScoringPrototypes::neutral(384)
+                ScoringPrototypes::neutral(embedder.dim())
             }
         }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod lifecycle_tests {
+    use super::*;
+
+    struct StubEmbedder {
+        dim: usize,
+        fail: bool,
+    }
+
+    impl EmbedProvider for StubEmbedder {
+        fn embed(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+            if self.fail {
+                anyhow::bail!("stub embed failure");
+            }
+            Ok(texts.iter().map(|_| vec![0.1_f32; self.dim]).collect())
+        }
+        fn dim(&self) -> usize {
+            self.dim
+        }
+    }
+
+    fn stub(dim: usize, fail: bool) -> Memoire {
+        Memoire::in_memory_with_embedder(Box::new(StubEmbedder { dim, fail })).unwrap()
+    }
+
+    #[test]
+    fn compute_prototypes_fallback_uses_embedder_dim() {
+        let m = stub(8, true);
+        let p = m.prototypes.lock().unwrap();
+        assert!(!p.is_semantic);
+        assert_eq!(p.consequence.len(), 8);
+        assert_eq!(p.actionability.len(), 8);
+        assert_eq!(p.reusability.len(), 8);
+    }
+
+    #[test]
+    fn background_maintenance_starts_without_ambient_runtime() {
+        let mut m = stub(8, false);
+        m.start_background_maintenance(60, 5);
+        assert!(m.maintenance_runtime.is_some());
+        assert_eq!(m.maintenance_handles.len(), 3);
+        assert!(m.maintenance_handles.iter().all(|h| !h.is_finished()));
+
+        // Restart replaces tasks instead of stacking them.
+        m.start_background_maintenance(60, 5);
+        assert_eq!(m.maintenance_handles.len(), 3);
+        drop(m); // must neither hang nor panic
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_maintenance_uses_ambient_runtime_and_stops_on_drop() {
+        let mut m = stub(8, false);
+        m.start_background_maintenance(60, 5);
+        assert!(m.maintenance_runtime.is_none());
+        let aborts: Vec<_> = m
+            .maintenance_handles
+            .iter()
+            .map(|h| h.abort_handle())
+            .collect();
+        assert_eq!(aborts.len(), 3);
+        drop(m);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(aborts.iter().all(|a| a.is_finished()));
     }
 }

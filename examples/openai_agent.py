@@ -29,7 +29,7 @@ try:
 except ImportError:
     sys.exit("Install openai:  pip install openai")
 
-from memoire import Memoire  # noqa: E402
+from memoire_engine import Memoire  # noqa: E402
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
