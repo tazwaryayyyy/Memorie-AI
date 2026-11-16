@@ -21,6 +21,23 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   memories like `memoire_recall` (`include_shadow`).
 
 ### Fixed
+- Namespace isolation in feedback paths: `Store::reinforce_if_used`, `penalize_if_used`,
+  `update_imported_metadata`, the `last_used_at` batch update in `search`, and the follow-up
+  reads/writes in `resolve_contradictions_for_id` now carry `AND namespace = ?`. Previously a
+  handle could reinforce or penalize another namespace's row (sharing one SQLite file) by passing
+  that row's id. Regression tests: `store.rs` (`*_is_namespace_scoped`) and `tests/namespace_feedback.rs`.
+- `memoire_engine.adapters.MemoireRetriever` is now a real `langchain_core.retrievers.BaseRetriever`
+  (`invoke`/`ainvoke`, LCEL pipes). `langchain-core` stays optional; `memoire_engine` and
+  `memoire_engine.adapters` import with neither it nor `llama-index-core` installed. Call
+  `retriever.invoke(query)`; the old ad-hoc `__call__` was removed and fields are pydantic fields.
+  New extras: `memoire-engine[langchain]`, `memoire-engine[llama-index]`.
+- `MemoireIndex.as_query_engine()` / `as_retriever()` passed a LlamaIndex `QueryBundle` to
+  `Memoire.recall()`, which raised `TypeError`; the retriever wrapper now unwraps `query_str`.
+- C FFI: `memoire_remember` is documented as returning `>= 0` (0 for blank input, duplicates and
+  rejected chunks), `cbindgen.toml` lists all 12 exported functions, `memoire_new_ns`'s parameter is
+  `namespace_` (`namespace` is a C++ keyword), and every `extern "C"` entry point that runs engine
+  code converts a panic into its error return (`-1` / `NULL`) instead of aborting the host process.
+  `tests/ffi_header_parity.rs` fails if `src/ffi.rs`, `include/memoire.h` and `cbindgen.toml` drift.
 - ONNX Runtime is now linked instead of loaded at runtime: removed `ort`'s `load-dynamic` feature.
   It disabled linking entirely, so the first `Session`/embedder use panicked with "Failed to load
   ONNX Runtime dylib" unless a compatible runtime happened to be findable (on Windows it could

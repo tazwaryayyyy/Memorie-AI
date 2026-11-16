@@ -6,6 +6,8 @@ pub mod embedder;
 pub mod error;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ffi;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod panic_guard;
 #[cfg(all(feature = "pyo3", not(target_arch = "wasm32")))]
 pub mod py_ffi;
 pub mod quality;

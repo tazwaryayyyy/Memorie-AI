@@ -1,3 +1,4 @@
+use crate::panic_guard::catch_panic;
 use crate::{store::Memory, Memoire};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -90,20 +91,44 @@ pub struct PyRecallAttribution {
 #[pyclass(name = "Memoire")]
 pub struct PyMemoire {
     /// Wrapped in Arc<Mutex> so the Python object is safe to share across
-    /// threads and concurrent &mut self calls block instead of panicking.
+    /// threads and concurrent calls block instead of panicking. Always access
+    /// it through [`PyMemoire::with_inner`].
     inner: Arc<Mutex<Memoire>>,
 }
 
-/// Convenience: lock the inner Memoire and surface any poisoning as a
-/// Python RuntimeError (poisoning is only possible on a panic, which
-/// shouldn't happen in normal operation).
-macro_rules! lock {
-    ($self:expr) => {
-        $self
-            .inner
-            .lock()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-    };
+fn db_err(e: impl ToString) -> PyErr {
+    PyErr::new::<MemoireError, _>(e.to_string())
+}
+
+fn panic_err(what: &str, msg: String) -> PyErr {
+    PyErr::new::<MemoireError, _>(format!("internal error: panic in {what}: {msg}"))
+}
+
+impl PyMemoire {
+    /// Lock the inner `Memoire` and run `f` on it, converting a Rust panic into
+    /// `MemoireError`.
+    ///
+    /// The panic is caught while the guard is still held, so the guard is
+    /// dropped normally and the mutex is not poisoned. Without this, PyO3
+    /// would still stop the panic at the Python boundary, but as a
+    /// `PanicException` (a `BaseException`, not caught by `except Exception`)
+    /// and the poisoned lock would fail every later call on the instance.
+    /// State that `f` had half-updated is not rolled back; locks inside
+    /// `Memoire` held at the panic point stay poisoned and later calls report
+    /// an error.
+    fn with_inner<T>(
+        &self,
+        what: &'static str,
+        f: impl FnOnce(&mut Memoire) -> PyResult<T>,
+    ) -> PyResult<T> {
+        let mut guard = self.inner.lock().map_err(|_| {
+            db_err("Memoire instance is unusable: an earlier internal panic poisoned its lock")
+        })?;
+        match catch_panic(|| f(&mut guard)) {
+            Ok(result) => result,
+            Err(msg) => Err(panic_err(what, msg)),
+        }
+    }
 }
 
 #[pymethods]
@@ -111,124 +136,122 @@ impl PyMemoire {
     #[new]
     #[pyo3(signature = (db_path = "./memoire.db", namespace = "default"))]
     fn new(db_path: &str, namespace: &str) -> PyResult<Self> {
-        let inner = if db_path == ":memory:" {
-            Memoire::in_memory_ns(namespace)
-        } else {
-            Memoire::new_ns(db_path, namespace)
-        }
-        .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
+        // Opening can panic (e.g. ONNX Runtime / model initialisation), and
+        // there is no lock to protect yet, so catch it here too.
+        let built = catch_panic(|| {
+            if db_path == ":memory:" {
+                Memoire::in_memory_ns(namespace)
+            } else {
+                Memoire::new_ns(db_path, namespace)
+            }
+        })
+        .map_err(|msg| panic_err("Memoire::new", msg))?;
+        let inner = built.map_err(db_err)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
         })
     }
 
     fn remember(&self, content: &str) -> PyResult<usize> {
-        let ids = lock!(self)
-            .remember(content)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(ids.len())
+        self.with_inner("remember", |m| {
+            m.remember(content).map(|ids| ids.len()).map_err(db_err)
+        })
+    }
+
+    /// Like `remember`, but returns the row ids that were actually inserted.
+    /// The list is shorter than the chunk count (possibly empty) when a chunk is
+    /// an exact duplicate of an existing memory or is rejected at ingestion.
+    fn remember_ids(&self, content: &str) -> PyResult<Vec<i64>> {
+        self.with_inner("remember_ids", |m| m.remember(content).map_err(db_err))
     }
 
     fn recall(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
-        let memories = lock!(self)
-            .recall(query, top_k)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(memories.into_iter().map(py_memory).collect())
+        self.with_inner("recall", |m| {
+            let memories = m.recall(query, top_k).map_err(db_err)?;
+            Ok(memories.into_iter().map(py_memory).collect())
+        })
     }
 
     #[pyo3(signature = (query, top_k, mmr_lambda = 0.5))]
     fn recall_mmr(&self, query: &str, top_k: usize, mmr_lambda: f32) -> PyResult<Vec<PyMemory>> {
-        let memories = lock!(self)
-            .recall_mmr(query, top_k, mmr_lambda)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(memories.into_iter().map(py_memory).collect())
+        self.with_inner("recall_mmr", |m| {
+            let memories = m.recall_mmr(query, top_k, mmr_lambda).map_err(db_err)?;
+            Ok(memories.into_iter().map(py_memory).collect())
+        })
     }
 
     fn recall_reranked(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
-        let memories = lock!(self)
-            .recall_reranked(query, top_k)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(memories.into_iter().map(py_memory).collect())
+        self.with_inner("recall_reranked", |m| {
+            let memories = m.recall_reranked(query, top_k).map_err(db_err)?;
+            Ok(memories.into_iter().map(py_memory).collect())
+        })
     }
 
     fn recall_explained(&self, query: &str, top_k: usize) -> PyResult<Vec<PyRecallAttribution>> {
-        let attributions = lock!(self)
-            .recall_explained(query, top_k)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(attributions
-            .into_iter()
-            .map(|a| PyRecallAttribution {
-                memory: py_memory(a.memory),
-                semantic_score: a.semantic_score,
-                trust: a.trust,
-                uncertainty: a.uncertainty,
-                effective_weight: a.effective_weight,
-                rank_score: a.rank_score,
-                reasons: a.reasons,
-            })
-            .collect())
+        self.with_inner("recall_explained", |m| {
+            let attributions = m.recall_explained(query, top_k).map_err(db_err)?;
+            Ok(attributions
+                .into_iter()
+                .map(|a| PyRecallAttribution {
+                    memory: py_memory(a.memory),
+                    semantic_score: a.semantic_score,
+                    trust: a.trust,
+                    uncertainty: a.uncertainty,
+                    effective_weight: a.effective_weight,
+                    rank_score: a.rank_score,
+                    reasons: a.reasons,
+                })
+                .collect())
+        })
     }
 
     fn recompute_prototypes(&self) -> PyResult<()> {
-        lock!(self)
-            .recompute_prototypes()
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(())
+        self.with_inner("recompute_prototypes", |m| {
+            m.recompute_prototypes().map_err(db_err)
+        })
     }
 
     fn forget(&self, memory_id: i64) -> PyResult<bool> {
-        let deleted = lock!(self)
-            .forget(memory_id)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(deleted)
+        self.with_inner("forget", |m| m.forget(memory_id).map_err(db_err))
     }
 
     fn count(&self) -> PyResult<i64> {
-        let count = lock!(self)
-            .count()
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(count)
+        self.with_inner("count", |m| m.count().map_err(db_err))
     }
 
     fn clear(&self) -> PyResult<()> {
-        lock!(self)
-            .clear()
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(())
+        self.with_inner("clear", |m| m.clear().map_err(db_err))
     }
 
     fn export_namespace(&self) -> PyResult<String> {
-        let value = lock!(self)
-            .export_namespace()
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        let json = serde_json::to_string(&value)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(json)
+        self.with_inner("export_namespace", |m| {
+            let value = m.export_namespace().map_err(db_err)?;
+            serde_json::to_string(&value).map_err(db_err)
+        })
     }
 
     /// `preserve_trust=False` (default) imports content only; `True` restores the
     /// snapshot's trust metadata within bounds. See `memoire::ImportTrust`.
     #[pyo3(signature = (snapshot_str, preserve_trust = false))]
     fn import_namespace(&self, snapshot_str: &str, preserve_trust: bool) -> PyResult<usize> {
-        let snapshot: serde_json::Value = serde_json::from_str(snapshot_str)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
+        let snapshot: serde_json::Value = serde_json::from_str(snapshot_str).map_err(db_err)?;
         let policy = if preserve_trust {
             crate::ImportTrust::PreserveBounded
         } else {
             crate::ImportTrust::Reset
         };
-        let count = lock!(self)
-            .import_namespace_with(&snapshot, policy)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(count)
+        self.with_inner("import_namespace", |m| {
+            m.import_namespace_with(&snapshot, policy).map_err(db_err)
+        })
     }
 
     fn resolve_contradictions(&self, memory_id: i64) -> PyResult<bool> {
-        lock!(self)
-            .store
-            .resolve_contradictions_for_id(memory_id)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(true)
+        self.with_inner("resolve_contradictions", |m| {
+            m.store
+                .resolve_contradictions_for_id(memory_id)
+                .map_err(db_err)?;
+            Ok(true)
+        })
     }
 
     #[pyo3(signature = (memory_id, agent_output, task_succeeded, session_id = None))]
@@ -239,27 +262,27 @@ impl PyMemoire {
         task_succeeded: bool,
         session_id: Option<&str>,
     ) -> PyResult<bool> {
-        let reinforced = lock!(self)
-            .reinforce_if_used_with_session(memory_id, agent_output, task_succeeded, session_id)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(reinforced)
+        self.with_inner("reinforce_if_used", |m| {
+            m.reinforce_if_used_with_session(memory_id, agent_output, task_succeeded, session_id)
+                .map_err(db_err)
+        })
     }
 
     fn penalize_if_used(&self, memory_ids: Vec<i64>, failure_severity: f32) -> PyResult<String> {
-        let outcomes = lock!(self)
-            .penalize_if_used(&memory_ids, failure_severity)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        let json = serde_json::to_string(&outcomes)
-            .map_err(|e| PyErr::new::<MemoireError, _>(e.to_string()))?;
-        Ok(json)
+        self.with_inner("penalize_if_used", |m| {
+            let outcomes = m
+                .penalize_if_used(&memory_ids, failure_severity)
+                .map_err(db_err)?;
+            serde_json::to_string(&outcomes).map_err(db_err)
+        })
     }
 
     /// Spawn the background maintenance task.
-    /// Uses `&self` (not `&mut self`) because inner is behind a Mutex,
-    /// so thread safety is provided by the lock, not exclusive access.
     fn start_background_maintenance(&self, interval_secs: u64, threshold: u32) -> PyResult<()> {
-        lock!(self).start_background_maintenance(interval_secs, threshold);
-        Ok(())
+        self.with_inner("start_background_maintenance", |m| {
+            m.start_background_maintenance(interval_secs, threshold);
+            Ok(())
+        })
     }
 }
 

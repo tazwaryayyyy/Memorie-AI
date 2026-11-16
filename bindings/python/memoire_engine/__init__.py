@@ -25,7 +25,7 @@ __all__ = [
     "MemoireError",
     "MemoryPolicy",
     "PolicyDecision",
-    # Framework adapters (opt-in — requires langchain or llama-index-core)
+    # Framework adapters (opt-in — requires langchain-core or llama-index-core)
     # from memoire_engine.adapters import MemoireRetriever, MemoireIndex
 ]
 __version__ = "0.1.0"

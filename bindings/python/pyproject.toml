@@ -25,6 +25,10 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "pytest-cov"]
+# Framework adapters (memoire_engine.adapters). Lower bounds are not tested
+# against older releases: langchain-core 1.8 and llama-index-core 0.14 were used.
+langchain = ["langchain-core>=0.3"]
+llama-index = ["llama-index-core>=0.10"]
 
 [project.urls]
 Homepage = "https://github.com/tazwaryayyyy/Memorie-AI"
