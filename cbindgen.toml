@@ -17,10 +17,14 @@ tab_width  = 2
 prefix = "memoire_"
 include = [
   "memoire_new",
+  "memoire_new_ns",
   "memoire_free",
   "memoire_remember",
   "memoire_recall",
+  "memoire_reinforce_if_used",
+  "memoire_penalize_if_used",
   "memoire_forget",
+  "memoire_resolve_contradictions",
   "memoire_count",
   "memoire_clear",
   "memoire_free_string",

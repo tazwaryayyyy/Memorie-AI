@@ -26,11 +26,13 @@ extern "C"
     /*
      * memoire_new_ns
      * --------------
-     * Open or create a Memoire database at `db_path` scoped to `namespace`.
-     * `namespace` may be NULL, in which case "default" is used.
+     * Open or create a Memoire database at `db_path` scoped to `namespace_`.
+     * `namespace_` may be NULL, in which case "default" is used.
      * Multiple handles sharing the same `db_path` but different namespaces
-     * are fully isolated — recall from one namespace never surfaces memories
-     * written by another.
+     * are fully isolated — recall, feedback (memoire_reinforce_if_used,
+     * memoire_penalize_if_used), memoire_forget and
+     * memoire_resolve_contradictions in one namespace never see or modify
+     * memories owned by another, even when given that memory's id.
      *
      * Returns: opaque handle (free with memoire_free), or NULL on error.
      */
@@ -39,7 +41,8 @@ extern "C"
     /*
      * memoire_free
      * ------------
-     * Destroy a handle. Safe to call on NULL.
+     * Destroy a handle returned by memoire_new or memoire_new_ns.
+     * Safe to call on NULL.
      */
     void memoire_free(MemoireHandle *handle);
 
@@ -48,7 +51,9 @@ extern "C"
      * ----------------
      * Chunk, embed, and store `content`.
      *
-     * Returns: chunks stored (>= 1) on success, -1 on error.
+     * Returns: number of chunks newly stored (>= 0) on success, -1 on error.
+     *          0 is not an error: blank input, chunks that exactly duplicate an
+     *          existing memory, and chunks rejected at ingestion are not counted.
      */
     int memoire_remember(MemoireHandle *handle, const char *content);
 
@@ -82,8 +87,8 @@ extern "C"
      *
      * `task_succeeded`: non-zero = task succeeded.
      *
-     * Returns: 1 = reinforced, 0 = not reinforced (attribution gate not met),
-     *          -1 = error.
+     * Returns: 1 = reinforced, 0 = not reinforced (attribution gate not met, or
+     *          the id is not owned by this handle's namespace), -1 = error.
      */
     int memoire_reinforce_if_used(MemoireHandle *handle,
                                   int64_t memory_id,
@@ -113,6 +118,8 @@ extern "C"
      *     },
      *     ...
      *   ]
+     *
+     * Ids that do not exist in this handle's namespace produce no outcome.
      */
     char *memoire_penalize_if_used(MemoireHandle *handle,
                                    const int64_t *ids,
@@ -124,7 +131,8 @@ extern "C"
      * --------------
      * Delete a memory by id.
      *
-     * Returns: 1 = deleted, 0 = not found, -1 = error.
+     * Returns: 1 = deleted, 0 = not found (including an id owned by another
+     *          namespace), -1 = error.
      */
     int memoire_forget(MemoireHandle *handle, int64_t id);
 
@@ -135,7 +143,8 @@ extern "C"
      * Scans for semantically similar memories with opposing polarity and archives
      * the lower-quality one.
      *
-     * Returns: 0 on success, -1 on error.
+     * Returns: 0 on success (an id not owned by this handle's namespace is a
+     *          no-op), -1 on error.
      */
     int memoire_resolve_contradictions(MemoireHandle *handle, int64_t id);
 
@@ -149,7 +158,7 @@ extern "C"
     /*
      * memoire_clear
      * -------------
-     * Erase ALL memories. Irreversible.
+     * Erase ALL memories in this handle's namespace. Irreversible.
      *
      * Returns: 0 on success, -1 on error.
      */

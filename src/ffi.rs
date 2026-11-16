@@ -8,10 +8,31 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_longlong};
 use std::ptr;
 
+use crate::panic_guard::catch_panic;
 use crate::Memoire;
 
 /// Opaque handle to a Memoire instance.
 pub struct MemoireHandle(Memoire);
+
+/// Run `f`, returning `on_panic` if it panics.
+///
+/// A panic that unwinds out of an `extern "C"` function aborts the whole host
+/// process (Rust >= 1.81; undefined behaviour before that). Every entry point
+/// that runs fallible engine code goes through this so a panic becomes the
+/// function's ordinary error value (`-1` / `NULL`) and is logged instead.
+///
+/// Relies on unwinding panics (the default). With `panic = "abort"` nothing can
+/// intercept the panic. Engine locks held at the panic point stay poisoned, so
+/// later calls on the same handle report errors; see [`catch_panic`].
+fn guarded<T>(name: &str, on_panic: T, f: impl FnOnce() -> T) -> T {
+    match catch_panic(f) {
+        Ok(value) => value,
+        Err(msg) => {
+            log::error!("{name}: panic caught at the FFI boundary: {msg}");
+            on_panic
+        }
+    }
+}
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
@@ -23,43 +44,50 @@ pub extern "C" fn memoire_new(db_path: *const c_char) -> *mut MemoireHandle {
     memoire_new_ns(db_path, ptr::null())
 }
 
-/// Create a new Memoire instance scoped to `namespace`.
+/// Create a new Memoire instance scoped to `namespace_`.
 ///
-/// `namespace` may be NULL, in which case `"default"` is used.
+/// `namespace_` may be NULL, in which case `"default"` is used.
 /// Multiple handles sharing the same `db_path` but different namespaces
-/// are fully isolated — recall from one namespace never surfaces memories
-/// written by another.
+/// are fully isolated — recall, feedback (`memoire_reinforce_if_used`,
+/// `memoire_penalize_if_used`), `memoire_forget` and
+/// `memoire_resolve_contradictions` in one namespace never see or modify
+/// memories owned by another, even when given that memory's id.
+///
+/// The parameter is named `namespace_` (not `namespace`) because `namespace` is a
+/// C++ keyword and generated headers copy Rust parameter names verbatim.
 ///
 /// Returns NULL on failure.
 #[no_mangle]
 pub extern "C" fn memoire_new_ns(
     db_path: *const c_char,
-    namespace: *const c_char,
+    namespace_: *const c_char,
 ) -> *mut MemoireHandle {
-    let path = match to_str(db_path) {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
-    let ns = to_str(namespace).unwrap_or("default");
-    let instance = if path == ":memory:" {
-        Memoire::in_memory_ns(ns)
-    } else {
-        Memoire::new_ns(path, ns)
-    };
-    match instance {
-        Ok(m) => Box::into_raw(Box::new(MemoireHandle(m))),
-        Err(e) => {
-            log::error!("memoire_new_ns failed: {e}");
-            ptr::null_mut()
+    guarded("memoire_new_ns", ptr::null_mut(), || {
+        let path = match to_str(db_path) {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+        let ns = to_str(namespace_).unwrap_or("default");
+        let instance = if path == ":memory:" {
+            Memoire::in_memory_ns(ns)
+        } else {
+            Memoire::new_ns(path, ns)
+        };
+        match instance {
+            Ok(m) => Box::into_raw(Box::new(MemoireHandle(m))),
+            Err(e) => {
+                log::error!("memoire_new_ns failed: {e}");
+                ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 /// Destroy a Memoire handle. Safe to call on NULL.
 ///
 /// # Safety
 /// `handle` must be either NULL or a pointer previously returned by
-/// `memoire_new` that has not already been freed.
+/// `memoire_new` or `memoire_new_ns` that has not already been freed.
 #[no_mangle]
 pub unsafe extern "C" fn memoire_free(handle: *mut MemoireHandle) {
     if !handle.is_null() {
@@ -69,24 +97,29 @@ pub unsafe extern "C" fn memoire_free(handle: *mut MemoireHandle) {
 
 // ─── Core API ────────────────────────────────────────────────────────────────
 
-/// Store `content`. Returns chunks stored (>= 1) or -1 on error.
+/// Store `content`. Returns the number of chunks newly stored, or -1 on error.
+///
+/// The count can be 0 (not an error): blank input, chunks that exactly duplicate
+/// an existing memory, and chunks rejected at ingestion are not counted.
 #[no_mangle]
 pub extern "C" fn memoire_remember(handle: *mut MemoireHandle, content: *const c_char) -> c_int {
-    let m = match mut_ref(handle) {
-        Some(h) => h,
-        None => return -1,
-    };
-    let content = match to_str(content) {
-        Some(s) => s,
-        None => return -1,
-    };
-    match m.remember(content) {
-        Ok(ids) => ids.len() as c_int,
-        Err(e) => {
-            log::error!("memoire_remember: {e}");
-            -1
+    guarded("memoire_remember", -1, || {
+        let m = match mut_ref(handle) {
+            Some(h) => h,
+            None => return -1,
+        };
+        let content = match to_str(content) {
+            Some(s) => s,
+            None => return -1,
+        };
+        match m.remember(content) {
+            Ok(ids) => ids.len() as c_int,
+            Err(e) => {
+                log::error!("memoire_remember: {e}");
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Retrieve the `top_k` most similar memories to `query`.
@@ -101,35 +134,38 @@ pub extern "C" fn memoire_recall(
     query: *const c_char,
     top_k: c_int,
 ) -> *mut c_char {
-    let m = match const_ref(handle) {
-        Some(h) => h,
-        None => return ptr::null_mut(),
-    };
-    let query = match to_str(query) {
-        Some(s) => s,
-        None => return ptr::null_mut(),
-    };
-    let k = if top_k <= 0 { 5 } else { top_k as usize };
+    guarded("memoire_recall", ptr::null_mut(), || {
+        let m = match const_ref(handle) {
+            Some(h) => h,
+            None => return ptr::null_mut(),
+        };
+        let query = match to_str(query) {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+        let k = if top_k <= 0 { 5 } else { top_k as usize };
 
-    match m.recall(query, k) {
-        Ok(memories) => {
-            let json = serde_json::to_string(&memories).unwrap_or_else(|_| "[]".to_string());
-            match CString::new(json) {
-                Ok(s) => s.into_raw(),
-                Err(_) => ptr::null_mut(),
+        match m.recall(query, k) {
+            Ok(memories) => {
+                let json = serde_json::to_string(&memories).unwrap_or_else(|_| "[]".to_string());
+                match CString::new(json) {
+                    Ok(s) => s.into_raw(),
+                    Err(_) => ptr::null_mut(),
+                }
+            }
+            Err(e) => {
+                log::error!("memoire_recall: {e}");
+                ptr::null_mut()
             }
         }
-        Err(e) => {
-            log::error!("memoire_recall: {e}");
-            ptr::null_mut()
-        }
-    }
+    })
 }
 
 /// Conditionally reinforce a memory based on whether the agent actually used it.
 ///
 /// `task_succeeded`: non-zero = succeeded.
-/// Returns 1=reinforced, 0=not reinforced, -1=error.
+/// Returns 1=reinforced, 0=not reinforced (including an id this handle's
+/// namespace does not own), -1=error.
 #[no_mangle]
 pub extern "C" fn memoire_reinforce_if_used(
     handle: *mut MemoireHandle,
@@ -137,22 +173,24 @@ pub extern "C" fn memoire_reinforce_if_used(
     agent_output: *const c_char,
     task_succeeded: c_int,
 ) -> c_int {
-    let m = match mut_ref(handle) {
-        Some(h) => h,
-        None => return -1,
-    };
-    let output = match to_str(agent_output) {
-        Some(s) => s,
-        None => return -1,
-    };
-    match m.reinforce_if_used(memory_id, output, task_succeeded != 0) {
-        Ok(true) => 1,
-        Ok(false) => 0,
-        Err(e) => {
-            log::error!("memoire_reinforce_if_used: {e}");
-            -1
+    guarded("memoire_reinforce_if_used", -1, || {
+        let m = match mut_ref(handle) {
+            Some(h) => h,
+            None => return -1,
+        };
+        let output = match to_str(agent_output) {
+            Some(s) => s,
+            None => return -1,
+        };
+        match m.reinforce_if_used(memory_id, output, task_succeeded != 0) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(e) => {
+                log::error!("memoire_reinforce_if_used: {e}");
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Penalize memories that contributed to a failed task outcome.
@@ -163,6 +201,7 @@ pub extern "C" fn memoire_reinforce_if_used(
 ///
 /// Returns a heap-allocated JSON string of `PenaltyOutcome` objects, or NULL
 /// on error.  **Caller MUST free it with `memoire_free_string`.**
+/// Ids that do not exist in this handle's namespace produce no outcome.
 ///
 /// JSON: `[{"id":1,"trust_before":0.62,"trust_after":0.41,"uncertainty_after":0.72}, ...]`
 ///
@@ -177,34 +216,37 @@ pub unsafe extern "C" fn memoire_penalize_if_used(
     ids_len: c_int,
     failure_severity: f32,
 ) -> *mut c_char {
-    let m = match mut_ref(handle) {
-        Some(h) => h,
-        None => return ptr::null_mut(),
-    };
-    if ids.is_null() || ids_len <= 0 {
-        return CString::new("[]")
-            .map(|s| s.into_raw())
-            .unwrap_or(ptr::null_mut());
-    }
-    let ids_slice = unsafe { std::slice::from_raw_parts(ids, ids_len as usize) };
-    match m.penalize_if_used(ids_slice, failure_severity) {
-        Ok(outcomes) => {
-            let json = serde_json::to_string(&outcomes).unwrap_or_else(|_| "[]".to_string());
-            CString::new(json)
+    guarded("memoire_penalize_if_used", ptr::null_mut(), || {
+        let m = match mut_ref(handle) {
+            Some(h) => h,
+            None => return ptr::null_mut(),
+        };
+        if ids.is_null() || ids_len <= 0 {
+            return CString::new("[]")
                 .map(|s| s.into_raw())
-                .unwrap_or(ptr::null_mut())
+                .unwrap_or(ptr::null_mut());
         }
-        Err(e) => {
-            log::error!("memoire_penalize_if_used: {e}");
-            ptr::null_mut()
+        let ids_slice = unsafe { std::slice::from_raw_parts(ids, ids_len as usize) };
+        match m.penalize_if_used(ids_slice, failure_severity) {
+            Ok(outcomes) => {
+                let json = serde_json::to_string(&outcomes).unwrap_or_else(|_| "[]".to_string());
+                CString::new(json)
+                    .map(|s| s.into_raw())
+                    .unwrap_or(ptr::null_mut())
+            }
+            Err(e) => {
+                log::error!("memoire_penalize_if_used: {e}");
+                ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
-/// Delete memory by id. Returns 1=deleted, 0=not found, -1=error.
+/// Delete memory by id. Returns 1=deleted, 0=not found (including an id owned by
+/// another namespace), -1=error.
 #[no_mangle]
 pub extern "C" fn memoire_forget(handle: *mut MemoireHandle, id: c_longlong) -> c_int {
-    match mut_ref(handle) {
+    guarded("memoire_forget", -1, || match mut_ref(handle) {
         Some(m) => match m.forget(id) {
             Ok(true) => 1,
             Ok(false) => 0,
@@ -214,53 +256,57 @@ pub extern "C" fn memoire_forget(handle: *mut MemoireHandle, id: c_longlong) -> 
             }
         },
         None => -1,
-    }
+    })
 }
 
 /// Resolve contradictions for a specific memory id. Returns 0 on success, -1 on error.
+/// An id this handle's namespace does not own is a successful no-op.
 #[no_mangle]
 pub extern "C" fn memoire_resolve_contradictions(
     handle: *mut MemoireHandle,
     id: c_longlong,
 ) -> c_int {
-    match mut_ref(handle) {
-        Some(m) => match m.store.resolve_contradictions_for_id(id) {
-            Ok(()) => 0,
-            Err(e) => {
-                log::error!("memoire_resolve_contradictions: {e}");
-                -1
-            }
-        },
-        None => -1,
-    }
+    guarded("memoire_resolve_contradictions", -1, || {
+        match mut_ref(handle) {
+            Some(m) => match m.store.resolve_contradictions_for_id(id) {
+                Ok(()) => 0,
+                Err(e) => {
+                    log::error!("memoire_resolve_contradictions: {e}");
+                    -1
+                }
+            },
+            None => -1,
+        }
+    })
 }
 
 /// Total stored chunks, or -1 on error.
 #[no_mangle]
 pub extern "C" fn memoire_count(handle: *const MemoireHandle) -> c_longlong {
-    match const_ref(handle) {
+    guarded("memoire_count", -1, || match const_ref(handle) {
         Some(m) => m.count().unwrap_or(-1),
         None => -1,
-    }
+    })
 }
 
-/// Erase all memories. Returns 0 on success, -1 on error.
+/// Erase all memories in this handle's namespace. Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn memoire_clear(handle: *mut MemoireHandle) -> c_int {
-    match mut_ref(handle) {
+    guarded("memoire_clear", -1, || match mut_ref(handle) {
         Some(m) => match m.clear() {
             Ok(()) => 0,
             Err(_) => -1,
         },
         None => -1,
-    }
+    })
 }
 
-/// Free a string returned by `memoire_recall`. Safe to call on NULL.
+/// Free a string returned by `memoire_recall` or `memoire_penalize_if_used`.
+/// Safe to call on NULL.
 ///
 /// # Safety
 /// `s` must be either NULL or a pointer previously returned by
-/// `memoire_recall` that has not already been freed.
+/// `memoire_recall` or `memoire_penalize_if_used` that has not already been freed.
 #[no_mangle]
 pub unsafe extern "C" fn memoire_free_string(s: *mut c_char) {
     if !s.is_null() {
@@ -309,4 +355,40 @@ fn const_ref(handle: *const MemoireHandle) -> Option<&'static Memoire> {
         return None;
     }
     Some(unsafe { &(*handle).0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guarded_returns_value_without_panic() {
+        assert_eq!(guarded("t", -1, || 7), 7);
+    }
+
+    #[test]
+    fn guarded_turns_panic_into_error_value() {
+        let r: c_int = guarded("t", -1, || panic!("boom"));
+        assert_eq!(r, -1);
+        let p: *mut c_char = guarded("t", ptr::null_mut(), || panic!("boom"));
+        assert!(p.is_null());
+    }
+
+    #[test]
+    fn null_handles_and_arguments_return_error_values() {
+        assert_eq!(memoire_remember(ptr::null_mut(), ptr::null()), -1);
+        assert!(memoire_recall(ptr::null(), ptr::null(), 5).is_null());
+        assert_eq!(
+            memoire_reinforce_if_used(ptr::null_mut(), 1, ptr::null(), 1),
+            -1
+        );
+        assert_eq!(memoire_forget(ptr::null_mut(), 1), -1);
+        assert_eq!(memoire_resolve_contradictions(ptr::null_mut(), 1), -1);
+        assert_eq!(memoire_count(ptr::null()), -1);
+        assert_eq!(memoire_clear(ptr::null_mut()), -1);
+        assert!(memoire_new(ptr::null()).is_null());
+        assert!(
+            unsafe { memoire_penalize_if_used(ptr::null_mut(), ptr::null(), 0, 1.0) }.is_null()
+        );
+    }
 }

@@ -540,8 +540,8 @@ impl Store {
                     reinforcement_count, confidence, importance_base,
                     created_at, store_state, contradiction_group,
                     failure_count, trust_ema
-             FROM memories WHERE id = ?1",
-            params![memory_id],
+             FROM memories WHERE id = ?1 AND namespace = ?2",
+            params![memory_id, self.namespace],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -629,8 +629,9 @@ impl Store {
         let mut stored_samples = 0i64;
         let mut last_session = None;
         let trust_row = conn.query_row(
-            "SELECT trust_variance, trust_samples, trust_last_session_id FROM memories WHERE id = ?1",
-            params![memory_id],
+            "SELECT trust_variance, trust_samples, trust_last_session_id FROM memories
+             WHERE id = ?1 AND namespace = ?2",
+            params![memory_id, self.namespace],
             |r| {
                 Ok((
                     r.get::<_, f64>(0)?,
@@ -677,7 +678,7 @@ impl Store {
                  trust_samples = ?5,
                  trust_last_session_id = ?6,
                  last_accessed_at = CAST(strftime('%s', 'now') AS INTEGER)
-             WHERE id = ?7",
+             WHERE id = ?7 AND namespace = ?8",
             params![
                 new_rc,
                 new_conf,
@@ -685,7 +686,8 @@ impl Store {
                 new_variance,
                 new_samples,
                 session_id,
-                memory_id
+                memory_id,
+                self.namespace
             ],
         )?;
         Ok(true)
@@ -711,8 +713,8 @@ impl Store {
                 "SELECT reinforcement_count, confidence, importance_base,
                         created_at, store_state, contradiction_group,
                         failure_count, trust_ema
-                 FROM memories WHERE id = ?1 AND archived = 0",
-                params![id],
+                 FROM memories WHERE id = ?1 AND namespace = ?2 AND archived = 0",
+                params![id, self.namespace],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
@@ -775,8 +777,16 @@ impl Store {
                      importance_base = ?3,
                      failure_count = ?4,
                      trust_ema = ?5
-                 WHERE id = ?6",
-                params![new_rc, new_conf, new_imp, new_fc, new_ema, id],
+                 WHERE id = ?6 AND namespace = ?7",
+                params![
+                    new_rc,
+                    new_conf,
+                    new_imp,
+                    new_fc,
+                    new_ema,
+                    id,
+                    self.namespace
+                ],
             )?;
 
             outcomes.push(PenaltyOutcome {
@@ -1084,10 +1094,13 @@ impl Store {
         if !result.is_empty() {
             let ids: Vec<String> = result.iter().map(|m| m.id.to_string()).collect();
             let placeholders = ids.join(",");
-            conn.execute_batch(&format!(
-                "UPDATE memories SET last_used_at = {now} WHERE id IN ({placeholders});",
-                now = now
-            ))?;
+            conn.execute(
+                &format!(
+                    "UPDATE memories SET last_used_at = ?1
+                     WHERE namespace = ?2 AND id IN ({placeholders})"
+                ),
+                params![now, ns],
+            )?;
         }
 
         Ok(result)
@@ -1257,8 +1270,9 @@ impl Store {
         for (other_id, _o_imp, _o_conf, _o_ev, _o_created) in contradictions {
             let existing = conn
                 .query_row(
-                    "SELECT trust_ema, reinforcement_count, created_at FROM memories WHERE id = ?1",
-                    params![other_id],
+                    "SELECT trust_ema, reinforcement_count, created_at FROM memories
+                     WHERE id = ?1 AND namespace = ?2",
+                    params![other_id, ns],
                     |r| {
                         Ok((
                             r.get::<_, Option<f32>>(0)?,
@@ -1287,8 +1301,8 @@ impl Store {
             let group = winner_id.to_string();
             conn.execute(
                 "UPDATE memories SET superseded_by = ?1, archived = 1, contradiction_group = ?2
-                 WHERE id = ?3",
-                params![winner_id, group, loser_id],
+                 WHERE id = ?3 AND namespace = ?4",
+                params![winner_id, group, loser_id, ns],
             )?;
             // Do NOT set contradiction_group on the winner. The loser already points to the
             // winner via superseded_by. Setting contradiction_group on the winner would put
@@ -1663,28 +1677,26 @@ impl Store {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
+        // `COALESCE(?5, created_at)` keeps the existing value when no timestamp was
+        // supplied. Scoped to this namespace so ids owned by another tenant are
+        // never touched, whatever the caller passes in `ids`.
         let query = format!(
-            "UPDATE memories SET trust_ema = ?1, reinforcement_count = ?2, importance_base = ?3, confidence = ?4 {} WHERE id IN ({})",
-            if created_at.is_some() { ", created_at = ?5" } else { "" },
-            placeholders
+            "UPDATE memories
+             SET trust_ema = ?1, reinforcement_count = ?2, importance_base = ?3,
+                 confidence = ?4, created_at = COALESCE(?5, created_at)
+             WHERE namespace = ?6 AND id IN ({placeholders})"
         );
-        if let Some(created) = created_at {
-            conn.execute(
-                &query,
-                params![
-                    trust_ema,
-                    reinforcement_count,
-                    importance_base,
-                    confidence,
-                    created
-                ],
-            )?;
-        } else {
-            conn.execute(
-                &query,
-                params![trust_ema, reinforcement_count, importance_base, confidence],
-            )?;
-        }
+        conn.execute(
+            &query,
+            params![
+                trust_ema,
+                reinforcement_count,
+                importance_base,
+                confidence,
+                created_at,
+                self.namespace
+            ],
+        )?;
         Ok(())
     }
 
@@ -1981,6 +1993,162 @@ mod tests {
         a.clear().unwrap();
         assert_eq!(a.count().unwrap(), 0);
         assert_eq!(b.count().unwrap(), 1, "a.clear() must not wipe tenant_b");
+    }
+
+    /// Raw feedback-related columns for one row, read with no namespace filter so a
+    /// test can see whether another tenant's call changed it.
+    #[derive(Debug, PartialEq)]
+    struct FeedbackRow {
+        reinforcement_count: i64,
+        failure_count: i64,
+        confidence: f32,
+        importance_base: f32,
+        trust_ema: Option<f32>,
+        trust_samples: i64,
+        trust_last_session_id: Option<String>,
+        last_accessed_at: Option<i64>,
+        created_at: i64,
+    }
+
+    fn raw_feedback_row(store: &Store, id: i64) -> FeedbackRow {
+        store
+            .pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT reinforcement_count, failure_count, confidence, importance_base,
+                        trust_ema, trust_samples, trust_last_session_id,
+                        last_accessed_at, created_at
+                 FROM memories WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(FeedbackRow {
+                        reinforcement_count: r.get(0)?,
+                        failure_count: r.get(1)?,
+                        confidence: r.get(2)?,
+                        importance_base: r.get(3)?,
+                        trust_ema: r.get(4)?,
+                        trust_samples: r.get(5)?,
+                        trust_last_session_id: r.get(6)?,
+                        last_accessed_at: r.get(7)?,
+                        created_at: r.get(8)?,
+                    })
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_reinforce_if_used_is_namespace_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = two_tenant_stores(dir.path());
+        let text = "decimal money correct precision";
+        let id_a = a.insert(text, &[1.0_f32, 0.0]).unwrap();
+        let before = raw_feedback_row(&a, id_a);
+
+        // The output equals the memory, so the Jaccard attribution gate would pass
+        // if the namespace filter were missing: only the namespace stops this call.
+        let reinforced = b
+            .reinforce_if_used(id_a, text, true, None, Some("tenant_b_session"))
+            .unwrap();
+        assert!(!reinforced, "tenant_b must not reinforce tenant_a's row");
+        assert_eq!(
+            raw_feedback_row(&a, id_a),
+            before,
+            "tenant_a's row must be unchanged"
+        );
+
+        // Control: the owning namespace can reinforce the same row.
+        assert!(a
+            .reinforce_if_used(id_a, text, true, None, Some("tenant_a_session"))
+            .unwrap());
+        let after = raw_feedback_row(&a, id_a);
+        assert_eq!(after.reinforcement_count, 1);
+        assert_eq!(
+            after.trust_last_session_id.as_deref(),
+            Some("tenant_a_session")
+        );
+    }
+
+    #[test]
+    fn test_penalize_if_used_is_namespace_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = two_tenant_stores(dir.path());
+        let id_a = a.insert("tenant a lesson", &[1.0_f32, 0.0]).unwrap();
+        let id_b = b.insert("tenant b lesson", &[0.0_f32, 1.0]).unwrap();
+        let before_a = raw_feedback_row(&a, id_a);
+
+        // Foreign id alone: no outcome, nothing written.
+        let outcomes = b.penalize_if_used(&[id_a], 1.0).unwrap();
+        assert!(outcomes.is_empty(), "foreign id must yield no outcome");
+        assert_eq!(raw_feedback_row(&a, id_a), before_a);
+
+        // Mixed batch: only the caller's own id is penalized.
+        let outcomes = b.penalize_if_used(&[id_a, id_b], 0.5).unwrap();
+        let penalized: Vec<i64> = outcomes.iter().map(|o| o.id).collect();
+        assert_eq!(penalized, [id_b]);
+        assert_eq!(raw_feedback_row(&a, id_a), before_a);
+        assert_eq!(raw_feedback_row(&b, id_b).failure_count, 1);
+
+        // Control: the owning namespace can penalize its own row.
+        let outcomes = a.penalize_if_used(&[id_a], 1.0).unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let after_a = raw_feedback_row(&a, id_a);
+        assert_eq!(after_a.failure_count, 1);
+        assert!(after_a.confidence < before_a.confidence);
+    }
+
+    #[test]
+    fn test_resolve_contradictions_ignores_foreign_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = two_tenant_stores(dir.path());
+        let emb = [0.577_f32, 0.577, 0.577];
+
+        let mut meta1 = QualityMeta::default_active("never use floats");
+        meta1.claim_value = Some("negative".to_string());
+        a.insert_with_quality("never use floats", &emb, &meta1)
+            .unwrap();
+        let mut meta2 = QualityMeta::default_active("always use floats");
+        meta2.claim_value = Some("affirmative".to_string());
+        let id2 = a
+            .insert_with_quality("always use floats", &emb, &meta2)
+            .unwrap();
+
+        b.resolve_contradictions_for_id(id2).unwrap();
+        assert_eq!(a.count().unwrap(), 2, "tenant_b must not archive a's rows");
+
+        // Control: the owning namespace does resolve the pair.
+        a.resolve_contradictions_for_id(id2).unwrap();
+        assert_eq!(a.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_update_imported_metadata_is_namespace_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = two_tenant_stores(dir.path());
+        let id_a = a.insert("tenant a import", &[1.0_f32, 0.0]).unwrap();
+        let id_b = b.insert("tenant b import", &[0.0_f32, 1.0]).unwrap();
+        let before_a = raw_feedback_row(&a, id_a);
+
+        b.update_imported_metadata(&[id_a, id_b], Some(0.9), 500, 0.9, 0.9, Some(1_000))
+            .unwrap();
+
+        assert_eq!(
+            raw_feedback_row(&a, id_a),
+            before_a,
+            "tenant_b must not rewrite tenant_a's metadata"
+        );
+        let row_b = raw_feedback_row(&b, id_b);
+        assert_eq!(row_b.reinforcement_count, 500);
+        assert_eq!(row_b.trust_ema, Some(0.9));
+        assert_eq!(row_b.created_at, 1_000);
+
+        // `created_at = None` keeps the stored timestamp.
+        b.update_imported_metadata(&[id_b], Some(0.9), 7, 0.9, 0.9, None)
+            .unwrap();
+        let row_b = raw_feedback_row(&b, id_b);
+        assert_eq!(row_b.reinforcement_count, 7);
+        assert_eq!(row_b.created_at, 1_000);
     }
 
     #[test]
