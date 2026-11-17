@@ -514,10 +514,11 @@ impl Memoire {
 
     /// Reinforce a memory only when it was actually used by the agent.
     ///
-    /// Fires when: `task_succeeded` AND (
-    ///   Jaccard token-overlap between memory content and `agent_output` >= 15%
-    ///   OR cosine(memory_embedding, embed(agent_output)) >= 0.75
-    /// )
+    /// Fires when `task_succeeded` AND at least one attribution gate passes:
+    ///
+    /// - Jaccard token overlap between memory content and `agent_output` is at
+    ///   least `ScoringConfig::jaccard_threshold` (default 0.35), or
+    /// - cosine(memory_embedding, embed(agent_output)) is at least 0.75.
     ///
     /// The cosine path catches semantic paraphrase where wording differs.
     /// Returns `true` if reinforcement was applied.

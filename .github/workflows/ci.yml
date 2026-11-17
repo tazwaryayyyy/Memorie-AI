@@ -59,11 +59,14 @@ jobs:
       - name: Unit tests
         run: cargo test --lib
 
+      - name: CLI and HTTP server tests
+        run: cargo test --bins
+
       - name: Integration tests
         run: cargo test --test integration_test
 
-      - name: Oracle, import-security and ONNX Runtime link tests
-        run: cargo test --test oracle --test import_security --test ort_smoke
+      - name: Oracle, import-security, feedback-error and ONNX Runtime link tests
+        run: cargo test --test oracle --test import_security --test feedback_errors --test ort_smoke
 
       - name: Doc tests
         run: cargo test --doc

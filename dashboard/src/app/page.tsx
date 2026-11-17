@@ -35,7 +35,7 @@ interface DatabaseInfo {
   name: string;
   exists: boolean;
   memories: Memory[];
-  info: string;
+  info: Record<string, unknown>;
   error: string | null;
 }
 
@@ -250,7 +250,7 @@ export default function Dashboard() {
                 Memoire AI
               </h1>
               <p className="text-[10px] text-zinc-500 font-semibold tracking-widest uppercase">
-                Observability Dashboard
+                Observability Dashboard (experimental)
               </p>
             </div>
           </div>
@@ -580,7 +580,7 @@ export default function Dashboard() {
           <p>© 2026 Memoire AI. Open-source local-first semantic memory.</p>
           <div className="flex items-center gap-4">
             <span className="bg-zinc-900 text-zinc-500 border border-zinc-800 px-2 py-0.5 rounded font-mono text-[10px]">
-              V0.1.0-PRODUCTION
+              EXPERIMENTAL · LOCAL ONLY
             </span>
           </div>
         </div>

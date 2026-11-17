@@ -7,6 +7,7 @@
 *.dylib
 *.dll
 *.pyd
+*.pdb
 .fastembed_cache/
 .pytest_cache/
 pytest-cache-files-*/
