@@ -2,8 +2,12 @@ import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { guardResponse } from '@/lib/guardResponse';
 
-export async function GET() {
+export async function GET(req: Request) {
+  const blocked = guardResponse(req);
+  if (blocked) return blocked;
+
   try {
     const logPath = path.join(os.homedir(), '.memoire', 'logs', 'mcp-server.jsonl');
 

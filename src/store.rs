@@ -571,7 +571,11 @@ impl Store {
             trust_ema_stored,
         ) = match row {
             Ok(v) => v,
-            Err(_) => return Ok(false),
+            // Unknown id, or an id owned by another namespace: not an error.
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+            // Anything else (locked/corrupt DB, schema or type mismatch) is a
+            // real failure and must not look like "attribution gate not met".
+            Err(e) => return Err(e.into()),
         };
 
         // Path 1: Jaccard token overlap (threshold raised to config.jaccard_threshold)

@@ -3,9 +3,9 @@
 //! A command-line interface to the Memoire memory engine.
 //!
 //! Usage:
-//!   memoire [--db PATH] [--ns NAMESPACE] <COMMAND> [ARGS]
+//!   memoire-cli [--db PATH] [--ns NAMESPACE] <COMMAND> [ARGS]
 //!
-//! Run `memoire --help` for the full command reference.
+//! Run `memoire-cli --help` for the full command reference.
 
 use std::env;
 use std::fs;
@@ -18,7 +18,7 @@ const HELP: &str = r#"
 Memoire — local-first semantic memory for AI agents
 
 USAGE:
-    memoire [OPTIONS] <COMMAND> [ARGS]
+    memoire-cli [OPTIONS] <COMMAND> [ARGS]
 
 OPTIONS:
     --db <PATH>          Path to the SQLite database (default: ./memoire.db)
@@ -44,16 +44,16 @@ COMMANDS:
     cache-models                  Pre-download embedding models to local cache
 
 EXAMPLES:
-    memoire remember "Fixed off-by-one error in pagination endpoint"
-    memoire recall "what pagination bugs did I fix?" --top 3
-    memoire recall "auth" --json | jq '.[0].content'
-    memoire recall "performance" --min-score 0.7
-    echo "Refactored DB pool" | memoire remember -
-    memoire export --output backup.json
-    memoire --ns billing-agent export --output billing.json
-    memoire --ns billing-agent import billing.json
-    memoire ingest ./session_notes.txt
-    memoire --db /tmp/test.db count
+    memoire-cli remember "Fixed off-by-one error in pagination endpoint"
+    memoire-cli recall "what pagination bugs did I fix?" --top 3
+    memoire-cli recall "auth" --json | jq '.[0].content'
+    memoire-cli recall "performance" --min-score 0.7
+    echo "Refactored DB pool" | memoire-cli remember -
+    memoire-cli export --output backup.json
+    memoire-cli --ns billing-agent export --output billing.json
+    memoire-cli --ns billing-agent import billing.json
+    memoire-cli ingest ./session_notes.txt
+    memoire-cli --db /tmp/test.db count
 "#;
 
 struct Args {
@@ -98,7 +98,10 @@ enum Command {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let raw: Vec<String> = env::args().skip(1).collect();
+    parse_args_from(env::args().skip(1).collect())
+}
+
+fn parse_args_from(raw: Vec<String>) -> Result<Args, String> {
     let mut db = "./memoire.db".to_string();
     let mut ns = "default".to_string();
     let mut i = 0;
@@ -162,6 +165,9 @@ fn parse_args() -> Result<Args, String> {
                             .get(i)
                             .and_then(|s| s.parse().ok())
                             .ok_or("--top requires a positive integer")?;
+                        if top == 0 || top > 1000 {
+                            return Err("--top must be between 1 and 1000".into());
+                        }
                     }
                     "--json" => json = true,
                     "--min-score" => {
@@ -171,7 +177,7 @@ fn parse_args() -> Result<Args, String> {
                             .and_then(|s| s.parse().ok())
                             .ok_or("--min-score requires a float in [0.0, 1.0]")?;
                     }
-                    _ => {}
+                    other => return Err(format!("recall: unknown argument {other:?}")),
                 }
                 i += 1;
             }
@@ -194,16 +200,29 @@ fn parse_args() -> Result<Args, String> {
         "count" => Command::Count,
 
         "clear" => {
-            let confirmed = raw.get(i).map(String::as_str) == Some("--confirm");
+            let mut confirmed = false;
+            for arg in raw.get(i..).unwrap_or(&[]) {
+                match arg.as_str() {
+                    "--confirm" => confirmed = true,
+                    other => return Err(format!("clear: unknown argument {other:?}")),
+                }
+            }
             Command::Clear { confirmed }
         }
 
         "export" => {
             let mut output = None;
             while i < raw.len() {
-                if raw[i] == "--output" || raw[i] == "-o" {
-                    i += 1;
-                    output = raw.get(i).cloned();
+                match raw[i].as_str() {
+                    "--output" | "-o" => {
+                        i += 1;
+                        output = Some(raw.get(i).cloned().ok_or("--output requires a file path")?);
+                    }
+                    // `--ns` is a global option and must come BEFORE the command;
+                    // silently ignoring it here would export the wrong namespace.
+                    other => return Err(format!(
+                        "export: unknown argument {other:?} (global options such as --ns go before the command)"
+                    )),
                 }
                 i += 1;
             }
@@ -216,8 +235,14 @@ fn parse_args() -> Result<Args, String> {
             for arg in raw.get(i..).unwrap_or(&[]) {
                 if arg == "--preserve-trust" {
                     preserve_trust = true;
+                } else if arg != "-" && arg.starts_with('-') {
+                    return Err(format!(
+                        "import: unknown argument {arg:?} (global options such as --ns go before the command)"
+                    ));
                 } else if file.is_none() {
                     file = Some(arg.clone());
+                } else {
+                    return Err(format!("import: unexpected extra argument {arg:?}"));
                 }
             }
             let file = file.ok_or("import requires a file path (or \"-\" for stdin)")?;
@@ -473,5 +498,71 @@ fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args_from(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn global_ns_before_command_is_honoured() {
+        let a = parse(&["--ns", "billing", "export", "--output", "b.json"]).unwrap();
+        assert_eq!(a.ns, "billing");
+        assert!(matches!(a.command, Command::Export { output: Some(ref o) } if o == "b.json"));
+    }
+
+    #[test]
+    fn export_rejects_namespace_after_command() {
+        // Previously ignored silently, exporting the *default* namespace.
+        let e = parse(&["export", "--namespace", "billing", "--output", "b.json"])
+            .err()
+            .expect("must be rejected");
+        assert!(e.contains("--namespace"), "{e}");
+    }
+
+    #[test]
+    fn export_output_requires_a_value() {
+        assert!(parse(&["export", "--output"]).is_err());
+    }
+
+    #[test]
+    fn import_rejects_namespace_after_command_and_extra_positionals() {
+        assert!(parse(&["import", "f.json", "--namespace", "x"]).is_err());
+        assert!(parse(&["import", "f.json", "x"]).is_err());
+        let ok = parse(&["import", "f.json", "--preserve-trust"]).unwrap();
+        assert!(matches!(
+            ok.command,
+            Command::Import {
+                preserve_trust: true,
+                ..
+            }
+        ));
+        assert!(parse(&["import", "-"]).is_ok(), "\"-\" means stdin");
+    }
+
+    #[test]
+    fn recall_rejects_unknown_flags_and_bad_top() {
+        assert!(parse(&["recall", "q", "--bogus"]).is_err());
+        assert!(parse(&["recall", "q", "--top", "0"]).is_err());
+        assert!(parse(&["recall", "q", "--top", "100000"]).is_err());
+        assert!(parse(&["recall", "q", "--top", "3", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn clear_requires_exactly_confirm() {
+        assert!(matches!(
+            parse(&["clear"]).unwrap().command,
+            Command::Clear { confirmed: false }
+        ));
+        assert!(matches!(
+            parse(&["clear", "--confirm"]).unwrap().command,
+            Command::Clear { confirmed: true }
+        ));
+        assert!(parse(&["clear", "--namespace", "x", "--confirm"]).is_err());
     }
 }

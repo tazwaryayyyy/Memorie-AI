@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-Agent behavior benchmark for Memoire quality-control claims.
+SYNTHETIC SMOKE TEST - NOT AN LLM BENCHMARK.
+
+The "agent" in this script is a deterministic stand-in (`baseline_generator()`
+with substring if/else branches) run over a handful of scripted tasks. The
+numbers it prints show that the plumbing works and that the arms differ on this
+fixed script. They say NOTHING about how real LLM agents behave and must not be
+cited as evidence that Memoire improves agent reliability. That claim is still
+untested; it needs a controlled multi-trial benchmark with a real LLM, a
+no-memory arm, a plain-vector-memory arm and a Memoire arm, with raw logs and
+failure cases published.
 
 Runs three arms:
 - no_memory: no persistence
@@ -219,6 +228,12 @@ def summarize(results: List[RunResult]) -> dict:
     }
 
 
+SYNTHETIC_DISCLAIMER = (
+    "SYNTHETIC SMOKE TEST: a deterministic scripted agent on fixed tasks. "
+    "These numbers are NOT evidence about real LLM agents."
+)
+
+
 def main() -> None:
     tasks = paired_tasks()
     out_dir = Path("benchmark_outputs")
@@ -240,13 +255,21 @@ def main() -> None:
         delta = ((baseline - improved) / baseline) * 100.0
 
     report = {
-        "headline": f"Agents with MQCL made {delta:.1f}% fewer repeated mistakes vs no memory.",
+        "synthetic": True,
+        "disclaimer": SYNTHETIC_DISCLAIMER,
+        "headline": (
+            "[SYNTHETIC SMOKE TEST, not an LLM benchmark] On this scripted harness the "
+            f"mqcl arm repeated {delta:.1f}% fewer mistakes than no_memory."
+        ),
         "results": all_results,
     }
 
     out_file = out_dir / "agent_behavior_report.json"
     out_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
+    print("=" * 72)
+    print(SYNTHETIC_DISCLAIMER)
+    print("=" * 72)
     print(report["headline"])
     print("Saved report:", out_file)
     for arm, payload in all_results.items():

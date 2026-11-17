@@ -1,17 +1,22 @@
 """
-Brutal demo moment for judges.
+Scripted illustration of Memoire's trust / feedback API.
 
-DEMO FROZEN — do not add arms, scenarios, or extra output.
-The three arms are fixed. The failure → correction loop is the story.
+IMPORTANT: the "agent" below (`simulate_agent_code`) is a deterministic string
+matcher, NOT an LLM. This demo shows the mechanics (store -> recall -> policy ->
+reinforce / penalize); it is not evidence that Memoire improves real agents.
+That needs the controlled real-LLM benchmark that is still to be done.
 
-Shows three arms:
-  1. No memory      — agent repeats the same float-money mistake twice.
-  2. Memoire + MQCL + Trust — lesson stored after failure, recalled with trust
-     score, policy decides FOLLOW → agent avoids the mistake.
-  3. Failure-Feedback Loop — wrong memory penalized → trust drops → suppressed →
-     correct lesson wins.
+Three arms:
+  1. No memory       - the scripted agent repeats the same float-money mistake.
+  2. Memoire + trust - a lesson is stored after a failure; whether the scripted
+     agent benefits depends on the trust the memory actually has at recall time.
+  3. Failure feedback - a wrong memory is penalized with penalize_if_used.
 
-The output is designed to be screenshot-worthy for a judge panel.
+Every "Outcome" line below is computed from what happened in the run, so it can
+report a failure. Known limitation (scoring thresholds are deliberately NOT
+changed here): a memory stored once starts with a low cold-start trust and only
+rises through reinforce_if_used, so on a first run it may land in HINT or IGNORE
+instead of FOLLOW, and the scripted agent may then never see it.
 
 Usage (inside a virtualenv; needs a Rust toolchain):
   cd bindings/python && maturin develop --release && cd ../..
@@ -45,6 +50,13 @@ def passes_money_tests(code: str) -> bool:
     return "Decimal" in code and "float" not in code
 
 
+COLD_START_NOTE = (
+    "  Note: scripted agent, not an LLM. A freshly stored memory has low cold-start\n"
+    "  trust (rc=0) and only rises via reinforce_if_used; with the default policy\n"
+    "  (HINT>=0.40, FOLLOW>=0.70) it may be HINT or IGNORE, not FOLLOW."
+)
+
+
 # ─── Arm 1: no memory ─────────────────────────────────────────────────────────
 
 def run_without_memory() -> None:
@@ -67,7 +79,12 @@ def run_without_memory() -> None:
     print(f"    Code  : {c2.strip()}")
     print(f"    Tests : {r2}")
 
-    print("\n  ★ JUDGE MOMENT: same float mistake repeated. No memory = no learning.")
+    if r1 == "FAIL" and r2 == "FAIL":
+        print("\n  Outcome: both tasks FAIL. With no memory the scripted agent repeats "
+              "the same float mistake (by construction).")
+    else:
+        print(f"\n  Outcome: Task 1 {r1}, Task 2 {r2} "
+              "(unexpected for the scripted no-memory agent).")
 
 
 # ─── Arm 2: Memoire + MQCL + Trust ───────────────────────────────────────────
@@ -119,9 +136,10 @@ def run_with_trust() -> None:
 
         recalled = m.recall(
             "money precision for refunds and discounts", top_k=3)
+        # Demo-side filter applied before the policy sees the results.
         recalled = [r for r in recalled if r.score >= 0.45]
 
-        print(f"\n  [RECALL]  {len(recalled)} result(s)")
+        print(f"\n  [RECALL]  {len(recalled)} result(s) with score >= 0.45")
         decisions = policy.evaluate(recalled)
         for d in decisions:
             mem = d.memory
@@ -154,8 +172,10 @@ def run_with_trust() -> None:
         print(f"    Tests : {'PASS' if r2_pass else 'FAIL'}")
 
         # Conditional reinforcement + influence log
+        reinforced = False
         if r2_pass and stored_id is not None:
-            trust_before = recalled[0].trust if recalled else 0.0
+            trust_before = next(
+                (r.trust for r in recalled if r.id == stored_id), 0.0)
             reinforced = m.reinforce_if_used(
                 stored_id, c2, task_succeeded=True)
             if reinforced:
@@ -163,7 +183,7 @@ def run_with_trust() -> None:
                 trust_after = updated[0].trust if updated else 0.0
                 trust_delta = trust_after - trust_before
                 print(
-                    "    \u2192 Mistake avoided: float precision error (previously failed)")
+                    "    \u2192 Scripted agent produced Decimal instead of float")
                 print(
                     f"    \u2192 Memory reinforced. Trust updated to {trust_after:.3f} (rc now=1).")
                 print()
@@ -171,11 +191,25 @@ def run_with_trust() -> None:
                 print(f"    \u2192 memory_id={stored_id}")
                 print("    \u2192 changed decision: float \u2192 Decimal")
                 print(
-                    f"    → trust_delta=+{trust_delta:.2f}  ({trust_before:.3f} → {trust_after:.3f})")
+                    f"    → trust_delta={trust_delta:+.2f}  ({trust_before:.3f} → {trust_after:.3f})")
             else:
                 print("    → Token overlap below threshold — reinforcement skipped.")
 
-        print("\n  ★ JUDGE MOMENT: agent followed memory → mistake avoided → trust grew.")
+        used = follow_count + hint_count
+        print()
+        if r2_pass and used:
+            print(f"  Outcome: Task 2 PASS with {follow_count} follow / {hint_count} hint "
+                  "memory injected. " + ("Reinforcement applied." if reinforced else
+                  "Reinforcement skipped (attribution gate not met)."))
+        elif r2_pass:
+            print("  Outcome: Task 2 PASS but no memory was injected, "
+                  "so the pass is not attributable to memory.")
+        elif used:
+            print(f"  Outcome: Task 2 FAIL even though {used} memory/memories were injected.")
+        else:
+            print("  Outcome: Task 2 FAIL. No memory reached the agent "
+                  f"({len(recalled)} recalled, all IGNORE or filtered out).")
+        print(COLD_START_NOTE)
 
 
 # ─── Arm 3: Failure-Feedback Loop ────────────────────────────────────────────
@@ -241,31 +275,31 @@ def run_with_failure_feedback() -> None:
         print(f"    Tests : {'PASS' if task_passed else 'FAIL'}")
 
         # ── Failure feedback: penalize memories that were used ─────────────────
+        penalized = False
         if not task_passed and used_ids:
             outcomes = m.penalize_if_used(used_ids, failure_severity=1.0)
+            penalized = bool(outcomes)
             print("\n  [FAILURE FEEDBACK]")
             for o in outcomes:
-                direction = (
-                    "↓ below HINT threshold"
-                    if o["trust_after"] < 0.40
-                    else "↓ declining"
-                )
+                if o["trust_after"] >= o["trust_before"]:
+                    direction = "no decrease"
+                elif o["trust_after"] < policy.HINT_THRESHOLD:
+                    direction = f"↓ below HINT threshold {policy.HINT_THRESHOLD:.2f}"
+                else:
+                    direction = "↓ declining"
                 print(f"    → memory_id={o['id']} penalized (severity=1.0)")
                 print(
                     f"    → trust {o['trust_before']:.3f} → {o['trust_after']:.3f}  "
                     f"({direction})"
                 )
-                print(
-                    f"    → uncertainty now {o['uncertainty_after']:.3f}  "
-                    "(high oscillation signal)"
-                )
-            print("    → System corrected itself after 1 failure.")
+                print(f"    → uncertainty now {o['uncertainty_after']:.3f}")
+            print("    → Penalty applied; Task 2 shows whether it changed the outcome.")
         elif not task_passed:
             print("\n  [FAILURE FEEDBACK]")
             print(
-                "    \u2192 no memories were injected; wrong lesson was already suppressed")
+                "    \u2192 no memory was injected (the policy ignored every recalled memory)")
             print(
-                f"    \u2192 wrong lesson trust: {initial_trust:.3f} (below HINT threshold)")
+                f"    \u2192 wrong lesson trust at setup: {initial_trust:.3f}")
 
         # ── Store the correct lesson ──────────────────────────────────────────
         correct_lesson = (
@@ -286,12 +320,19 @@ def run_with_failure_feedback() -> None:
         print(f"\n  [RECALL]  {len(recalled2)} result(s)")
         for d in decisions2:
             mem = d.memory
-            tag = "(penalized)" if wrong_id and mem.id == wrong_id else "(correct)"
+            if wrong_id is not None and mem.id == wrong_id:
+                tag = "(wrong lesson)"
+            elif correct_id is not None and mem.id == correct_id:
+                tag = "(correct lesson)"
+            else:
+                tag = ""
             print(
                 f"    \u2192 \"{mem.content[:55]}{'…' if len(mem.content) > 55 else ''}\" "
                 f"| trust={mem.trust:.3f} | action={d.action.upper()} {tag}"
             )
 
+        wrong_injected2 = any(
+            d.memory.id == wrong_id and d.action != "ignore" for d in decisions2)
         context_block2 = policy.inject_context(decisions2)
         code2 = simulate_agent_code(task, context_block2)
         task_passed2 = passes_money_tests(code2)
@@ -308,18 +349,22 @@ def run_with_failure_feedback() -> None:
                     f"    \u2192 Correct lesson reinforced. Trust now {updated[0].trust:.3f} (rc=1)."
                 )
 
-    print(
-        "\n  \u2733 JUDGE MOMENT: wrong memory penalized \u2192 suppressed \u2192 "
-        "correct lesson won."
-    )
+        print()
+        if penalized and task_passed2 and not wrong_injected2:
+            print("  Outcome: wrong lesson penalized and NOT injected on retry; "
+                  "correct lesson used; Task 2 PASS.")
+        else:
+            print(f"  Outcome: penalized={penalized}, wrong lesson injected on retry="
+                  f"{wrong_injected2}, Task 2 {'PASS' if task_passed2 else 'FAIL'}. "
+                  "The penalize-then-recover sequence did not fully play out in this run.")
+        print(COLD_START_NOTE)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     print("=" * 60)
-    print("  Memoire · Trust Score Demo")
-    print("  \"It doesn't just remember — it decides what to trust.\"")
+    print("  Memoire · Trust Score Demo (scripted agent, not an LLM)")
     print("=" * 60)
     run_without_memory()
     run_with_trust()
