@@ -5,6 +5,10 @@ All notable changes to Memoire will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+> **Release status:** no version has been tagged or published to any registry. `Cargo.toml`,
+> `bindings/python/pyproject.toml` and `mcp-server/pyproject.toml` are all at `0.1.0`. The
+> `0.2.0` / `0.3.0` entries below record development milestones, not published releases.
+
 ---
 
 ## [Unreleased]
@@ -56,14 +60,79 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - MCP `memoire_clear` and `memoire_import` are not exposed unless `MEMOIRE_ENABLE_ADMIN_TOOLS=1`;
   `memoire_import` never preserves trust and accepts at most 1000 memories per call.
 
+### Fixed (stabilization, `fix/p0-stabilization`, steps 1-7a)
+- `Store::clone()` now shares one `Arc<RwLock<StoreInner>>`, so clones see the same
+  `embedding_cache`, `fingerprints` and HNSW index instead of diverging copies.
+- `Memoire::start_background_maintenance` reuses an ambient Tokio runtime or starts a private
+  one-worker runtime, and `Drop` aborts all watcher tasks and shuts the owned runtime down.
+- Namespace scoping also applied to `forget`, `clear` and `maintenance_pass`; fingerprints are
+  released when a row is deleted or pruned, so identical content can be stored again.
+- `embedder.dim()` fallback, `r2d2` `min_idle(1)` (no 20 eager connections at startup) and
+  `as_chunks::<4>()` for embedding blob decoding.
+- `OnnxNliChecker` now parses `id2label` from the model's `config.json`, its label is
+  authoritative when a model is set (`Store::set_nli_checker`), and the lexical fallback runs
+  only with no ONNX model or on inference error. There is still no automated test with a real
+  MNLI model.
+- Build: removed `+avx2,+fma` and `jobs=4` from `.cargo/config.toml` (binaries must run on any
+  x86_64 CPU); `wasm32` dependencies are gated in `Cargo.toml`; `*.pdb` is gitignored.
+- Text handling: char-boundary-safe `truncate_chars` / `preview` (`src/text.rs`).
+- PyO3 calls convert panics into `MemoireError` (`src/panic_guard.rs`, `with_inner` +
+  `catch_panic`) without poisoning the handle mutex; C FFI uses `guarded`.
+- Python: `Memoire.remember_ids()` returns chunk ids (`remember()` returns the chunk count);
+  Python 3.10 compatibility in the examples; `examples/agent_demo.py` frees `c_char_p` results
+  correctly.
+- MCP server: import order, UTC timestamps in logs, shadow gate on recall, `.memoire_path`
+  workspace containment.
+- CLI (`memoire-cli`) rejects unknown or misplaced flags (for example `--namespace` after the
+  subcommand) and bounds `--top` to `1..=1000`.
+- `examples/brutal_moment_demo.py` prints honest conditional banners instead of a fixed
+  pass message, and `scripts/agent_behavior_benchmark.py` is labelled
+  `[SYNTHETIC SMOKE TEST, not an LLM benchmark]`. Neither is evidence of agent improvement.
+
+### Security (steps 6-7a, continued)
+- `memoire-server` (experimental, local-only): binds `127.0.0.1` only; `MEMOIRE_API_TOKEN`
+  unset means unauthenticated loopback, set-but-blank exits with code `2`, set requires a
+  constant-time BLAKE3-checked Bearer token (except `GET /health`); loopback `Host` required
+  and loopback `Origin` required when present; `db` must resolve inside `MEMOIRE_ALLOWED_PATHS`
+  (default: working directory); `/clear` and `preserve_trust` need `MEMOIRE_ENABLE_ADMIN_TOOLS`;
+  2 MiB body limit and at most 16 open (database, namespace) instances.
+- Dashboard (experimental, local-only): bound to `127.0.0.1`; API routes use
+  `dashboard/src/lib/localGuard.ts` (Host, Origin, `Sec-Fetch-Site`, JSON content type),
+  default-deny path roots, forward `MEMOIRE_API_TOKEN`; the `clear` action was removed.
+
+### Added
+- `SECURITY.md`: threat model, `memoire-server` / MCP / dashboard controls, import trust, SQLite
+  deletion and WAL caveats, supply-chain notes, and a disclosure process.
+- CI now also runs `tests/ffi_header_parity.rs` and `tests/namespace_feedback.rs`.
+
+### Documentation
+- `README.md` rewritten to match the code: correct package and binary names (nothing is
+  published yet), working source-build commands, `MemoryPolicy` thresholds (`0.70`/`0.40`,
+  strict `0.80`/`0.50`), `remember()` vs `remember_ids()`, model-cache precedence
+  (`$HF_HOME`, `$FASTEMBED_CACHE_DIR`, `./.fastembed_cache`) and the cold-start download, a
+  support matrix, an accurate description of what CI runs, and a Known Limitations section
+  (cold-start `shadow` deadlock, no real-LLM evaluation).
+- `docs/ARCHITECTURE.md`: corrected the contradiction-resolution rule, the NLI path, the
+  recall ranking formula, import trust, background tasks, SIMD, WASM, schema and HTTP
+  server descriptions.
+
+### Known issues (open at this point)
+- Cold-start `shadow` deadlock: unreinforced lessons that ingest below the `0.50` quality
+  threshold are stored `shadow`, have no promotion path, score below `MemoryPolicy`'s HINT
+  threshold and are hidden by the MCP server, so they cannot earn reinforcement. Step 8.
+- No real-LLM evaluation of the trust hypothesis exists yet. Step 8.
+
 ### Planned
 - Metadata tagging (`project`, `session_id`, `language`) on stored memories
 - Filtered recall: `recall_where(query, project="my-api")`
-- Node.js native addon via `napi-rs` (faster than ffi-napi)
-- `wasm32-wasi` target for browser/edge deployment (stubs added in P3.4)
-- NLI-based contradiction detection (P3.3 — opt-in via `use_nli_contradiction: true`)
-- Cross-encoder re-ranking (`recall_reranked` / P3.1 — fastembed TextRerank)
-- Memory snapshot export/import CLI + MCP tools (P3.2 — `export_namespace` / `import_namespace`)
+- Node.js native addon via `napi-rs` (the `bindings/node` C-FFI wrapper is unmaintained)
+- A working `wasm32` runtime (`quality::now_ts()` currently uses `SystemTime::now()`)
+- CI coverage for the Python SDK tests, `wasm32` and dashboard checks
+
+*Previously listed here but already present in the code at `fe10f11`:* NLI contradiction
+detection (`NliChecker`, enabled by default via `use_nli_contradiction`), cross-encoder
+re-ranking (`Memoire::with_reranker` / `recall_reranked`), and namespace snapshot export/import
+(CLI, MCP, HTTP, Python, Rust).
 
 ---
 

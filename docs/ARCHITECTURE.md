@@ -23,7 +23,7 @@ Memoire is structured as four clean layers with no circular dependencies:
  │  (src/chunker.rs)  │      │  (src/embedder.rs)          │
  │                    │      │                             │
  │  Auto-detecting    │      │  EmbedProvider trait        │
- │  prose + code-     │      │  FastEmbedProvider impl     │
+ │  prose + code-     │      │  `Embedder` impl (fastembed)│
  │  aware splitter    │      │  all-MiniLM-L6-V2           │
  │  → Vec<String>     │      │  ONNX Runtime (local)       │
  │                    │      │  → Vec<Vec<f32>> (384-dim)  │
@@ -104,9 +104,14 @@ Store::search(query_vec, top_k)
     │   Path selected by store size vs. hnsw_threshold (default 500):
     │     < threshold → linear cosine scan (exact, O(n))
     │     ≥ threshold → HNSW ANN index (approximate, O(log n))
-    │   Sort descending by weighted score (relevance + quality + trust)
-    │   Apply trust decay: trust × exp(−decay_rate × days_since_last_used)
-    │   Clamp decayed trust to [0.0, 1.0]
+    │   Rank by score = 0.75·cosine + 0.20·effective_weight + 0.05·recency_bonus
+    │   (trust is computed per hit and returned, but is NOT part of this ranking;
+    │    recall_explained uses its own rank score)
+    │   Rows: store_state IN ('active','shadow') and archived = 0;
+    │   include_shadow=true additionally admits 'probationary' rows
+    │   Trust per hit: compute_trust(...) × (0.6 + 0.4·cosine), blended with stored
+    │   trust_ema, then decayed: trust × exp(−decay_rate × days_since_last_used)
+    │   Clamp trust to [0.0, 1.0]
     │   UPDATE last_used_at = now() for all returned IDs
     │   Truncate to top_k
     │
@@ -139,31 +144,53 @@ Vec<Memory>  (deduplicated, top_k results)
 
 ## SQLite Schema
 
+The block below is copied from `const SCHEMA` in `src/store.rs` (older databases are
+upgraded in place by `ensure_quality_columns`, which adds any missing column).
+
 ```sql
 CREATE TABLE IF NOT EXISTS memories (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    namespace            TEXT    NOT NULL DEFAULT 'default',
-    content              TEXT    NOT NULL,
-    embedding            BLOB    NOT NULL,   -- LE f32 × 384 = 1536 bytes
-    fingerprint          TEXT    NOT NULL,
-    created_at           INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    last_used_at         INTEGER,            -- updated on every recall
-    reinforcement_count  INTEGER NOT NULL DEFAULT 0,
-    trust_ema            REAL    CHECK(trust_ema IS NULL OR trust_ema BETWEEN 0.0 AND 1.0),
-    confidence           REAL    NOT NULL DEFAULT 0.5 CHECK(confidence BETWEEN 0.0 AND 1.0),
-    novelty              REAL    NOT NULL DEFAULT 0.5 CHECK(novelty BETWEEN 0.0 AND 1.0),
-    archived             INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
-    importance_base      REAL,
-    contradiction_group  TEXT
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace   TEXT    NOT NULL DEFAULT 'default',
+    content     TEXT    NOT NULL,
+    embedding   BLOB    NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    importance_base REAL NOT NULL DEFAULT 0.5,
+    confidence REAL NOT NULL DEFAULT 0.5 CHECK(confidence BETWEEN 0.0 AND 1.0),
+    novelty REAL NOT NULL DEFAULT 0.5 CHECK(novelty BETWEEN 0.0 AND 1.0),
+    actionability REAL NOT NULL DEFAULT 0.5,
+    evidence REAL NOT NULL DEFAULT 0.5,
+    consequence REAL NOT NULL DEFAULT 0.5,
+    reusability REAL NOT NULL DEFAULT 0.5,
+    source_kind TEXT NOT NULL DEFAULT 'agent',
+    store_state TEXT NOT NULL DEFAULT 'active',
+    reinforcement_count INTEGER NOT NULL DEFAULT 0,
+    last_accessed_at INTEGER,
+    superseded_by INTEGER,
+    contradiction_group TEXT,
+    archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1)),
+    effective_weight REAL NOT NULL DEFAULT 1.0,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    claim_key TEXT,
+    claim_value TEXT,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    trust_ema     REAL CHECK(trust_ema IS NULL OR trust_ema BETWEEN 0.0 AND 1.0),
+    trust_variance REAL NOT NULL DEFAULT 0.0,
+    trust_samples INTEGER NOT NULL DEFAULT 0,
+    trust_last_session_id TEXT,
+    ingestion_driver TEXT,
+    last_used_at  INTEGER
 );
-
-CREATE INDEX IF NOT EXISTS idx_memories_namespace
-    ON memories (namespace);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at
     ON memories (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_claim_key
+    ON memories (claim_key);
+CREATE INDEX IF NOT EXISTS idx_memories_store_state
+    ON memories (store_state, archived, superseded_by);
+CREATE INDEX IF NOT EXISTS idx_memories_namespace
+    ON memories (namespace, archived, superseded_by);
 ```
 
-**CHECK constraints** are enforced at the SQLite level for all trust columns. Application code additionally clamps values before every INSERT/UPDATE to prevent the constraint from ever being triggered by normal use.
+**CHECK constraints** are enforced at the SQLite level on `confidence`, `novelty`, `archived` and `trust_ema`. Application code additionally clamps values before every INSERT/UPDATE to prevent the constraint from ever being triggered by normal use.
 
 **Storage estimate:** Each memory chunk costs:
 - ~100–600 bytes for `content` (128 words average)
@@ -222,7 +249,7 @@ The chunker's default chunk size of 128 words (~180 word-piece tokens on average
 `fastembed` was chosen over raw `candle` or `ort` because:
 
 1. **Zero configuration** — model download, tokenisation, mean pooling, and L2 normalisation are all handled internally.
-2. **Bundled ONNX Runtime** — no system ONNX library required.
+2. **Prebuilt ONNX Runtime** — no system ONNX library is required; the `ort` crate downloads and statically links a prebuilt runtime at build time (needs network, or `ORT_LIB_LOCATION`). Do not enable `ort`'s `load-dynamic` or `copy-dylibs` features (see `CHANGELOG.md`). The embedding **model** is downloaded on first use (about 23 MB); cache directory precedence is `$HF_HOME`, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache` relative to the current working directory.
 3. **Batch inference** — `embed(Vec<String>)` runs the full batch in a single ONNX call.
 4. **Active maintenance** — kept up-to-date with the latest fastembed/ONNX Runtime releases.
 
@@ -265,7 +292,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 Because fastembed L2-normalises embeddings before returning them, `norm_a ≈ norm_b ≈ 1.0`. The division is essentially free and the dot product **is** the cosine similarity. The normalisation guard is kept for correctness.
 
-The LLVM auto-vectoriser (enabled by `opt-level = 3`) generates SIMD instructions (AVX2/SSE4.2) for the inner loop on x86_64, making the scan faster than it looks at the source level.
+The LLVM auto-vectoriser (enabled by `opt-level = 3`) may vectorise the inner loop, but only with the instruction sets the build target guarantees: on a default x86_64 build that is the SSE2 baseline. `.cargo/config.toml` deliberately does not enable `+avx2,+fma`, because release binaries and wheels must run on any x86_64 CPU. AVX2/FMA code is only produced if you build yourself with something like `RUSTFLAGS="-C target-cpu=native"`.
 
 ---
 
@@ -363,7 +390,7 @@ memoire_free_string()           → transfers string back to Rust for deallocati
 
 ## HTTP API Server
 
-`src/bin/memoire_server.rs` is a standalone Axum binary (`memoire-server`) that exposes the library as a local HTTP API. The dashboard uses this instead of spawning CLI subprocesses per request.
+`src/bin/memoire_server.rs` is an **experimental, local-only** Axum binary (`memoire-server`) that exposes the library over HTTP for the dashboard. It binds `127.0.0.1` only. Authentication, `Host`/`Origin` checks, the `MEMOIRE_ALLOWED_PATHS` sandbox and the admin gate are described in [`SECURITY.md`](../SECURITY.md).
 
 ```
 GET  /health
@@ -372,12 +399,13 @@ POST /recall     { "db": "...", "ns": "...", "query": "...", "k": 5 }
 POST /reinforce  { "db": "...", "ns": "...", "id": 1, ... }
 POST /penalize   { "db": "...", "ns": "...", "ids": [...], ... }
 POST /forget     { "db": "...", "ns": "...", "id": 1 }
-POST /clear      { "db": "...", "ns": "..." }
-GET  /info       ?db=...
+POST /clear      { "db": "...", "ns": "..." }                       (admin-gated)
+POST /import     { "db": "...", "ns": "...", "snapshot": {...}, "preserve_trust": false }
+GET  /info       ?db=...&ns=...
 GET  /export     ?db=...&ns=...
 ```
 
-The server keeps a `HashMap<(db_path, namespace), Arc<Mutex<Memoire>>>` cache so each `(db, namespace)` pair has exactly one long-lived instance — no cold-start model loading per request.
+The server keeps an `Arc<Mutex<HashMap<(PathBuf, String), Arc<Memoire>>>>` cache keyed by (canonical database path, namespace), bounded to 16 open instances, so each pair has one long-lived instance and no per-request model load.
 
 Default port: `6779`. Override with `MEMOIRE_SERVER_PORT`.
 
@@ -401,21 +429,21 @@ The MCP server instance cache key is `(db_path, namespace)` — different namesp
 
 ## NLI Contradiction Detection (P3.3)
 
-`resolve_contradictions_for_id` is called after every `remember()` for each new chunk. When `ScoringConfig::use_nli_contradiction` is `true` (default), it uses a three-signal ensemble implemented in `src/quality.rs::NliChecker`:
+`resolve_contradictions_for_id` (`src/store.rs`) is called after every `remember()` for each new chunk. When `ScoringConfig::use_nli_contradiction` is `true` (default), candidates are compared with `NliChecker` (`src/quality.rs`) against existing `active`/`shadow`, non-archived rows in the same namespace.
 
-### Signal 1 — Cosine gate
-Memories with cosine similarity below `nli_cosine_threshold` (default 0.80) are on different topics and skipped.
+### Step 1 — Cosine gate
+Pairs with cosine similarity below `nli_cosine_threshold` (default 0.80) are treated as different topics and skipped.
 
-### Signal 2 — Polarity opposition
-`detect_polarity()` classifies each text as `Affirmative`, `Negative`, or `Neutral` via a small high-precision lexicon. Texts where one is `Neutral` are skipped. Only `Affirmative↔Negative` pairs proceed.
+### Step 2 — Classification
+- **ONNX NLI model supplied** (`Memoire::with_nli_model(path)` → `OnnxNliChecker`, labels read from the model's `config.json` `id2label`): its label is **authoritative**.
+- **No ONNX model, or ONNX inference returned an error**: lexical fallback (`NliChecker::lexical_label`). `detect_polarity()` classifies each text as `Affirmative`, `Negative` or `Neutral` with a small keyword lexicon; only `Affirmative↔Negative` pairs can be labelled `Contradiction`. `negation_asymmetry(a, b)` is computed as a secondary signal, but both of its branches (score ≥ 1 and the conservative fallback) currently return `Contradiction`, so it does not change the outcome.
 
-### Signal 3 — Negation asymmetry
-`negation_asymmetry(a, b)` counts negation tokens present in one text but absent in the other. Score ≥ 1 confirms the contradiction. This guards against polarity false positives where both texts happen to share surface tokens.
+Known gap: `resolve_contradictions_for_id` returns early when the **new** memory's polarity is `Neutral`, so an ONNX model never sees such pairs. There is no automated test that runs a real MNLI model.
 
 ### Resolution
-Quality-weighted: `q = 0.45×importance + 0.25×confidence + 0.20×recency + 0.10×evidence`. The loser is archived (`archived=1`, `superseded_by=winner_id`), removed from the in-memory embedding cache, and logged. The winner is untouched.
+`quality::should_supersede(incoming_importance, existing_gravity)`: the incoming memory wins only if `importance_base > 0.50 + 0.40 × gravity`, where gravity comes from `compute_gravity_radius` (existing `trust_ema`, `reinforcement_count`, age). The loser is archived (`archived = 1`, `superseded_by` set to the winner's id), removed from the in-memory embedding cache and logged; its row is kept, not deleted. If the incoming memory loses, it is the one archived.
 
-Setting `use_nli_contradiction: false` reverts to the previous polarity-only gate for backward compatibility.
+Setting `use_nli_contradiction: false` disables this step entirely.
 
 ---
 
@@ -434,7 +462,7 @@ Setting `use_nli_contradiction: false` reverts to the previous polarity-only gat
 }
 ```
 
-Embeddings and raw IDs are **never exported** — they are recomputed on import. `import_namespace()` calls `remember()` on each content string (which re-embeds, deduplicates, and runs quality scoring), then overwrites `trust_ema`, `reinforcement_count`, `importance_base`, `confidence`, and `created_at` with the snapshot values to preserve the original trust history.
+Embeddings and raw IDs are **never exported** — they are recomputed on import. `import_namespace()` calls `remember()` on each content string (which re-embeds, deduplicates, and runs quality scoring). By default (`ImportTrust::Reset`; Python `preserve_trust=False`; CLI without `--preserve-trust`) that is all: snapshot metadata is ignored, so a hostile snapshot cannot inject trust. Only with explicit opt-in (`ImportTrust::PreserveBounded`) are `trust_ema`, `reinforcement_count`, `importance_base`, `confidence` and `created_at` overwritten from the snapshot, each clamped to bounds. The MCP `memoire_import` tool never preserves trust.
 
 ---
 
@@ -448,7 +476,7 @@ On `wasm32-unknown-unknown`, the following modules are excluded via `#[cfg(not(t
 - `py_ffi` (PyO3)
 - The `Memoire` struct and all its methods
 
-The `quality` module and `chunker` module are pure-Rust with no native deps and compile to WASM unchanged. WASM re-exports available:
+The `quality` and `chunker` modules compile for `wasm32`. On wasm32 the `tree-sitter` AST chunking is not built (`cfg(not(target_arch = "wasm32"))`), so `chunk_code_ast` falls back to the regex-based code chunker there. This target is **postponed**: `quality::now_ts()` calls `SystemTime::now()`, which compiles on `wasm32-unknown-unknown` but is expected to panic at runtime, and CI does not check this target. WASM re-exports available:
 
 ```rust
 pub use quality::{NliChecker, NliLabel, ScoringConfig, detect_polarity, cosine_similarity};
@@ -466,7 +494,7 @@ cargo build --target wasm32-unknown-unknown --no-default-features --features was
 Memoire includes an asynchronous background maintenance scheduler that cleans up, updates indices (HNSW), and handles other routine tasks. 
 - **Scheduler Actions**: Runs `Store::maintenance_pass()` automatically.
 - **Triggers**: Supports both time-based (e.g. run every `interval_secs` seconds) and count-based triggers (e.g. run when insertion counter reaches `threshold` inserts).
-- **Wiring**: Handled via `spawn_maintenance_scheduler` and `spawn_count_watcher` in `src/background.rs`. They are automatically aborted when the `Memoire` instance is dropped.
+- **Wiring**: `Memoire::start_background_maintenance` starts the watchers in `src/background.rs`: the interval scheduler (`spawn_maintenance_scheduler`), the insert-count watcher (`spawn_count_watcher`) and a reinforcement watcher that triggers `recompute_prototypes` every 100 reinforcements. It uses the ambient Tokio runtime if one exists, otherwise a private one-worker runtime. `Drop for Memoire` aborts every watcher handle and shuts down the owned runtime if there is one.
 
 ---
 
