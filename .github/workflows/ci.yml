@@ -65,8 +65,8 @@ jobs:
       - name: Integration tests
         run: cargo test --test integration_test
 
-      - name: Oracle, import-security, feedback-error and ONNX Runtime link tests
-        run: cargo test --test oracle --test import_security --test feedback_errors --test ort_smoke
+      - name: Oracle, import-security, feedback, ONNX Runtime link and FFI header tests
+        run: cargo test --test oracle --test import_security --test feedback_errors --test ort_smoke --test ffi_header_parity --test namespace_feedback
 
       - name: Doc tests
         run: cargo test --doc
