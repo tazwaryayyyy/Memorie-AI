@@ -209,12 +209,12 @@ fn test_probationary_memories_visibility() {
         "Probationary memories must be hidden by default"
     );
 
-    // Probationary memories appear when include_shadow=true in recall()
+    // Probationary memories appear when include_hidden=true in recall()
     let results_shadow = mem.recall_with_options("validate inputs", 5, true).unwrap();
     assert_eq!(
         results_shadow.len(),
         1,
-        "Probationary memories must be returned when include_shadow=true"
+        "Probationary memories must be returned when include_hidden=true"
     );
     assert_eq!(results_shadow[0].state, "probationary");
 }

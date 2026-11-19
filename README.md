@@ -36,9 +36,10 @@ Task 2 starts -> recall("billing precision") -> trust-gated context for the agen
 Task 2 ends   -> reinforce_if_used(...) or penalize_if_used(...)
 ```
 
-Whether this loop improves a real coding agent has **not been measured**. Whether a
-freshly stored lesson is even surfaced is currently affected by a known cold-start
-problem (see Limitations).
+Whether this loop improves a real coding agent has **not been measured**. As of Step
+8b-1 a fresh lesson enters as an unverified `trial` memory and is offered in a bounded
+trial slot (see Trust and Policy and Known Limitations), verified by deterministic engine
+tests only.
 
 ## What It Does
 
@@ -47,10 +48,11 @@ problem (see Limitations).
   locally on CPU. The model is downloaded on first use (see [Model cache](#model-cache-and-offline-use)).
 - **Deduplication**: BLAKE3 fingerprints; exact-content duplicates are dropped.
 - **Quality scoring at ingest**: five heuristic features (actionability, consequence,
-  novelty, reusability, evidence) combined with fixed weights; `>= 0.50` is stored
-  `active`, below that `shadow`.
-- **Trust**: a heuristic value in `[0, 1]` built from stored trust, reinforcement
-  count, confidence, age and importance, then time-decayed. Constants are hand-set.
+  novelty, reusability, evidence) combined with fixed weights and stored as metadata. With
+  the default `AdmissionMode::AdmitAll` they do not gate exposure; `QualityGate` restores
+  the legacy `>= 0.50` live / else hidden `shadow` split.
+- **Trust**: a Beta posterior `(2 + s) / (4 + s + f)` over attributed reinforcements and
+  failures, independent of ingest scores, time-regressed toward 0.5. Constants are hand-set.
 - **Contradiction handling**: when a new memory is close to an existing one (cosine
   `>= 0.80`) and the two are judged contradictory, one is archived. Judgement is a
   lexical polarity heuristic unless you supply an ONNX NLI model.
@@ -180,19 +182,31 @@ ONNX file path yourself via `with_nli_model`).
 
 ## Trust and Policy
 
-Each recalled `Memory` carries `score`, `trust`, `uncertainty` and `state`
-(`active`, `shadow`, or `probationary`; archived rows are not returned).
+Each recalled `Memory` carries `score`, `trust`, `uncertainty`, `state` and `exposure`.
+States: `trial` and `active` are live; `shadow`, `probationary` and `quarantined` are
+hidden from default recall. `exposure` is `follow` (trust >= 0.70), `hint`, `trial`
+(no feedback yet), `hidden`, or `plain` (`recall_plain`).
 
-- `score` (ranking) = `0.75 * cosine + 0.20 * effective_weight + 0.05 * recency_bonus`.
-  Trust is **not** part of this ranking in `Store::search`.
-- `trust` is computed per query in `Store::search`: a base from `compute_trust`
-  (weights 0.35 reinforcement, 0.25 confidence, 0.20 age, 0.15 importance, 0.05
-  contradiction survival; shadow rows are multiplied by 0.6) scaled by
-  `0.6 + 0.4 * cosine`, blended with the stored `trust_ema`, then multiplied by
-  `exp(-decay_rate * days_since_last_used)` (`decay_rate` default `0.01`). New rows seed
-  `trust_ema = importance * cold_start_weight` (default `0.5`).
+- `score` (ranking) = `0.75 * cosine + 0.20 * trust + 0.05 * recency_bonus`.
+- `trust` is a Beta posterior over attributed feedback: `(2 + s) / (4 + s + f)` with
+  `s = reinforcement_count` and `f = failure_count` (a prior of four pseudo-observations
+  at 0.5), regressed toward 0.5 by `exp(-decay_rate * days_since_last_feedback)` (default
+  `0.01`). `uncertainty = 4 / (4 + s + f)`. It does not depend on any ingest-time score:
+  every new memory starts at exactly `0.5`.
+- State transitions use integer rules on `(s, f)`: `trial -> active` when `3s >= 8 + 7f`
+  (trust >= 0.70, e.g. three successes and no failures); any live state `-> quarantined`
+  when `2f > 3s + 2` (trust < 0.40, e.g. two failures and no successes). Quarantined rows
+  are excluded from default recall and from export, take no further feedback, and are
+  restored by the operator with `unquarantine` (CLI: `memoire-cli unquarantine <ID>`),
+  which clears their failure count.
+- Feedback: `reinforce_if_used` requires text attribution (the memory's distinctive tokens
+  contained in the output at `containment_threshold`, default 0.35, or cosine >= 0.75);
+  `reinforce_declared` skips the text gate for callers that know which memories the agent
+  used. Both count one vote per memory per session id. `penalize_if_used` records one
+  failure per id and no longer rewrites `importance_base` or `confidence`.
 
-These constants are hand-chosen defaults in `ScoringConfig`, not fitted or validated.
+These constants (the prior strength, the thresholds, `trial_cap`) are hand-chosen defaults,
+not fitted or validated.
 
 `memoire_engine.MemoryPolicy` turns `trust` into an action:
 
@@ -258,8 +272,8 @@ For C/FFI consumers: [docs/FFI_GUIDE.md](docs/FFI_GUIDE.md).
 
 ## Contradiction Detection
 
-Run after each `remember()` for each new chunk, against live `active`/`shadow` rows in the
-same namespace (`NliChecker` in `src/quality.rs`):
+Run after each `remember()` for each new chunk, against live `trial`/`active` and hidden
+`shadow` rows in the same namespace (`NliChecker` in `src/quality.rs`):
 
 1. Cosine similarity `< nli_cosine_threshold` (default `0.80`) -> treated as unrelated.
 2. If an ONNX NLI model was supplied (`Memoire::with_nli_model(path)`), its label is
@@ -274,8 +288,9 @@ model never sees that pair.
 There is no automated test against a real NLI model in this repository.
 
 ```rust
-use memoire::quality::ScoringConfig;
-let config = ScoringConfig { use_nli_contradiction: false, ..ScoringConfig::default() };
+use memoire::quality::{ContradictionMode, ScoringConfig};
+// Off: never supersede or archive. Legacy: cosine + stored polarity only. Nli: default.
+let config = ScoringConfig { contradiction_mode: ContradictionMode::Off, ..ScoringConfig::default() };
 let m = Memoire::new("agent.db")?.with_scoring_config(config);
 ```
 
@@ -297,8 +312,9 @@ read the file. See [SECURITY.md](SECURITY.md).
 
 ## Export / Import
 
-The snapshot is JSON containing `content` and metadata (`trust_ema`, `reinforcement_count`,
-`importance_base`, `confidence`, `created_at`). Embeddings are recomputed on import.
+The snapshot is JSON containing `content` and metadata (`trust_ema` (legacy, ignored),
+`reinforcement_count`, `importance_base`, `confidence`, `created_at`). Quarantined memories
+are not exported. Embeddings are recomputed on import.
 **By default, import keeps only `content` and resets trust** (`ImportTrust::Reset`,
 `preserve_trust=False`, no `--preserve-trust`). Restoring metadata is opt-in and clamped
 to bounds; "bounded" does not mean "verified", so use it only for snapshots you exported.
@@ -346,9 +362,11 @@ and `memoire_import` are listed only when `MEMOIRE_ENABLE_ADMIN_TOOLS=1`. Tools 
 `memoire_health` accept a `namespace` parameter.
 
 `memoire_recall` and `memoire_recall_explained` hide `shadow` memories unless
-`include_shadow=true`. Note this is the MCP layer's own filter. In the Rust API,
-`recall` already returns `active` and `shadow` rows, and the `include_shadow` argument of
-`recall_with_options` / `Store::search` only adds `probationary` rows.
+`include_shadow=true`. This is the MCP layer's own filter and is now redundant: the Rust
+`recall` returns only live (`trial` / `active`) rows, and `include_hidden` (the renamed
+`include_shadow` argument of `recall_with_options` / `Store::search`) additionally returns
+`shadow`, `probationary` and `quarantined` rows with no trial cap. The MCP tools do not yet
+expose `exposure`, pass a session id, or let you configure `trial_cap`.
 
 ## Experimental: HTTP Server and Dashboard
 
@@ -374,18 +392,17 @@ resolve inside `MEMOIRE_ALLOWED_PATHS` (default: the server's working directory)
 
 ## Known Limitations
 
-1. **Cold-start `shadow` deadlock (open, P0, queued for Step 8).** Ingest stores a
-   chunk as `active` only if its quality score is `>= 0.50` (`quality::decide_store`),
-   otherwise `shadow`. No code path in `src/` promotes `shadow` to `active`. With the
-   default `ScoringConfig`, an unreinforced shadow row's recall-time trust is bounded
-   below `0.40` (`compute_trust` caps its base at `0.6 * 0.60 = 0.36` before the
-   similarity scaling, and the seeded `trust_ema` is lower still), which is below the
-   default `MemoryPolicy` HINT threshold, and the MCP server hides `shadow` rows by default.
-   A lesson that ingests as `shadow` is therefore suppressed before it can earn
-   reinforcement. In maintainer runs at `fe10f11`, `examples/brutal_moment_demo.py` showed
-   exactly this (Arm 2: `trust=0.180 state=shadow action=IGNORE`; Arm 3: both the wrong
-   and the correct lesson ended `IGNORE`). Do not rely on a first-time lesson being
-   surfaced today.
+1. **Cold start (changed in Step 8b-1; effect on real agents unmeasured).** New lessons
+   used to be stored `shadow` by a centroid quality gate with no promotion path and were
+   suppressed before feedback could reach them. By default they now enter as unverified
+   `trial` memories (`AdmissionMode::AdmitAll`) with a neutral trust of exactly `0.5`,
+   and one recall may return at most `ScoringConfig::trial_cap` (default `1`) of them so
+   outcome feedback can act. Consequences to be aware of: with no feedback history every
+   memory is unverified, so a default recall returns **at most one result**; raise
+   `trial_cap` (or pass `trial_cap=` in Python) for no-feedback use. Hidden `shadow` rows
+   (only under `AdmissionMode::QualityGate`) are promoted by `Store::promote_shadow`;
+   ingest does not call it yet. This is verified by deterministic engine tests only, not
+   by any real-agent run.
 2. **No real-LLM evaluation.** `scripts/agent_behavior_benchmark.py` is a deterministic
    synthetic smoke test (it prints `[SYNTHETIC SMOKE TEST, not an LLM benchmark]`), and
    `examples/brutal_moment_demo.py` is a scripted demo. Neither is evidence that Memoire

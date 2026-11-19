@@ -11,6 +11,7 @@ keywords = ["ai", "memory", "embeddings", "sqlite", "ffi"]
 categories = ["database", "science::ml"]
 include = [
     "/src/**",
+    "/migrations/**",
     "/examples/basic_usage.rs",
     "/benches/**",
     "/include/memoire.h",

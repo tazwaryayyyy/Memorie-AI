@@ -58,7 +58,15 @@ class Memoire:
             results = m.recall("...", top_k=5)
     """
 
-    def __init__(self, db_path: str = "./memoire.db", namespace: str = "default") -> None:
+    def __init__(
+        self,
+        db_path: str = "./memoire.db",
+        namespace: str = "default",
+        *,
+        admission: Optional[str] = None,
+        contradiction: Optional[str] = None,
+        trial_cap: Optional[int] = None,
+    ) -> None:
         """
         Open or create a Memoire database at `db_path` scoped to `namespace`.
 
@@ -66,6 +74,14 @@ class Memoire:
             db_path: Path to the SQLite database file.
                      Pass ':memory:' for a non-persistent in-memory store.
             namespace: The isolation namespace for memories.
+            admission: ``"admit_all"`` (default: every non-duplicate chunk enters as
+                an unverified ``trial`` memory) or ``"quality_gate"`` (legacy centroid
+                gate: low-scoring chunks are stored hidden as ``shadow``).
+            contradiction: ``"nli"`` (default), ``"legacy"`` (cosine + polarity only)
+                or ``"off"`` (never supersede or archive).
+            trial_cap: Maximum unverified memories one recall may return (default 1).
+                With no feedback history every memory is unverified, so a default
+                recall returns at most one result; raise this for no-feedback use.
 
         Raises:
             MemoireError: if the library fails to initialise.
@@ -76,7 +92,14 @@ class Memoire:
                 "Please run `pip install .` or `maturin dev` in bindings/python."
             )
         try:
-            self._impl = _NativeMemoire(db_path, namespace)
+            options = {}
+            if admission is not None:
+                options["admission"] = admission
+            if contradiction is not None:
+                options["contradiction"] = contradiction
+            if trial_cap is not None:
+                options["trial_cap"] = trial_cap
+            self._impl = _NativeMemoire(db_path, namespace, **options)
         except Exception as e:
             raise MemoireError(f"Failed to initialize Memoire: {e}") from e
 
@@ -175,6 +198,55 @@ class Memoire:
             return self._impl.reinforce_if_used(memory_id, agent_output, task_succeeded, session_id)
         except Exception as e:
             raise MemoireError(f"reinforce_if_used() failed: {e}") from e
+
+    def reinforce_declared(self, memory_id: int, session_id: Optional[str] = None) -> bool:
+        """
+        Reinforce a memory the agent *declared* it used, with no text-overlap gate.
+
+        The caller asserts both the declaration and the task success. Returns False
+        for an unknown or quarantined id, or when ``session_id`` equals the memory's
+        last reinforcing session (one vote per memory per session).
+        """
+        self._check_open()
+        try:
+            return self._impl.reinforce_declared(memory_id, session_id)
+        except Exception as e:
+            raise MemoireError(f"reinforce_declared() failed: {e}") from e
+
+    def unquarantine(self, memory_id: int) -> bool:
+        """
+        Operator action: return a quarantined memory to service.
+
+        Clears its failure evidence (otherwise the next failure would re-quarantine
+        it). Returns False if ``memory_id`` is not a quarantined memory.
+        """
+        self._check_open()
+        try:
+            return self._impl.unquarantine(memory_id)
+        except Exception as e:
+            raise MemoireError(f"unquarantine() failed: {e}") from e
+
+    def promote_shadow(self, memory_id: int) -> bool:
+        """Promote a hidden ``shadow`` / ``probationary`` memory to the live set."""
+        self._check_open()
+        try:
+            return self._impl.promote_shadow(memory_id)
+        except Exception as e:
+            raise MemoireError(f"promote_shadow() failed: {e}") from e
+
+    def recall_plain(self, query: str, top_k: int = 5) -> List[Memory]:
+        """
+        Plain cosine top-k over every stored memory.
+
+        No trust, no state filter, no trial cap and no database writes: the
+        plain-vector-memory baseline for evaluation. Results have
+        ``exposure == "plain"``.
+        """
+        self._check_open()
+        try:
+            return self._impl.recall_plain(query, top_k)
+        except Exception as e:
+            raise MemoireError(f"recall_plain() failed: {e}") from e
 
     def penalize_if_used(
         self,

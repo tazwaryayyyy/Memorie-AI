@@ -12,6 +12,52 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ---
 
 ## [Unreleased]
+### Changed (Step 8b-1: trust, lifecycle, feedback integrity; breaking, pre-publish)
+- **Trust is a Beta posterior** `(2 + s) / (4 + s + f)` over `reinforcement_count` /
+  `failure_count`, independent of ingest scores; `uncertainty = 4 / (4 + s + f)`. Removed
+  `compute_trust`, the `trust_ema` blend and `ScoringConfig::{ema_new_weight, rc_saturation,
+  cold_start_weight}`. Decay now regresses toward 0.5 using days since last *feedback*.
+- **Ranking** is `0.75 * cosine + 0.20 * trust + 0.05 * recency`.
+- **States**: `trial` and `active` are live; `shadow`, `probationary`, `quarantined` are
+  hidden. `trial -> active` at `3s >= 8 + 7f`; live `-> quarantined` at `2f > 3s + 2`.
+  `Store::search(.., include_hidden)` (renamed from `include_shadow`; default now excludes
+  `shadow`) skips hidden rows before the top-k cosine cut, so they cannot crowd out live ones.
+- **Bounded trial exposure**: a default recall returns at most `ScoringConfig::trial_cap`
+  (default 1) unverified rows; `trial_min_cos` (default 0.0) is an optional relevance floor.
+  With no feedback history this limits a default recall to one result.
+- **`ScoringConfig`**: `admission: AdmissionMode::{AdmitAll (default), QualityGate}`,
+  `contradiction_mode: ContradictionMode::{Off, Legacy, Nli (default)}` replacing
+  `use_nli_contradiction`, `containment_threshold` replacing `jaccard_threshold`.
+- **Feedback integrity**: `reinforce_if_used` / `penalize_if_used` run in immediate
+  transactions; one vote per (memory, session id); `penalize_if_used` no longer decrements
+  `reinforcement_count` or rewrites `importance_base` / `confidence`, skips quarantined rows
+  and returns database errors instead of skipping the row. `failure_severity` now only gates
+  (`> 0` counts one failure).
+- **Attribution**: asymmetric containment of the memory's distinctive tokens replaces
+  whole-output symmetric Jaccard, so long outputs are not penalised.
+- `sample_namespace` samples `trial`/`active` rows; export excludes `quarantined` rows;
+  `PreserveBounded` import re-derives state from the imported counts.
+- Database `user_version` 2 -> 3 (`migrations/v3.sql`): live states re-derived from counts
+  (approximate for databases written by earlier engines).
+
+### Added
+- `Memoire::{reinforce_declared, unquarantine, promote_shadow, recall_plain}` and the
+  `Store` equivalents; `Memory::exposure`; Python `Memoire(admission=, contradiction=,
+  trial_cap=)`, `reinforce_declared`, `unquarantine`, `promote_shadow`, `recall_plain`;
+  `memoire-cli unquarantine <ID>`.
+- `tests/lifecycle.rs` and in-crate tests for the state machine, trial cap, quarantine,
+  migration, concurrency and plain recall (deterministic; no LLM).
+
+### Fixed
+- `Cargo.toml` `include` now ships `/migrations/**`; `include_str!("../migrations/v2.sql")`
+  failed from a packaged crate.
+
+### Not changed yet (Step 8b-2 / 8b-3)
+- `evidence` / `novelty` weights, `lexical_label` asymmetry gate, `NEGATIVE`/`NEGATORS`
+  lexicons, lexical-only contradiction -> `quarantined`, prototype leakage, corroboration
+  promotion at ingest; MCP/SDK thresholds, `exposure` in MCP output, session ids in MCP.
+
+### Documentation (earlier in Unreleased)
 
 ### Changed (breaking, pre-release)
 - Python import package renamed `memoire` -> `memoire_engine` (distribution name `memoire-engine`,
@@ -117,9 +163,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   server descriptions.
 
 ### Known issues (open at this point)
-- Cold-start `shadow` deadlock: unreinforced lessons that ingest below the `0.50` quality
-  threshold are stored `shadow`, have no promotion path, score below `MemoryPolicy`'s HINT
-  threshold and are hidden by the MCP server, so they cannot earn reinforcement. Step 8.
+- Cold-start `shadow` deadlock: addressed in Step 8b-1 above (unmeasured with real agents).
 - No real-LLM evaluation of the trust hypothesis exists yet. Step 8.
 
 ### Planned

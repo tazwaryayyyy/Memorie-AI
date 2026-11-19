@@ -23,8 +23,8 @@ use embedder::{EmbedProvider, Embedder, FastEmbedReranker, Reranker};
 use error::{MemoireError, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use quality::{
-    build_quality_meta, fingerprint, IngestDecision, IngestionOracle, ScoringConfig,
-    ScoringPrototypes, ScoringWeights,
+    build_quality_meta, fingerprint, ingest_state, AdmissionMode, IngestDecision, IngestionOracle,
+    ScoringConfig, ScoringPrototypes, ScoringWeights,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use serde::Serialize;
@@ -406,6 +406,15 @@ impl Memoire {
                     .map_err(|_| MemoireError::LockPoisoned)?,
             );
 
+            // Default admission: ingest text features never gate exposure, so a chunk the
+            // quality gate would have hidden enters as `trial` instead of `shadow`.
+            if self.store.config.admission == AdmissionMode::AdmitAll
+                && decision == IngestDecision::Shadow
+            {
+                decision = IngestDecision::Active;
+                meta.store_state = ingest_state(&decision).to_string();
+            }
+
             if let Some(oracle) = &self.oracle {
                 let sample = self.store.sample_namespace(50)?;
                 let oracle_decision = oracle.decide(chunk, embedding, &sample);
@@ -413,13 +422,7 @@ impl Memoire {
                     continue;
                 }
                 decision = oracle_decision;
-                meta.store_state = match decision {
-                    IngestDecision::Active => "active",
-                    IngestDecision::Probationary => "probationary",
-                    IngestDecision::Shadow => "shadow",
-                    IngestDecision::Reject => "rejected",
-                }
-                .to_string();
+                meta.store_state = ingest_state(&decision).to_string();
             }
 
             match decision {
@@ -441,29 +444,43 @@ impl Memoire {
         self.recall_with_options(query, top_k, false)
     }
 
-    /// `include_shadow` is a legacy name: `false` returns `active` and `shadow`
-    /// rows (shadow rows are ranked with a reduced trust weight), and `true`
-    /// additionally returns `probationary` rows. See `Store::search`.
+    /// `include_hidden = false` returns live rows only (`trial` / `active`, with at most
+    /// `ScoringConfig::trial_cap` unverified rows); `true` additionally returns hidden
+    /// rows (`shadow`, `probationary`, `quarantined`) and skips the trial cap. See
+    /// `Store::search`.
     pub fn recall_with_options(
         &self,
         query: &str,
         top_k: usize,
-        include_shadow: bool,
+        include_hidden: bool,
     ) -> Result<Vec<Memory>> {
         if self.store.count()? == 0 {
             return Ok(vec![]);
         }
         log::debug!(
-            "recall_with_options(): {:?} top_k={} include_shadow={}",
+            "recall_with_options(): {:?} top_k={} include_hidden={}",
             query,
             top_k,
-            include_shadow
+            include_hidden
         );
         let query_vec = self
             .embedder
             .embed_one(query)
             .map_err(MemoireError::Embedding)?;
-        self.store.search(&query_vec, top_k, include_shadow)
+        self.store.search(&query_vec, top_k, include_hidden)
+    }
+
+    /// Plain vector-similarity recall: exact cosine over every stored memory, no trust,
+    /// no state filter, no trial cap, no database writes. The baseline for evaluation.
+    pub fn recall_plain(&self, query: &str, top_k: usize) -> Result<Vec<Memory>> {
+        if self.store.count()? == 0 {
+            return Ok(vec![]);
+        }
+        let query_vec = self
+            .embedder
+            .embed_one(query)
+            .map_err(MemoireError::Embedding)?;
+        self.store.search_plain(&query_vec, top_k)
     }
 
     /// Recall with a minimum score threshold after ranking.
@@ -516,8 +533,9 @@ impl Memoire {
     ///
     /// Fires when `task_succeeded` AND at least one attribution gate passes:
     ///
-    /// - Jaccard token overlap between memory content and `agent_output` is at
-    ///   least `ScoringConfig::jaccard_threshold` (default 0.35), or
+    /// - the memory's distinctive tokens are contained in `agent_output` at least
+    ///   `ScoringConfig::containment_threshold` (default 0.35; asymmetric, so long
+    ///   outputs are not penalised), or
     /// - cosine(memory_embedding, embed(agent_output)) is at least 0.75.
     ///
     /// The cosine path catches semantic paraphrase where wording differs.
@@ -566,6 +584,29 @@ impl Memoire {
         failure_severity: f32,
     ) -> Result<Vec<store::PenaltyOutcome>> {
         self.store.penalize_if_used(memory_ids, failure_severity)
+    }
+
+    /// Reinforce a memory the agent explicitly declared it used, with no text gate. The
+    /// caller asserts both the declaration and the task success. Same namespace,
+    /// quarantine and one-vote-per-session rules as `reinforce_if_used`.
+    pub fn reinforce_declared(&self, memory_id: i64, session_id: Option<&str>) -> Result<bool> {
+        let applied = self.store.reinforce_declared(memory_id, session_id)?;
+        if applied {
+            self.reinforcement_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(applied)
+    }
+
+    /// Operator action: return a quarantined memory to service, clearing its failure
+    /// evidence. Returns false if `id` is not a quarantined memory of this namespace.
+    pub fn unquarantine(&self, id: i64) -> Result<bool> {
+        self.store.unquarantine(id)
+    }
+
+    /// Promote a hidden `shadow` / `probationary` memory to the live set. Returns false
+    /// if `id` is not such a memory of this namespace.
+    pub fn promote_shadow(&self, id: i64) -> Result<bool> {
+        self.store.promote_shadow(id)
     }
 
     /// Delete a memory by id. Returns true if it existed.

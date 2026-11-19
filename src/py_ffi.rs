@@ -1,4 +1,5 @@
 use crate::panic_guard::catch_panic;
+use crate::quality::{AdmissionMode, ContradictionMode, ScoringConfig};
 use crate::{store::Memory, Memoire};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -33,6 +34,9 @@ pub struct PyMemory {
     pub uncertainty: f32,
     #[pyo3(get)]
     pub state: String,
+    /// `"follow"`, `"hint"`, `"trial"` (unverified), `"hidden"` or `"plain"`.
+    #[pyo3(get)]
+    pub exposure: String,
     #[pyo3(get)]
     pub created_at: i64,
     #[pyo3(get)]
@@ -44,8 +48,8 @@ impl PyMemory {
     fn __repr__(&self) -> String {
         let preview = crate::text::preview(&self.content, 60);
         format!(
-            "Memory(id={}, score={:.3}, trust={:.3}, uncertainty={:.3}, state={:?}, content={:?})",
-            self.id, self.score, self.trust, self.uncertainty, self.state, preview
+            "Memory(id={}, score={:.3}, trust={:.3}, uncertainty={:.3}, state={:?}, exposure={:?}, content={:?})",
+            self.id, self.score, self.trust, self.uncertainty, self.state, self.exposure, preview
         )
     }
 }
@@ -64,6 +68,7 @@ fn py_memory(m: Memory) -> PyMemory {
         ingestion_driver: m.ingestion_driver,
         uncertainty: m.uncertainty,
         state: m.state,
+        exposure: m.exposure,
         created_at: m.created_at,
         last_used_at: m.last_used_at,
     }
@@ -134,8 +139,39 @@ impl PyMemoire {
 #[pymethods]
 impl PyMemoire {
     #[new]
-    #[pyo3(signature = (db_path = "./memoire.db", namespace = "default"))]
-    fn new(db_path: &str, namespace: &str) -> PyResult<Self> {
+    #[pyo3(signature = (
+        db_path = "./memoire.db",
+        namespace = "default",
+        admission = None,
+        contradiction = None,
+        trial_cap = None
+    ))]
+    fn new(
+        db_path: &str,
+        namespace: &str,
+        admission: Option<&str>,
+        contradiction: Option<&str>,
+        trial_cap: Option<usize>,
+    ) -> PyResult<Self> {
+        // Validate options before the (expensive) store/embedder is built.
+        let mut config = ScoringConfig::default();
+        if let Some(name) = admission {
+            config.admission = AdmissionMode::parse(name).ok_or_else(|| {
+                MemoireError::new_err(format!(
+                    "unknown admission mode {name:?} (expected \"admit_all\" or \"quality_gate\")"
+                ))
+            })?;
+        }
+        if let Some(name) = contradiction {
+            config.contradiction_mode = ContradictionMode::parse(name).ok_or_else(|| {
+                MemoireError::new_err(format!(
+                    "unknown contradiction mode {name:?} (expected \"off\", \"legacy\" or \"nli\")"
+                ))
+            })?;
+        }
+        if let Some(cap) = trial_cap {
+            config.trial_cap = cap;
+        }
         // Opening can panic (e.g. ONNX Runtime / model initialisation), and
         // there is no lock to protect yet, so catch it here too.
         let built = catch_panic(|| {
@@ -146,7 +182,7 @@ impl PyMemoire {
             }
         })
         .map_err(|msg| panic_err("Memoire::new", msg))?;
-        let inner = built.map_err(db_err)?;
+        let inner = built.map_err(db_err)?.with_scoring_config(config);
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
         })
@@ -168,6 +204,15 @@ impl PyMemoire {
     fn recall(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
         self.with_inner("recall", |m| {
             let memories = m.recall(query, top_k).map_err(db_err)?;
+            Ok(memories.into_iter().map(py_memory).collect())
+        })
+    }
+
+    /// Plain cosine top-k over every stored memory: no trust, no state filter, no
+    /// trial cap, no database writes. The baseline for evaluation.
+    fn recall_plain(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
+        self.with_inner("recall_plain", |m| {
+            let memories = m.recall_plain(query, top_k).map_err(db_err)?;
             Ok(memories.into_iter().map(py_memory).collect())
         })
     }
@@ -265,6 +310,29 @@ impl PyMemoire {
         self.with_inner("reinforce_if_used", |m| {
             m.reinforce_if_used_with_session(memory_id, agent_output, task_succeeded, session_id)
                 .map_err(db_err)
+        })
+    }
+
+    /// Reinforce a memory the agent declared it used, with no text gate. The caller
+    /// asserts both the declaration and the task success.
+    #[pyo3(signature = (memory_id, session_id = None))]
+    fn reinforce_declared(&self, memory_id: i64, session_id: Option<&str>) -> PyResult<bool> {
+        self.with_inner("reinforce_declared", |m| {
+            m.reinforce_declared(memory_id, session_id).map_err(db_err)
+        })
+    }
+
+    /// Operator action: return a quarantined memory to service (clears its failures).
+    fn unquarantine(&self, memory_id: i64) -> PyResult<bool> {
+        self.with_inner("unquarantine", |m| {
+            m.unquarantine(memory_id).map_err(db_err)
+        })
+    }
+
+    /// Promote a hidden shadow/probationary memory to the live set.
+    fn promote_shadow(&self, memory_id: i64) -> PyResult<bool> {
+        self.with_inner("promote_shadow", |m| {
+            m.promote_shadow(memory_id).map_err(db_err)
         })
     }
 

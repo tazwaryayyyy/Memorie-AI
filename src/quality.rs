@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
@@ -388,60 +389,103 @@ fn negation_asymmetry(a: &str, b: &str) -> usize {
 
 // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Configuration ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
 
-/// Configuration for trust scoring and reinforcement attribution.
+/// How ingest decides whether a new chunk enters the live `trial` set or the
+/// hidden `shadow` set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdmissionMode {
+    /// Every chunk that is not an exact duplicate (and not rejected by an installed
+    /// oracle) enters as `trial`. Ingest-text features never gate exposure. Default.
+    #[default]
+    AdmitAll,
+    /// Legacy centroid gate: `decide_store(score) >= 0.50` -> `trial`, else `shadow`.
+    /// Hidden `shadow` rows only become live via `Store::promote_shadow`.
+    QualityGate,
+}
+
+impl AdmissionMode {
+    /// Parse a user-supplied name (`"admit_all"` / `"quality_gate"`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "admit_all" | "admitall" => Some(Self::AdmitAll),
+            "quality_gate" | "qualitygate" => Some(Self::QualityGate),
+            _ => None,
+        }
+    }
+}
+
+/// Which contradiction detector `Store::resolve_contradictions_for_id` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContradictionMode {
+    /// No contradiction detection at all: nothing is ever superseded or archived.
+    Off,
+    /// Cosine >= 0.80 plus stored-polarity opposition only (the pre-8b
+    /// `use_nli_contradiction = false` path).
+    Legacy,
+    /// `NliChecker`: the ONNX model when installed, otherwise the lexical ensemble. Default.
+    #[default]
+    Nli,
+}
+
+impl ContradictionMode {
+    /// Parse a user-supplied name (`"off"` / `"legacy"` / `"nli"`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Some(Self::Off),
+            "legacy" => Some(Self::Legacy),
+            "nli" => Some(Self::Nli),
+            _ => None,
+        }
+    }
+}
+
+/// Configuration for trust scoring, exposure and reinforcement attribution.
 ///
-/// All fields are tuneable after construction via `Memoire::with_scoring_config()`.
-/// These are engineering heuristics with default values chosen as reasonable starting
-/// points. Tune based on observed agent behaviour; there is no universal calibration.
+/// Trust is a Beta posterior over "this memory helps when used" (see
+/// [`posterior_trust`]); it has no tunable weights. These are engineering
+/// heuristics with defaults chosen as starting points, not validated constants.
 #[derive(Debug, Clone)]
 pub struct ScoringConfig {
-    /// Weight applied to the newly computed trust value in EMA updates.
-    /// Range: (0.0, 1.0). Default 0.3 (30% new value, 70% historical EMA).
-    /// Lower values ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ slower trust changes, more stable but less responsive.
-    pub ema_new_weight: f32,
-    /// Saturation constant `k` in the reinforcement term `rc / (rc + k)`.
-    /// Default 3.0: rc=3 reaches ~0.5, rc=9 reaches ~0.75 of the reinforcement ceiling.
-    /// Increase to require more task confirmations before a memory reaches FOLLOW.
-    pub rc_saturation: f32,
-    /// Minimum Jaccard token overlap required to attribute reinforcement to a memory.
-    /// Range: [0.0, 1.0]. Default 0.35.
-    /// Higher ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ stricter attribution, fewer false-positive trust inflations.
-    pub jaccard_threshold: f32,
+    /// Minimum fraction of the memory's *distinctive* tokens that must appear in the
+    /// agent output for text attribution to pass (asymmetric containment, see
+    /// [`token_containment`]). Range: [0.0, 1.0]. Default 0.35.
+    pub containment_threshold: f32,
     /// Memory count above which HNSW approximate search is used instead of linear scan.
-    /// Default 500. Below this, a linear scan over the in-memory embedding cache is
-    /// faster due to lower constant factors than HNSW index construction.
+    /// Default 500.
     pub hnsw_threshold: usize,
-    /// Multiplied by quality_score to compute the initial trust_ema for a new memory
-    /// that has no reinforcement history (reinforcement_count == 0).
-    /// Range: 0.0ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“1.0. Default: 0.5
-    /// Set to 0.0 to disable cold-start trust (original behavior).
-    pub cold_start_weight: f32,
-    /// Exponential decay rate applied to trust_ema per day since last use.
-    /// Effective trust = trust_ema * exp(-decay_rate * days_since_last_used)
-    /// Default: 0.01 (half-life ~69 days). Set to 0.0 to disable.
+    /// Exponential regression of trust toward the neutral prior 0.5 per day since the
+    /// last *feedback* (not last recall):
+    /// `0.5 + (trust - 0.5) * exp(-decay_rate * days)`. Default 0.01. 0.0 disables.
     pub decay_rate: f32,
-    /// When true, use `NliChecker` for contradiction detection in addition to
-    /// lexical polarity heuristics. Provides higher-precision contradiction
-    /// detection by adding negation-asymmetry analysis to the polarity gate.
-    /// Default: true.
-    pub use_nli_contradiction: bool,
-    /// Minimum cosine similarity between two memories for them to be considered
-    /// in the same topic cluster during NLI contradiction checking.
-    /// Range: [0.0, 1.0]. Default: 0.80.
+    /// Contradiction detector used after each `remember()`. Default `Nli`.
+    pub contradiction_mode: ContradictionMode,
+    /// Minimum cosine similarity for two memories to be compared by the contradiction
+    /// detector. Range: [0.0, 1.0]. Default 0.80.
     pub nli_cosine_threshold: f32,
+    /// Ingest admission policy. Default `AdmitAll` (centroid gate off).
+    pub admission: AdmissionMode,
+    /// Maximum number of *unverified* (`reinforcement_count + failure_count == 0`)
+    /// memories one recall may return, so feedback can act on them without letting
+    /// untested text crowd out evidence-bearing memories. 0 disables unverified
+    /// exposure entirely. Not applied when hidden rows are explicitly requested.
+    /// Default 1. NOTE: with no feedback history every memory is unverified, so a
+    /// default recall then returns at most one result; raise this for no-feedback use.
+    pub trial_cap: usize,
+    /// Minimum cosine similarity for an unverified memory to be eligible for a trial
+    /// slot. Default 0.0 (no floor); to be calibrated on a dev split, never on test data.
+    pub trial_min_cos: f32,
 }
 
 impl Default for ScoringConfig {
     fn default() -> Self {
         Self {
-            ema_new_weight: 0.3,
-            rc_saturation: 3.0,
-            jaccard_threshold: 0.35,
+            containment_threshold: 0.35,
             hnsw_threshold: 500,
-            cold_start_weight: 0.5,
             decay_rate: 0.01,
-            use_nli_contradiction: true,
+            contradiction_mode: ContradictionMode::Nli,
             nli_cosine_threshold: 0.80,
+            admission: AdmissionMode::AdmitAll,
+            trial_cap: 1,
+            trial_min_cos: 0.0,
         }
     }
 }
@@ -694,7 +738,7 @@ impl QualityMeta {
             consequence: 0.5,
             reusability: 0.5,
             source_kind: "agent".to_string(),
-            store_state: "active".to_string(),
+            store_state: "trial".to_string(),
             reinforcement_count: 0,
             last_accessed_at: Some(now),
             superseded_by: None,
@@ -837,63 +881,110 @@ pub fn extract_features(
     }
 }
 
-/// Compute a trust score in [0.0, 1.0] at recall time.
+/// Pseudo-observations behind the neutral trust prior: `alpha = beta = 2`, i.e. four
+/// imaginary outcomes at 50%. A heuristic prior, not a validated constant.
+pub const TRUST_PRIOR_ALPHA: f32 = 2.0;
+pub const TRUST_PRIOR_BETA: f32 = 2.0;
+const TRUST_PRIOR_STRENGTH: f32 = TRUST_PRIOR_ALPHA + TRUST_PRIOR_BETA;
+
+/// Posterior mean of "this memory helps when used" after `successes` attributed
+/// successes and `failures` attributed failures: `(2 + s) / (4 + s + f)`.
 ///
-/// Weight rationale (heuristic defaults, tunable via ScoringConfig):
-///   0.35 reinforcement ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â most direct signal: memory was acted on and helped
-///   0.25 confidence    ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â initial quality signal from ingestion evidence
-///   0.20 age_term      ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â fresh memories are more likely to still be accurate
-///   0.15 importance    ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ingestion-time importance score
-///   0.05 contradiction ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â small bonus for surviving a contradiction resolution
-///
-/// Trust interpretation:
-///   ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥ 0.75 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ FOLLOW (act on it)
-///   ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥ 0.45 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ HINT (verify before acting)
-///   < 0.45 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ IGNORE
-pub fn compute_trust(
-    reinforcement_count: i64,
-    contradiction_survived: bool,
-    store_state: &str,
-    importance_base: f32,
-    confidence: f32,
-    age_days: f32,
-    config: &ScoringConfig,
-) -> f32 {
-    let state_weight: f32 = match store_state {
-        "active" => 1.0,
-        "shadow" => 0.6,
-        _ => return 0.0,
-    };
+/// Independent of every ingest-time feature, so every freshly admitted memory starts
+/// at exactly 0.5 whatever its quality score.
+pub fn posterior_trust(successes: i64, failures: i64) -> f32 {
+    let s = successes.max(0) as f32;
+    let f = failures.max(0) as f32;
+    ((TRUST_PRIOR_ALPHA + s) / (TRUST_PRIOR_STRENGTH + s + f)).clamp(0.0, 1.0)
+}
 
-    let rc = reinforcement_count as f32;
-    let reinforcement_term = rc / (rc + config.rc_saturation);
-    let age_term = (-0.02_f32 * age_days).exp().clamp(0.0, 1.0);
-    let contradiction_bonus: f32 = if contradiction_survived { 1.0 } else { 0.0 };
+/// `4 / (4 + s + f)`: 1.0 with no evidence, falling as evidence accumulates.
+pub fn trust_uncertainty(successes: i64, failures: i64) -> f32 {
+    let n = (successes.max(0) + failures.max(0)) as f32;
+    (TRUST_PRIOR_STRENGTH / (TRUST_PRIOR_STRENGTH + n)).clamp(0.0, 1.0)
+}
 
-    let inner = 0.35 * reinforcement_term
-        + 0.25 * confidence.clamp(0.0, 1.0)
-        + 0.20 * age_term
-        + 0.15 * importance_base.clamp(0.0, 1.0)
-        + 0.05 * contradiction_bonus;
+/// Regress `trust` toward the neutral prior 0.5 as feedback evidence ages.
+pub fn decayed_trust(trust: f32, days_since_feedback: f32, decay_rate: f32) -> f32 {
+    let trust = trust.clamp(0.0, 1.0);
+    if decay_rate <= 0.0 || !days_since_feedback.is_finite() || days_since_feedback <= 0.0 {
+        return trust;
+    }
+    (0.5 + (trust - 0.5) * (-decay_rate * days_since_feedback).exp()).clamp(0.0, 1.0)
+}
 
-    let base_trust = state_weight * inner;
+/// True when posterior trust is below 0.40, written over integers so no float
+/// comparison sits on the boundary: `2f > 3s + 2`.
+pub fn should_quarantine(successes: i64, failures: i64) -> bool {
+    let s = successes.max(0) as i128;
+    let f = failures.max(0) as i128;
+    2 * f > 3 * s + 2
+}
 
-    // Head-start for brand-new, high-quality active memories so critical lessons
-    // can reach the HINT threshold before any reinforcement has occurred.
-    // Only fires for active, never-reinforced, contradiction-free memories
-    // that scored highly on both importance and confidence at ingestion.
-    let fast_track = if reinforcement_count == 0
-        && store_state == "active"
-        && importance_base > 0.8
-        && confidence > 0.7
-        && !contradiction_survived
-    {
-        0.15_f32
+/// True when posterior trust is at least 0.70: `3s >= 8 + 7f`.
+pub fn meets_follow(successes: i64, failures: i64) -> bool {
+    let s = successes.max(0) as i128;
+    let f = failures.max(0) as i128;
+    3 * s >= 8 + 7 * f
+}
+
+/// State of a *live* memory implied by its feedback counts alone.
+pub fn derive_live_state(successes: i64, failures: i64) -> &'static str {
+    if should_quarantine(successes, failures) {
+        "quarantined"
+    } else if meets_follow(successes, failures) {
+        "active"
     } else {
-        0.0
-    };
+        "trial"
+    }
+}
 
-    (base_trust + fast_track).clamp(0.0, 1.0)
+/// `trial` and `active` rows are exposed by default; everything else is hidden.
+pub fn is_live_state(state: &str) -> bool {
+    state == "trial" || state == "active"
+}
+
+/// Persisted `store_state` for an ingest decision. An admission is not evidence, so
+/// even `IngestDecision::Active` enters as `trial`.
+pub fn ingest_state(decision: &IngestDecision) -> &'static str {
+    match decision {
+        IngestDecision::Active => "trial",
+        IngestDecision::Probationary => "probationary",
+        IngestDecision::Shadow => "shadow",
+        IngestDecision::Reject => "rejected",
+    }
+}
+
+const ATTRIBUTION_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "that", "this", "from", "into", "are", "was", "were", "been",
+    "have", "has", "had", "not", "but", "can", "will", "would", "should", "could", "must", "may",
+    "might", "you", "your", "our", "they", "them", "their", "use", "using", "used", "when", "then",
+    "than", "also", "any", "all", "each", "every", "only", "just", "more", "most", "such", "very",
+    "its", "does", "did", "out", "over", "under", "about", "after", "before", "because", "which",
+    "what", "who", "how", "why", "there", "here", "these", "those", "always", "never", "avoid",
+];
+
+/// Lower-cased ASCII-alphanumeric tokens of at least three characters, minus
+/// stopwords. Used for text attribution of feedback.
+pub fn distinctive_tokens(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|t| t.to_ascii_lowercase())
+        .filter(|t| t.len() >= 3 && !ATTRIBUTION_STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
+/// Asymmetric containment `|M ∩ O| / |M|` of the memory's distinctive tokens in the
+/// agent output. Unlike symmetric Jaccard it does not shrink as the output grows, so a
+/// 400-token answer that uses a 20-token lesson is not penalised for being long.
+/// Returns 0.0 when the memory has no distinctive tokens.
+pub fn token_containment(memory: &str, output: &str) -> f32 {
+    let mem = distinctive_tokens(memory);
+    if mem.is_empty() {
+        return 0.0;
+    }
+    let out = distinctive_tokens(output);
+    let hit = mem.iter().filter(|t| out.contains(*t)).count();
+    hit as f32 / mem.len() as f32
 }
 
 pub fn compute_gravity_radius(trust_ema: f64, reinforcement_count: i64, age_days: f64) -> f64 {
@@ -931,13 +1022,7 @@ pub fn build_quality_meta(
     let decision = decide_store(score, 1.0 - novelty);
     let polarity = detect_polarity(content);
 
-    let state = match decision {
-        IngestDecision::Active => "active",
-        IngestDecision::Probationary => "probationary",
-        IngestDecision::Shadow => "shadow",
-        IngestDecision::Reject => "rejected",
-    }
-    .to_string();
+    let state = ingest_state(&decision).to_string();
 
     let meta = QualityMeta {
         importance_base: score,
@@ -1473,5 +1558,145 @@ mod tests {
         );
         assert_eq!(label, NliLabel::Neutral);
         assert_eq!(stub.calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    // ---- Step 8b-1: posterior trust, derived states, attribution ----
+
+    #[test]
+    fn posterior_trust_matches_the_documented_table() {
+        let cases = [
+            ((0, 0), 0.5),
+            ((1, 0), 0.6),
+            ((2, 0), 2.0 / 3.0),
+            ((3, 0), 5.0 / 7.0),
+            ((0, 1), 0.4),
+            ((0, 2), 1.0 / 3.0),
+            ((1, 2), 3.0 / 7.0),
+            ((2, 1), 4.0 / 7.0),
+        ];
+        for ((s, f), want) in cases {
+            let got = posterior_trust(s, f);
+            assert!((got - want).abs() < 1e-6, "({s},{f}): {got} != {want}");
+        }
+        assert!((trust_uncertainty(0, 0) - 1.0).abs() < 1e-6);
+        assert!((trust_uncertainty(2, 2) - 0.5).abs() < 1e-6);
+        // Negative counts from a corrupt database are treated as zero.
+        assert_eq!(posterior_trust(-5, -5), 0.5);
+    }
+
+    #[test]
+    fn integer_state_rules_agree_with_the_float_thresholds() {
+        for s in 0..40_i64 {
+            for f in 0..40_i64 {
+                let t = posterior_trust(s, f);
+                assert_eq!(
+                    should_quarantine(s, f),
+                    t < 0.40,
+                    "quarantine ({s},{f}) t={t}"
+                );
+                assert_eq!(meets_follow(s, f), t >= 0.70, "follow ({s},{f}) t={t}");
+                let want = if t < 0.40 {
+                    "quarantined"
+                } else if t >= 0.70 {
+                    "active"
+                } else {
+                    "trial"
+                };
+                assert_eq!(derive_live_state(s, f), want, "({s},{f})");
+            }
+        }
+        assert_eq!(
+            derive_live_state(0, 1),
+            "trial",
+            "one failure alone is not enough"
+        );
+        assert_eq!(derive_live_state(0, 2), "quarantined");
+        assert_eq!(derive_live_state(3, 0), "active");
+        assert_eq!(derive_live_state(5, 1), "active");
+        assert_eq!(derive_live_state(4, 1), "trial");
+    }
+
+    #[test]
+    fn decayed_trust_regresses_toward_the_neutral_prior() {
+        assert_eq!(decayed_trust(0.9, 0.0, 0.01), 0.9);
+        assert_eq!(decayed_trust(0.9, 100.0, 0.0), 0.9);
+        let later = decayed_trust(0.9, 100.0, 0.01);
+        assert!(later < 0.9 && later > 0.5, "{later}");
+        let low = decayed_trust(0.1, 100.0, 0.01);
+        assert!(low > 0.1 && low < 0.5, "{low}");
+        assert!((decayed_trust(0.7, 1.0e6, 0.01) - 0.5).abs() < 1e-3);
+        assert_eq!(decayed_trust(0.7, f32::NAN, 0.01), 0.7);
+    }
+
+    #[test]
+    fn live_and_ingest_states() {
+        assert!(is_live_state("trial") && is_live_state("active"));
+        for hidden in ["shadow", "probationary", "quarantined", "rejected"] {
+            assert!(!is_live_state(hidden), "{hidden}");
+        }
+        assert_eq!(ingest_state(&IngestDecision::Active), "trial");
+        assert_eq!(ingest_state(&IngestDecision::Shadow), "shadow");
+        assert_eq!(ingest_state(&IngestDecision::Probationary), "probationary");
+        assert_eq!(ingest_state(&IngestDecision::Reject), "rejected");
+    }
+
+    #[test]
+    fn containment_does_not_shrink_with_output_length() {
+        let lesson = "Quantize prices with Decimal using rounding half even for billing totals";
+        let long = format!("{} {}", "filler ".repeat(400), lesson);
+        assert_eq!(token_containment(lesson, lesson), 1.0);
+        assert_eq!(token_containment(lesson, &long), 1.0);
+        assert_eq!(token_containment(lesson, &"filler ".repeat(400)), 0.0);
+        // Code output that only mentions two of the lesson's content words.
+        let partial =
+            "from decimal import Decimal; total = Decimal('1.20').quantize(Decimal('0.01'))";
+        let c = token_containment(lesson, partial);
+        assert!(c > 0.0 && c < 0.5, "{c}");
+    }
+
+    #[test]
+    fn containment_edge_cases() {
+        assert_eq!(token_containment("", "anything at all"), 0.0);
+        assert_eq!(token_containment("the and for", "the and for"), 0.0);
+        // Case and punctuation are normalised; short tokens and stopwords are dropped.
+        assert_eq!(
+            token_containment("Use DECIMAL, never float!", "decimal float"),
+            1.0
+        );
+        let toks = distinctive_tokens("Always use the Decimal-class for money");
+        assert!(toks.contains("decimal") && toks.contains("class") && toks.contains("money"));
+        assert!(!toks.contains("the") && !toks.contains("for") && !toks.contains("always"));
+    }
+
+    #[test]
+    fn mode_enums_parse_and_default() {
+        assert_eq!(AdmissionMode::default(), AdmissionMode::AdmitAll);
+        assert_eq!(ContradictionMode::default(), ContradictionMode::Nli);
+        assert_eq!(
+            AdmissionMode::parse("admit_all"),
+            Some(AdmissionMode::AdmitAll)
+        );
+        assert_eq!(
+            AdmissionMode::parse("Quality-Gate"),
+            Some(AdmissionMode::QualityGate)
+        );
+        assert_eq!(AdmissionMode::parse("nope"), None);
+        assert_eq!(
+            ContradictionMode::parse("OFF"),
+            Some(ContradictionMode::Off)
+        );
+        assert_eq!(
+            ContradictionMode::parse("legacy"),
+            Some(ContradictionMode::Legacy)
+        );
+        assert_eq!(
+            ContradictionMode::parse("nli"),
+            Some(ContradictionMode::Nli)
+        );
+        assert_eq!(ContradictionMode::parse("x"), None);
+        let cfg = ScoringConfig::default();
+        assert_eq!(cfg.trial_cap, 1);
+        assert_eq!(cfg.trial_min_cos, 0.0);
+        assert_eq!(cfg.admission, AdmissionMode::AdmitAll);
     }
 }

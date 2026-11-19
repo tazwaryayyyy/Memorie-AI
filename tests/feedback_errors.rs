@@ -62,11 +62,12 @@ fn database_failure_is_an_error_not_ok_false() {
     let id = m.remember(CONTENT).unwrap()[0];
     assert!(m.reinforce_if_used(id, CONTENT, true).unwrap());
 
-    // Break the schema underneath the open handle: the SELECT in
-    // `Store::reinforce_if_used` now fails with "no such column".
+    // Break the schema underneath the open handle: the transactional read in
+    // `Store::apply_success` (which reads `failure_count`; it no longer reads
+    // `confidence`, which feedback stopped rewriting) now fails with "no such column".
     let other = rusqlite::Connection::open(&db).unwrap();
     other
-        .execute_batch("ALTER TABLE memories RENAME COLUMN confidence TO confidence_gone;")
+        .execute_batch("ALTER TABLE memories RENAME COLUMN failure_count TO failure_count_gone;")
         .unwrap();
 
     let res = m.reinforce_if_used(id, CONTENT, true);
