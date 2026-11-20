@@ -373,6 +373,11 @@ impl Memoire {
     }
 
     /// Chunk `content`, embed each chunk, and persist with `source_kind` metadata.
+    ///
+    /// Returns the ids of the rows that now represent the chunks. Under
+    /// `AdmissionMode::QualityGate`, a chunk that independently restates a hidden `shadow`
+    /// row (cosine >= 0.92, no contradiction, from a different ingest call than the row)
+    /// promotes that row to `trial` and returns its id instead of inserting a duplicate.
     pub fn remember_with_source(&self, content: &str, source_kind: &str) -> Result<Vec<i64>> {
         let chunks = chunk_text(content, &self.chunker_config);
         if chunks.is_empty() {
@@ -392,6 +397,18 @@ impl Memoire {
             if self.store.fingerprint_exists(&fp)? {
                 continue;
             }
+
+            // Quality-gated admission hides low-scoring chunks as `shadow`. A later,
+            // independent restatement of one corroborates it: promote the hidden row to
+            // `trial` instead of inserting a duplicate. Not evidence of usefulness, so no
+            // reinforcement is recorded; the promoted id is returned in place of a new one.
+            if self.store.config.admission == AdmissionMode::QualityGate {
+                if let Some(existing) = self.store.corroborate_shadow(chunk, embedding, &ids)? {
+                    ids.push(existing);
+                    continue;
+                }
+            }
+
             let max_sim = self.store.max_similarity(embedding)?;
             let novelty = (1.0 - max_sim).clamp(0.0, 1.0);
             let (mut meta, mut decision) = build_quality_meta(
@@ -836,7 +853,8 @@ impl Memoire {
             "Disabled the feature flag after rollback to restore stable behavior".to_string(),
         ];
         let reusability_sents = [
-            "Always use Decimal for financial calculations never use float".to_string(),
+            "Always close database connections and file handles in a finally block to avoid leaks"
+                .to_string(),
             "Never store passwords in plain text always hash with bcrypt".to_string(),
             "API rate limit policy must enforce maximum requests per hour".to_string(),
             "Rule: all database queries must use parameterized statements".to_string(),

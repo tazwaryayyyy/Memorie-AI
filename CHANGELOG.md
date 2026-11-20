@@ -12,6 +12,47 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ---
 
 ## [Unreleased]
+### Changed (Step 8b-2: weights, contradiction verdicts, shadow corroboration; breaking, pre-publish)
+- **`ScoringWeights::default()`**: `novelty` and `evidence` weigh `0.0`; the three semantic
+  centroid weights are renormalised to `3/7`, `5/14`, `3/14` (original 0.30 : 0.25 : 0.15
+  ratio, sum 1). Both features are still computed and stored. `confidence` is now
+  `0.50 + 0.20 * actionability` (the `0.30 * evidence` term is gone), so attacker-controlled
+  keywords can no longer raise importance or confidence. Scores are on a different scale:
+  with `AdmissionMode::QualityGate`, the unchanged `>= 0.50` bar now hides most realistic
+  lessons until it is calibrated.
+- **Prototype leakage**: the `"Always use Decimal for financial calculations never use
+  float"` reusability exemplar in `Memoire::compute_prototypes` is replaced by a
+  domain-neutral rule about closing connections and file handles.
+- **Lexical contradiction gate** (`NliChecker::lexical_label`): `Contradiction` now needs
+  opposing polarity AND `negation_asymmetry >= 1`; opposing polarity alone is `Neutral`.
+  `detect_polarity` and `negation_asymmetry` share one lexicon (`NEGATIVE_TERMS`; asymmetry
+  also counts `not` / `no`), fixing `"disabled"`, `"removed"`, `"stopped"`, `"reverted"`,
+  `"vulnerable"` and `"do not"` counting for polarity but not for asymmetry.
+- **Contradiction losers**: a verdict from the lexical fallback now `quarantines` the loser
+  (hidden, never deleted, recoverable with `unquarantine`); a verdict from an installed ONNX
+  model still archives it. The `Legacy` polarity gate still archives. `count()` therefore no
+  longer drops after a lexical contradiction.
+- **Shadow corroboration** (`AdmissionMode::QualityGate`): a chunk that restates a hidden
+  `shadow` row (cosine >= 0.92, no contradiction, different `remember` call) promotes it to
+  `trial` instead of inserting a duplicate; `remember` returns the promoted id. No
+  reinforcement is recorded.
+
+### Added
+- `NliChecker::check_with_source` and `NliSource`; `Store::corroborate_shadow`,
+  `store::NEAR_DUPLICATE_COSINE`.
+- Tests: weights/confidence, lexicon alignment, lexical gate (TLS case), verdict source,
+  authoritative-archive vs lexical-quarantine, corroboration (similarity, independence,
+  state, contradiction), `tests/lifecycle.rs` corroboration scenarios, and oracle tests that
+  prove keyword evidence cannot buy a pass.
+
+### Known gaps (not addressed here)
+- Tokens are whitespace-delimited, so a lexicon term followed by punctuation (`disabled.`)
+  is not matched by `detect_polarity` / `negation_asymmetry`.
+- `should_supersede` still compares the incoming memory's ingest importance with
+  `0.50 + 0.40 * gravity`; with the new weights the existing memory almost always wins.
+- Remaining exemplars still touch payments, hashing, parameterized queries and input
+  validation.
+
 ### Changed (Step 8b-1: trust, lifecycle, feedback integrity; breaking, pre-publish)
 - **Trust is a Beta posterior** `(2 + s) / (4 + s + f)` over `reinforcement_count` /
   `failure_count`, independent of ingest scores; `uncertainty = 4 / (4 + s + f)`. Removed
@@ -52,10 +93,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - `Cargo.toml` `include` now ships `/migrations/**`; `include_str!("../migrations/v2.sql")`
   failed from a packaged crate.
 
-### Not changed yet (Step 8b-2 / 8b-3)
-- `evidence` / `novelty` weights, `lexical_label` asymmetry gate, `NEGATIVE`/`NEGATORS`
-  lexicons, lexical-only contradiction -> `quarantined`, prototype leakage, corroboration
-  promotion at ingest; MCP/SDK thresholds, `exposure` in MCP output, session ids in MCP.
+### Not changed yet (Step 8b-3)
+- MCP/SDK thresholds, `exposure` in MCP output, session ids in MCP, `MEMOIRE_TRIAL_CAP`.
 
 ### Documentation (earlier in Unreleased)
 

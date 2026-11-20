@@ -47,15 +47,22 @@ tests only.
 - **Embeddings**: `all-MiniLM-L6-v2` (384-dim) via `fastembed` + ONNX Runtime, run
   locally on CPU. The model is downloaded on first use (see [Model cache](#model-cache-and-offline-use)).
 - **Deduplication**: BLAKE3 fingerprints; exact-content duplicates are dropped.
-- **Quality scoring at ingest**: five heuristic features (actionability, consequence,
-  novelty, reusability, evidence) combined with fixed weights and stored as metadata. With
-  the default `AdmissionMode::AdmitAll` they do not gate exposure; `QualityGate` restores
-  the legacy `>= 0.50` live / else hidden `shadow` split.
+- **Quality scoring at ingest**: three semantic features (actionability, consequence,
+  reusability: cosine to fixed centroids) weighted `3/7`, `5/14`, `3/14`. `novelty` and
+  `evidence` are still computed and stored as metadata but weigh 0. With the default
+  `AdmissionMode::AdmitAll` the score does not gate exposure; `QualityGate` restores the
+  `>= 0.50` live / else hidden `shadow` split. Because the weights now sum over centroid
+  cosines only, realistic lessons often score below 0.50, so `QualityGate` needs its own
+  calibration before use.
 - **Trust**: a Beta posterior `(2 + s) / (4 + s + f)` over attributed reinforcements and
   failures, independent of ingest scores, time-regressed toward 0.5. Constants are hand-set.
 - **Contradiction handling**: when a new memory is close to an existing one (cosine
-  `>= 0.80`) and the two are judged contradictory, one is archived. Judgement is a
-  lexical polarity heuristic unless you supply an ONNX NLI model.
+  `>= 0.80`) and the two are judged contradictory, the loser is hidden: archived if an ONNX
+  NLI model decided, quarantined (recoverable) if only the lexical heuristic did.
+- **Shadow corroboration** (`AdmissionMode::QualityGate` only): a chunk that independently
+  restates a hidden `shadow` row (cosine `>= 0.92`, no contradiction, from a different
+  `remember` call) promotes that row to `trial` instead of inserting a duplicate, and the
+  promoted id is returned. It records no reinforcement. Exact replays do not count.
 - **MMR recall**, optional cross-encoder reranking, **namespaces**, JSON
   **export/import**.
 - **Interfaces**: Rust library, Python SDK (PyO3), MCP server, CLI, C FFI,
@@ -277,15 +284,25 @@ Run after each `remember()` for each new chunk, against live `trial`/`active` an
 
 1. Cosine similarity `< nli_cosine_threshold` (default `0.80`) -> treated as unrelated.
 2. If an ONNX NLI model was supplied (`Memoire::with_nli_model(path)`), its label is
-   authoritative. Without one, or if inference errors, a lexical fallback is used:
-   opposing polarity (from a small keyword lexicon) is labelled `Contradiction`.
+   authoritative. Without one, or if inference errors, a lexical fallback is used: the two
+   texts must have opposing polarity (from a small keyword lexicon) **and** at least one
+   negation term (from the same lexicon, plus `not` / `no`) must appear in exactly one of
+   them. Opposing polarity without that asymmetry is `Neutral`.
 3. The incoming row replaces the existing one only if its importance exceeds
-   `0.50 + 0.40 * existing_gravity`; the loser is archived with `superseded_by` set.
+   `0.50 + 0.40 * existing_gravity`; otherwise the incoming row is the loser.
+4. The loser is hidden. A model-backed verdict **archives** it (`archived = 1`,
+   `superseded_by` set; maintenance deletes archived rows after seven days). A lexical-only
+   verdict **quarantines** it instead: hidden from default recall, never deleted, restored
+   with `unquarantine` (CLI: `memoire-cli unquarantine <ID>`). The `Legacy` polarity gate
+   keeps its historical archiving.
 
 Caveats: the lexical fallback is a keyword heuristic and will produce false positives and
 false negatives. If the new memory's polarity is neutral the check is skipped entirely, so an NLI
-model never sees that pair.
-There is no automated test against a real NLI model in this repository.
+model never sees that pair. Terms are matched on whitespace-delimited tokens, so one followed
+by punctuation (`disabled.`) is not matched. The winner rule compares the incoming memory's
+ingest importance (a centroid score, often well below 0.50 with MiniLM) with that threshold,
+so the existing memory usually wins. There is no automated test against a real NLI model in
+this repository.
 
 ```rust
 use memoire::quality::{ContradictionMode, ScoringConfig};
@@ -407,9 +424,10 @@ resolve inside `MEMOIRE_ALLOWED_PATHS` (default: the server's working directory)
    synthetic smoke test (it prints `[SYNTHETIC SMOKE TEST, not an LLM benchmark]`), and
    `examples/brutal_moment_demo.py` is a scripted demo. Neither is evidence that Memoire
    improves a real coding agent. No such benchmark has been run or published.
-3. **Heuristic scoring.** Quality scoring, the `evidence` keyword feature, the trust
-   formula, the policy thresholds and the lexical contradiction fallback are heuristics
-   with hand-set constants. They are configurable, not validated or calibrated.
+3. **Heuristic scoring.** Quality scoring (three semantic centroid features; the `evidence`
+   keyword and `novelty` features are stored but no longer scored), the trust formula, the
+   policy thresholds and the lexical contradiction fallback are heuristics with hand-set
+   constants. They are configurable, not validated or calibrated.
 4. **Not offline on cold start** (model download), and the default cache directory is
    relative to the working directory (see [Model cache](#model-cache-and-offline-use)).
 5. **Not published.** No registry package exists yet; there are no prebuilt wheels or

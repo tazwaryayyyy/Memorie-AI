@@ -25,6 +25,17 @@ pub enum NliLabel {
     Entailment,
 }
 
+/// Where an [`NliChecker`] verdict came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NliSource {
+    /// The cosine topic gate failed, so the pair is `Neutral` without further analysis.
+    TopicGate,
+    /// An installed ONNX NLI model produced the label (authoritative).
+    Onnx,
+    /// The lexical fallback produced the label (a heuristic; no model, or inference failed).
+    Lexical,
+}
+
 /// Pairwise NLI classifier. Implemented by [`OnnxNliChecker`]; unit tests use stubs
 /// so no model download is needed.
 pub(crate) trait NliClassifier: Send + Sync {
@@ -293,25 +304,52 @@ impl NliChecker {
         hypothesis_emb: &[f32],
         cosine_threshold: f32,
     ) -> NliLabel {
+        self.check_with_source(
+            premise_text,
+            hypothesis_text,
+            premise_emb,
+            hypothesis_emb,
+            cosine_threshold,
+        )
+        .0
+    }
+
+    /// Like [`Self::check`], but also reports where the verdict came from, so callers can
+    /// treat a heuristic `Contradiction` (`NliSource::Lexical`) less destructively than a
+    /// model-backed one (`NliSource::Onnx`).
+    pub fn check_with_source(
+        &self,
+        premise_text: &str,
+        hypothesis_text: &str,
+        premise_emb: &[f32],
+        hypothesis_emb: &[f32],
+        cosine_threshold: f32,
+    ) -> (NliLabel, NliSource) {
         let sim = cosine_similarity(premise_emb, hypothesis_emb);
         if sim < cosine_threshold {
-            return NliLabel::Neutral;
+            return (NliLabel::Neutral, NliSource::TopicGate);
         }
 
         if let Some(classifier) = &self.onnx {
             match classifier.classify(premise_text, hypothesis_text) {
-                Ok(label) => return label,
+                Ok(label) => return (label, NliSource::Onnx),
                 Err(e) => {
                     log::warn!("ONNX NLI inference failed ({e}); falling back to lexical heuristic")
                 }
             }
         }
 
-        Self::lexical_label(premise_text, hypothesis_text)
+        (
+            Self::lexical_label(premise_text, hypothesis_text),
+            NliSource::Lexical,
+        )
     }
 
-    /// Lexical fallback: polarity opposition + negation asymmetry. Assumes the
-    /// topic gate has already passed.
+    /// Lexical fallback. A `Contradiction` needs BOTH signals: the two texts have
+    /// opposing polarity AND at least one negation term appears in exactly one of them.
+    /// Opposing polarity without negation asymmetry is `Neutral` (an unconfirmed
+    /// guess is not enough to supersede or hide a memory). Assumes the topic gate has
+    /// already passed.
     fn lexical_label(premise_text: &str, hypothesis_text: &str) -> NliLabel {
         // Gate 2: polarity opposition.
         let pol_a = detect_polarity(premise_text);
@@ -325,16 +363,13 @@ impl NliChecker {
             return NliLabel::Entailment;
         }
 
-        // Gate 3: negation asymmetry score.
-        // We compute how many negation tokens appear exclusively in one text.
-        // High asymmetry confirms the contradiction rather than a polarity artifact.
-        let neg_score = negation_asymmetry(premise_text, hypothesis_text);
-        if neg_score >= 1 {
-            return NliLabel::Contradiction;
+        // Gate 3: negation asymmetry. Count negation terms that appear in exactly one
+        // text; both gates must agree before the pair is called a contradiction.
+        if negation_asymmetry(premise_text, hypothesis_text) >= 1 {
+            NliLabel::Contradiction
+        } else {
+            NliLabel::Neutral
         }
-
-        // Polarity opposes but no clear negation asymmetry - conservative fallback.
-        NliLabel::Contradiction
     }
 }
 
@@ -344,30 +379,45 @@ impl Default for NliChecker {
     }
 }
 
+/// Terms marking a negative / prohibitive claim, with their inflections. The single
+/// source for both [`detect_polarity`] and [`negation_asymmetry`]: they used to keep
+/// separate lists that disagreed (`"disabled"`, `"removed"`, `"stopped"`, `"reverted"`,
+/// `"vulnerable"` and `"do not"` counted for polarity but not for asymmetry), so a pair
+/// such as "always enable TLS verification" / "TLS verification disabled" opposed in
+/// polarity yet showed no negation asymmetry.
+const NEGATIVE_TERMS: &[&str] = &[
+    "never",
+    "avoid",
+    "don't",
+    "do not",
+    "cannot",
+    "must not",
+    "should not",
+    "prohibited",
+    "forbidden",
+    "disable",
+    "disabled",
+    "remove",
+    "removed",
+    "deprecated",
+    "stop",
+    "stopped",
+    "revert",
+    "reverted",
+    "rollback",
+    "dangerous",
+    "insecure",
+    "vulnerable",
+    "broken",
+];
+
+/// Plain negation tokens counted for asymmetry only: too generic to decide a claim's
+/// polarity by themselves.
+const PLAIN_NEGATIONS: &[&str] = &["not", "no"];
+
 /// Count negation tokens present in one text but absent in the other.
 /// High values indicate one text strongly negates what the other asserts.
 fn negation_asymmetry(a: &str, b: &str) -> usize {
-    const NEGATORS: &[&str] = &[
-        "never",
-        "not",
-        "no",
-        "avoid",
-        "don't",
-        "cannot",
-        "must not",
-        "should not",
-        "prohibited",
-        "forbidden",
-        "disable",
-        "remove",
-        "deprecated",
-        "stop",
-        "revert",
-        "rollback",
-        "dangerous",
-        "insecure",
-        "broken",
-    ];
     let na = normalize_text(a);
     let nb = normalize_text(b);
     let in_a = |t: &&str| -> bool {
@@ -384,7 +434,11 @@ fn negation_asymmetry(a: &str, b: &str) -> usize {
             nb.split_whitespace().any(|w| w == *t)
         }
     };
-    NEGATORS.iter().filter(|t| in_a(t) != in_b(t)).count()
+    NEGATIVE_TERMS
+        .iter()
+        .chain(PLAIN_NEGATIONS.iter())
+        .filter(|t| in_a(t) != in_b(t))
+        .count()
 }
 
 // ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ Configuration ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬ÃƒÂ¢Ã¢â‚¬ÂÃ¢â€šÂ¬
@@ -581,32 +635,6 @@ pub fn detect_polarity(text: &str) -> Polarity {
     let norm = normalize_text(text);
     let words: Vec<&str> = norm.split_whitespace().collect();
 
-    const NEGATIVE: &[&str] = &[
-        "never",
-        "avoid",
-        "don't",
-        "do not",
-        "cannot",
-        "must not",
-        "should not",
-        "prohibited",
-        "forbidden",
-        "disable",
-        "disabled",
-        "remove",
-        "removed",
-        "deprecated",
-        "stop",
-        "stopped",
-        "revert",
-        "reverted",
-        "rollback",
-        "dangerous",
-        "insecure",
-        "vulnerable",
-        "broken",
-    ];
-
     const AFFIRMATIVE: &[&str] = &[
         "always",
         "ensure",
@@ -629,7 +657,7 @@ pub fn detect_polarity(text: &str) -> Polarity {
     ];
 
     // Check multi-word tokens against the full normalised text (handles "do not", "must not").
-    let neg_hits = NEGATIVE
+    let neg_hits = NEGATIVE_TERMS
         .iter()
         .filter(|&&t| {
             if t.contains(' ') {
@@ -693,13 +721,18 @@ pub struct ScoringWeights {
 }
 
 impl Default for ScoringWeights {
+    /// Only the three semantic centroid features score by default. `novelty` and
+    /// `evidence` are still computed and stored as metadata, but weigh 0: novelty
+    /// punishes repeated or corrective lessons, and keyword evidence is attacker-controlled
+    /// text. The three remaining weights keep their original 0.30 : 0.25 : 0.15 ratio,
+    /// renormalised to sum to 1 (`3/7`, `5/14`, `3/14`).
     fn default() -> Self {
         Self {
-            actionability: 0.30,
-            consequence: 0.25,
-            novelty: 0.20,
-            reusability: 0.15,
-            evidence: 0.10,
+            actionability: 3.0 / 7.0,
+            consequence: 5.0 / 14.0,
+            novelty: 0.0,
+            reusability: 3.0 / 14.0,
+            evidence: 0.0,
         }
     }
 }
@@ -1026,8 +1059,8 @@ pub fn build_quality_meta(
 
     let meta = QualityMeta {
         importance_base: score,
-        confidence: (0.50 + 0.30 * features.evidence + 0.20 * features.actionability)
-            .clamp(0.0, 1.0),
+        // Keyword evidence no longer contributes: it is attacker-controlled text.
+        confidence: (0.50 + 0.20 * features.actionability).clamp(0.0, 1.0),
         novelty: features.novelty,
         actionability: features.actionability,
         evidence: features.evidence,
@@ -1698,5 +1731,143 @@ mod tests {
         assert_eq!(cfg.trial_cap, 1);
         assert_eq!(cfg.trial_min_cos, 0.0);
         assert_eq!(cfg.admission, AdmissionMode::AdmitAll);
+    }
+
+    // ---- Step 8b-2: weights, lexicons, lexical gate, verdict source ----
+
+    #[test]
+    fn default_weights_score_only_the_semantic_features() {
+        let w = ScoringWeights::default();
+        assert_eq!(w.novelty, 0.0);
+        assert_eq!(w.evidence, 0.0);
+        let sum = w.actionability + w.consequence + w.reusability;
+        assert!((sum - 1.0).abs() < 1e-6, "weights sum to {sum}");
+        // Original 0.30 : 0.25 : 0.15 ratio is preserved.
+        assert!((w.actionability / w.consequence - 0.30 / 0.25).abs() < 1e-5);
+        assert!((w.consequence / w.reusability - 0.25 / 0.15).abs() < 1e-5);
+    }
+
+    #[test]
+    fn keyword_evidence_and_novelty_cannot_raise_importance_or_confidence() {
+        let protos = ScoringPrototypes::neutral(3);
+        let emb = [1.0_f32, 0.0, 0.0];
+        let w = ScoringWeights::default();
+        let (plain, _) = build_quality_meta("plain note", &emb, 0.0, "agent", &w, &protos);
+        let (stuffed, _) = build_quality_meta(
+            "tested confirmed verified measured benchmark metrics 123",
+            &emb,
+            1.0,
+            "agent",
+            &w,
+            &protos,
+        );
+        assert!(
+            stuffed.evidence > plain.evidence,
+            "evidence is still recorded"
+        );
+        assert!(stuffed.novelty > plain.novelty, "novelty is still recorded");
+        assert_eq!(stuffed.importance_base, plain.importance_base);
+        assert_eq!(stuffed.confidence, plain.confidence);
+        assert!(
+            (plain.confidence - 0.6).abs() < 1e-6,
+            "{}",
+            plain.confidence
+        );
+    }
+
+    #[test]
+    fn lexical_contradiction_needs_polarity_and_negation_asymmetry() {
+        // Opposing polarity AND "disabled" appears in only one text.
+        assert_eq!(
+            NliChecker::lexical_label(
+                "always enable TLS verification",
+                "TLS verification disabled in staging"
+            ),
+            NliLabel::Contradiction
+        );
+        // Opposing polarity, but every negation term is shared: no asymmetry -> Neutral.
+        let a = "always lint ensure review enable ci never skip avoid shortcuts";
+        let b = "never merge avoid hotfixes";
+        assert_eq!(detect_polarity(a), Polarity::Affirmative);
+        assert_eq!(detect_polarity(b), Polarity::Negative);
+        assert_eq!(negation_asymmetry(a, b), 0);
+        assert_eq!(NliChecker::lexical_label(a, b), NliLabel::Neutral);
+        // Same direction stays Entailment, unknown polarity stays Neutral.
+        assert_eq!(
+            NliChecker::lexical_label("always use Decimal", "always prefer Decimal"),
+            NliLabel::Entailment
+        );
+        assert_eq!(
+            NliChecker::lexical_label("the sky is blue", "never use floats"),
+            NliLabel::Neutral
+        );
+    }
+
+    #[test]
+    fn polarity_and_asymmetry_share_one_negation_lexicon() {
+        for term in NEGATIVE_TERMS {
+            let text = format!("{term} it");
+            assert_eq!(detect_polarity(&text), Polarity::Negative, "{term}");
+            assert!(negation_asymmetry(&text, "do it") >= 1, "{term}");
+        }
+        for term in PLAIN_NEGATIONS {
+            assert!(
+                negation_asymmetry(&format!("{term} it"), "do it") >= 1,
+                "{term}"
+            );
+        }
+        // The terms that used to be missing from the asymmetry list.
+        for term in [
+            "disabled",
+            "removed",
+            "stopped",
+            "reverted",
+            "vulnerable",
+            "do not",
+        ] {
+            assert!(NEGATIVE_TERMS.contains(&term), "{term}");
+        }
+    }
+
+    #[test]
+    fn check_with_source_reports_where_the_verdict_came_from() {
+        struct Fixed(NliLabel);
+        impl NliClassifier for Fixed {
+            fn classify(&self, _p: &str, _h: &str) -> anyhow::Result<NliLabel> {
+                Ok(self.0.clone())
+            }
+        }
+        struct Failing;
+        impl NliClassifier for Failing {
+            fn classify(&self, _p: &str, _h: &str) -> anyhow::Result<NliLabel> {
+                anyhow::bail!("inference failed")
+            }
+        }
+        let emb = [0.577_f32, 0.577, 0.577];
+        let a = "never use float for money";
+        let b = "always use float for money";
+
+        let lexical = NliChecker::new();
+        assert_eq!(
+            lexical.check_with_source(a, b, &emb, &emb, 0.80),
+            (NliLabel::Contradiction, NliSource::Lexical)
+        );
+        assert_eq!(
+            lexical.check_with_source(a, b, &unit_vec(3, 0), &unit_vec(3, 1), 0.80),
+            (NliLabel::Neutral, NliSource::TopicGate)
+        );
+        let model = NliChecker::with_classifier(Arc::new(Fixed(NliLabel::Contradiction)));
+        assert_eq!(
+            model.check_with_source(a, b, &emb, &emb, 0.80),
+            (NliLabel::Contradiction, NliSource::Onnx)
+        );
+        // An erroring model falls back to the lexical heuristic, and says so.
+        let broken = NliChecker::with_classifier(Arc::new(Failing));
+        assert_eq!(
+            broken.check_with_source(a, b, &emb, &emb, 0.80).1,
+            NliSource::Lexical
+        );
+        // `check` is unchanged.
+        assert_eq!(model.check(a, b, &emb, &emb, 0.80), NliLabel::Contradiction);
     }
 }

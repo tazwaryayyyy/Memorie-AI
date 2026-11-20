@@ -323,14 +323,24 @@ fn test_semantic_contradiction_detection() {
     assert!(!ids1.is_empty(), "first memory must be stored");
     assert!(!ids2.is_empty(), "second memory must be stored");
 
-    // After contradiction resolution, the active count must be strictly less than
-    // total inserted — the loser must be archived. Near-paraphrase pairs reliably
-    // exceed the 0.80 cosine gate under MiniLM.
-    let active = mem.count().unwrap();
-    let total = (ids1.len() + ids2.len()) as i64;
-    assert!(
-        active < total,
-        "contradiction resolution must archive the loser: stored {total} but active={active}"
+    // No ONNX NLI model is installed here, so the verdict comes from the lexical fallback:
+    // a heuristic. The loser is therefore quarantined (hidden but recoverable), not
+    // archived. Near-paraphrase pairs reliably exceed the 0.80 cosine gate.
+    let quarantined: Vec<_> = mem
+        .export_all()
+        .unwrap()
+        .into_iter()
+        .filter(|x| x.state == "quarantined")
+        .collect();
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "lexical contradiction resolution must quarantine exactly the loser"
+    );
+    assert_eq!(
+        mem.count().unwrap(),
+        (ids1.len() + ids2.len()) as i64,
+        "a quarantined loser is not archived"
     );
 
     // Recall must still work and return valid scores

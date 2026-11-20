@@ -155,15 +155,19 @@ fn export_does_not_launder_quarantined_memories() {
 }
 
 #[test]
-fn contradiction_mode_controls_whether_anything_is_archived() {
+fn contradiction_mode_decides_how_a_contradiction_is_resolved() {
     let pair = [
         "Never cache authentication tokens in local storage under any circumstances",
         "Always cache authentication tokens in local storage for performance",
     ];
-    for (mode, expected) in [
-        (ContradictionMode::Off, 2),
-        (ContradictionMode::Nli, 1),
-        (ContradictionMode::Legacy, 1),
+    // (mode, quarantined rows, rows still counted)
+    for (mode, quarantined, counted) in [
+        (ContradictionMode::Off, 0, 2),
+        // No ONNX model here: the lexical verdict is a heuristic, so the loser is
+        // quarantined (hidden, recoverable) rather than archived.
+        (ContradictionMode::Nli, 1, 2),
+        // The legacy polarity gate keeps its historical archiving.
+        (ContradictionMode::Legacy, 0, 1),
     ] {
         let m = engine(ScoringConfig {
             contradiction_mode: mode,
@@ -172,8 +176,92 @@ fn contradiction_mode_controls_whether_anything_is_archived() {
         for text in pair {
             assert_eq!(m.remember(text).unwrap().len(), 1);
         }
-        assert_eq!(m.count().unwrap(), expected, "mode {mode:?}");
+        let hidden = m
+            .export_all()
+            .unwrap()
+            .iter()
+            .filter(|x| x.state == "quarantined")
+            .count();
+        assert_eq!(hidden, quarantined, "mode {mode:?}");
+        assert_eq!(m.count().unwrap(), counted, "mode {mode:?}");
     }
+}
+
+const LESSON: &str =
+    "set explicit timeout values on every outbound http request call made by service workers";
+// One word swapped: 13 of 14 tokens shared, cosine ~0.93 under `BagEmbedder`.
+const RESTATEMENT: &str =
+    "set explicit timeout values on every outbound http request call made by service threads";
+
+fn gated() -> Memoire {
+    engine(ScoringConfig {
+        admission: AdmissionMode::QualityGate,
+        ..ScoringConfig::default()
+    })
+}
+
+#[test]
+fn independent_restatement_promotes_the_shadow_row_instead_of_duplicating() {
+    let m = gated();
+    let first = m.remember(LESSON).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(only_state(&m).0, "shadow");
+    assert!(m.recall(LESSON, 3).unwrap().is_empty());
+
+    let second = m.remember(RESTATEMENT).unwrap();
+    assert_eq!(
+        second, first,
+        "the promoted row's id is returned, nothing new inserted"
+    );
+    assert_eq!(m.count().unwrap(), 1, "no duplicate row");
+    let row = &m.export_all().unwrap()[0];
+    assert_eq!(row.state, "trial");
+    assert_eq!(
+        row.reinforcement_count, 0,
+        "corroboration is not success evidence"
+    );
+    assert_eq!(row.content, LESSON, "the original text is kept");
+    let recalled = m.recall(LESSON, 3).unwrap();
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].exposure, "trial");
+}
+
+#[test]
+fn exact_replay_does_not_corroborate() {
+    let m = gated();
+    m.remember(LESSON).unwrap();
+    assert!(
+        m.remember(LESSON).unwrap().is_empty(),
+        "exact duplicates are dropped"
+    );
+    assert_eq!(only_state(&m).0, "shadow", "a replay is not independent");
+}
+
+#[test]
+fn contradicting_restatement_does_not_promote_the_shadow_row() {
+    let m = gated();
+    m.remember("never open sockets without a timeout configured")
+        .unwrap();
+    let second = m
+        .remember("always open sockets without a timeout configured")
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    let rows = m.export_all().unwrap();
+    assert_eq!(rows.len(), 2, "the refuting text is inserted, not merged");
+    assert!(
+        rows.iter().all(|r| r.state != "trial"),
+        "no row may be promoted by a refutation: {:?}",
+        rows.iter().map(|r| r.state.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(rows.iter().filter(|r| r.state == "quarantined").count(), 1);
+}
+
+#[test]
+fn admit_all_has_no_shadow_rows_to_corroborate() {
+    let m = engine(ScoringConfig::default());
+    m.remember(LESSON).unwrap();
+    m.remember(RESTATEMENT).unwrap();
+    assert_eq!(m.count().unwrap(), 2, "restatements are ordinary inserts");
 }
 
 #[test]

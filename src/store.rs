@@ -11,7 +11,7 @@ use crate::quality::{
     compute_gravity_radius, cosine_similarity, decayed_trust, derive_live_state, detect_polarity,
     effective_weight, is_live_state, meets_follow, now_ts, posterior_trust, recency_bonus,
     should_supersede, token_containment, trust_uncertainty, ContradictionMode, NliChecker,
-    NliLabel, OnnxNliChecker, Polarity, QualityMeta, ScoringConfig,
+    NliLabel, NliSource, OnnxNliChecker, Polarity, QualityMeta, ScoringConfig,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,6 +198,10 @@ impl StoreInner {
 /// Largest `reinforcement_count` accepted from an imported snapshot. A sanity
 /// bound against absurd values, not a claim about how much trust is deserved.
 pub const IMPORT_MAX_REINFORCEMENT: i64 = 1_000;
+
+/// Cosine at or above which two chunks count as restatements of one another when
+/// corroborating a hidden `shadow` row (see `Store::corroborate_shadow`).
+pub const NEAR_DUPLICATE_COSINE: f32 = 0.92;
 
 /// Cosine similarity between agent output and memory above which text attribution is
 /// considered satisfied without lexical overlap.
@@ -1309,6 +1313,120 @@ impl Store {
             .collect())
     }
 
+    /// Corroborate a hidden `shadow` row: if `content` / `embedding` independently
+    /// restate one (cosine >= [`NEAR_DUPLICATE_COSINE`], not a contradiction under the
+    /// configured `contradiction_mode`), promote that row to the live set and return its
+    /// id. The caller then skips inserting a duplicate. Nothing is counted as success
+    /// evidence: a restatement is not proof the lesson helps, so `reinforcement_count`
+    /// is untouched and the row starts as an unverified `trial`.
+    ///
+    /// Ids in `exclude` (rows inserted earlier in the same ingest call) are never
+    /// promoted, so one call cannot corroborate itself. Exact duplicates are filtered
+    /// out earlier by the fingerprint check and never reach this method. Only rows in
+    /// state `shadow` qualify, never `quarantined` or `probationary` ones.
+    pub fn corroborate_shadow(
+        &self,
+        content: &str,
+        embedding: &[f32],
+        exclude: &[i64],
+    ) -> Result<Option<i64>> {
+        let chosen = {
+            let conn = self.pool.get()?;
+            if !self.prepare_search_cache(&conn)? {
+                return Ok(None);
+            }
+            let mut near: Vec<(i64, f32, Vec<f32>)> = {
+                let inner = self.read_lock()?;
+                inner
+                    .embedding_cache
+                    .iter()
+                    .filter(|(id, _)| inner.hidden.contains(id) && !exclude.contains(id))
+                    .filter_map(|(id, emb)| {
+                        let sim = cosine_similarity(embedding, emb);
+                        if sim >= NEAR_DUPLICATE_COSINE {
+                            Some((*id, sim, emb.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            near.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut chosen = None;
+            for (id, _sim, existing_emb) in near {
+                let row = conn
+                    .query_row(
+                        "SELECT content, store_state, claim_value FROM memories
+                         WHERE id = ?1 AND namespace = ?2 AND archived = 0
+                           AND superseded_by IS NULL",
+                        params![id, self.namespace],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((existing_content, state, existing_polarity)) = row else {
+                    continue;
+                };
+                if state != "shadow" {
+                    continue;
+                }
+                if self.contradicts(
+                    &existing_content,
+                    existing_polarity.as_deref(),
+                    &existing_emb,
+                    content,
+                    embedding,
+                ) {
+                    continue;
+                }
+                chosen = Some(id);
+                break;
+            }
+            chosen
+        };
+
+        match chosen {
+            Some(id) if self.promote_shadow(id)? => Ok(Some(id)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether `incoming` contradicts `existing` under the configured mode (used to keep
+    /// corroboration from promoting a row that the incoming text actually refutes).
+    fn contradicts(
+        &self,
+        existing: &str,
+        existing_polarity: Option<&str>,
+        existing_emb: &[f32],
+        incoming: &str,
+        incoming_emb: &[f32],
+    ) -> bool {
+        match self.config.contradiction_mode {
+            ContradictionMode::Off => false,
+            ContradictionMode::Nli => {
+                self.nli_checker.check(
+                    existing,
+                    incoming,
+                    existing_emb,
+                    incoming_emb,
+                    self.config.nli_cosine_threshold,
+                ) == NliLabel::Contradiction
+            }
+            ContradictionMode::Legacy => {
+                let existing_pol = existing_polarity
+                    .map(Polarity::from_stored)
+                    .unwrap_or_else(|| detect_polarity(existing));
+                existing_pol.opposes(&detect_polarity(incoming))
+            }
+        }
+    }
+
     /// Plain vector similarity: exact cosine over every stored (non-archived,
     /// non-superseded) memory of this namespace, ranked by cosine alone. No trust, no
     /// state filter, no trial cap and no `last_used_at` write, so repeated calls leave
@@ -1372,6 +1490,12 @@ impl Store {
     ///   3. Negation asymmetry score (how many negators appear in one but not the other)
     ///
     /// `Legacy` is the original cosine + polarity gate, kept for backward compatibility.
+    ///
+    /// The loser of a contradiction is hidden in one of two ways. A verdict backed by an
+    /// installed NLI model archives it (`archived = 1`, deleted by maintenance after a
+    /// week). A verdict from the lexical fallback is only a heuristic, so the loser is
+    /// `quarantined` instead: hidden from default recall but recoverable with
+    /// `unquarantine`. The `Legacy` polarity gate keeps its historical archiving.
     pub fn resolve_contradictions_for_id(&self, id: i64) -> Result<()> {
         if self.config.contradiction_mode == ContradictionMode::Off {
             return Ok(());
@@ -1420,7 +1544,7 @@ impl Store {
             })?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, content, embedding, importance_base, confidence, evidence, created_at, claim_value
+            "SELECT id, content, embedding, claim_value
              FROM memories
              WHERE id != ?1
                AND namespace = ?2
@@ -1434,29 +1558,17 @@ impl Store {
         let nli_threshold = self.config.nli_cosine_threshold;
         let nli = self.nli_checker.clone();
 
-        let mut contradictions: Vec<(i64, f32, f32, f32, i64)> = Vec::new();
+        // (other id, whether the verdict is only a lexical heuristic)
+        let mut contradictions: Vec<(i64, bool)> = Vec::new();
         for row in stmt.query_map(params![id, ns], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Vec<u8>>(2)?,
-                r.get::<_, f32>(3)?,
-                r.get::<_, f32>(4)?,
-                r.get::<_, f32>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         })? {
-            let (
-                other_id,
-                other_content,
-                other_blob,
-                o_imp,
-                o_conf,
-                o_ev,
-                o_created,
-                other_polarity_opt,
-            ) = match row {
+            let (other_id, other_content, other_blob, other_polarity_opt) = match row {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -1466,18 +1578,22 @@ impl Store {
                 None => continue,
             };
 
-            let is_contradiction = if use_nli {
-                // NLI path: three-signal ensemble.
-                let label = nli.check(
+            let (is_contradiction, heuristic_only) = if use_nli {
+                // NLI path: an installed model is authoritative; otherwise the lexical
+                // ensemble decides and its verdict is marked heuristic.
+                let (label, source) = nli.check_with_source(
                     &new_content,
                     &other_content,
                     &new_emb,
                     &other_emb,
                     nli_threshold,
                 );
-                label == NliLabel::Contradiction
+                (
+                    label == NliLabel::Contradiction,
+                    source == NliSource::Lexical,
+                )
             } else {
-                // Legacy path: cosine + polarity only.
+                // Legacy path: cosine + polarity only (historical archiving).
                 let sim = cosine_similarity(&new_emb, &other_emb);
                 if sim < 0.80 {
                     continue;
@@ -1488,19 +1604,12 @@ impl Store {
                     .unwrap_or_else(|| detect_polarity(&other_content).as_str().to_string());
                 let new_pol = Polarity::from_stored(&new_polarity_str);
                 let other_pol = Polarity::from_stored(&other_polarity_str);
-                new_pol.opposes(&other_pol)
+                (new_pol.opposes(&other_pol), false)
             };
 
-            if !is_contradiction {
-                // For the NLI path we need to check the polarity explicitly for legacy compat.
-                if !use_nli {
-                    continue;
-                }
-                // NLI returned Neutral or Entailment â€” skip.
-                continue;
+            if is_contradiction {
+                contradictions.push((other_id, heuristic_only));
             }
-
-            contradictions.push((other_id, o_imp, o_conf, o_ev, o_created));
         }
 
         if contradictions.is_empty() {
@@ -1509,7 +1618,7 @@ impl Store {
 
         drop(stmt);
 
-        for (other_id, _o_imp, _o_conf, _o_ev, _o_created) in contradictions {
+        for (other_id, heuristic_only) in contradictions {
             let existing = conn
                 .query_row(
                     "SELECT reinforcement_count, failure_count, created_at FROM memories
@@ -1540,6 +1649,22 @@ impl Store {
                 (other_id, id)
             };
 
+            if heuristic_only {
+                // Lexical verdicts are guesses: hide the loser but keep it recoverable.
+                conn.execute(
+                    "UPDATE memories SET store_state = 'quarantined'
+                     WHERE id = ?1 AND namespace = ?2",
+                    params![loser_id, ns],
+                )?;
+                if inner.embedding_cache_loaded {
+                    inner.set_hidden(loser_id, true);
+                }
+                log::debug!(
+                    "contradiction (lexical): winner={winner_id} loser={loser_id} quarantined"
+                );
+                continue;
+            }
+
             let group = winner_id.to_string();
             conn.execute(
                 "UPDATE memories SET superseded_by = ?1, archived = 1, contradiction_group = ?2
@@ -1549,7 +1674,7 @@ impl Store {
             // Do NOT set contradiction_group on the winner. The loser already points to the
             // winner via superseded_by. Setting contradiction_group on the winner would put
             // it into the weak-group deduplication filter in search(), which suppresses
-            // memories whose best-survivor trust < 0.40 â€” incorrectly hiding the winner.
+            // memories whose best-survivor trust < 0.40, incorrectly hiding the winner.
             inner.remove_from_cache(loser_id);
             log::debug!(
                 "contradiction resolved ({}): winner={winner_id} loser={loser_id} group={group}",
@@ -2060,6 +2185,26 @@ mod tests {
         .unwrap()
     }
 
+    fn count_in_state(store: &Store, state: &str) -> i64 {
+        let conn = store.pool.get().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE store_state = ?1",
+            params![state],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn archived_count(store: &Store) -> i64 {
+        let conn = store.pool.get().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE archived = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     fn live_meta(content: &str, reinforcement_count: i64) -> QualityMeta {
         let mut meta = QualityMeta::default_active(content);
         meta.reinforcement_count = reinforcement_count;
@@ -2289,11 +2434,16 @@ mod tests {
             .unwrap();
 
         b.resolve_contradictions_for_id(id2).unwrap();
-        assert_eq!(a.count().unwrap(), 2, "tenant_b must not archive a's rows");
+        assert_eq!(
+            count_in_state(&a, "quarantined"),
+            0,
+            "tenant_b must not quarantine a's rows"
+        );
 
-        // Control: the owning namespace does resolve the pair.
+        // Control: the owning namespace does resolve the pair (lexical verdict ->
+        // the loser is quarantined, not archived).
         a.resolve_contradictions_for_id(id2).unwrap();
-        assert_eq!(a.count().unwrap(), 1);
+        assert_eq!(count_in_state(&a, "quarantined"), 1);
     }
 
     #[test]
@@ -2349,18 +2499,84 @@ mod tests {
             unreachable!()
         };
 
-        // Control: lexical heuristic only -> the pair is a contradiction, one side archived.
+        // Control: lexical heuristic only -> the pair is a contradiction, and since the
+        // verdict is a heuristic one side is quarantined (not archived).
         let lexical = Store::in_memory().unwrap();
         let id = seed(&lexical);
         lexical.resolve_contradictions_for_id(id).unwrap();
-        assert_eq!(lexical.count().unwrap(), 1);
+        assert_eq!(count_in_state(&lexical, "quarantined"), 1);
+        assert_eq!(archived_count(&lexical), 0);
 
-        // Authoritative model says Neutral -> nothing is superseded.
+        // Authoritative model says Neutral -> nothing is superseded or hidden.
         let mut modelled = Store::in_memory().unwrap();
         modelled.nli_checker = NliChecker::with_classifier(Arc::new(AlwaysNeutral));
         let id = seed(&modelled);
         modelled.resolve_contradictions_for_id(id).unwrap();
         assert_eq!(modelled.count().unwrap(), 2);
+        assert_eq!(count_in_state(&modelled, "quarantined"), 0);
+    }
+
+    #[test]
+    fn authoritative_contradiction_still_archives_the_loser() {
+        use crate::quality::{NliChecker, NliClassifier};
+        use std::sync::Arc;
+
+        struct AlwaysContradiction;
+        impl NliClassifier for AlwaysContradiction {
+            fn classify(&self, _p: &str, _h: &str) -> anyhow::Result<NliLabel> {
+                Ok(NliLabel::Contradiction)
+            }
+        }
+
+        let emb = [0.577_f32, 0.577, 0.577];
+        let mut store = Store::in_memory().unwrap();
+        store.nli_checker = NliChecker::with_classifier(Arc::new(AlwaysContradiction));
+        let mut ids = Vec::new();
+        for text in ["never use float for money", "always use float for money"] {
+            let mut meta = QualityMeta::default_active(text);
+            meta.claim_value = Some(detect_polarity(text).as_str().to_string());
+            ids.push(store.insert_with_quality(text, &emb, &meta).unwrap());
+        }
+        store.resolve_contradictions_for_id(ids[1]).unwrap();
+        // A model-backed verdict is trusted: archived, not merely quarantined.
+        assert_eq!(store.count().unwrap(), 1);
+        assert_eq!(archived_count(&store), 1);
+        assert_eq!(count_in_state(&store, "quarantined"), 0);
+    }
+
+    #[test]
+    fn lexical_contradiction_quarantines_the_tls_pair_and_unquarantine_restores_it() {
+        let store = Store::in_memory().unwrap();
+        let emb = [0.577_f32, 0.577, 0.577];
+        let mut ids = Vec::new();
+        for text in [
+            "TLS verification disabled in staging",
+            "always enable TLS verification",
+        ] {
+            let mut meta = QualityMeta::default_active(text);
+            meta.claim_value = Some(detect_polarity(text).as_str().to_string());
+            ids.push(store.insert_with_quality(text, &emb, &meta).unwrap());
+        }
+        store.resolve_contradictions_for_id(ids[1]).unwrap();
+
+        assert_eq!(count_in_state(&store, "quarantined"), 1);
+        assert_eq!(archived_count(&store), 0);
+        assert_eq!(store.count().unwrap(), 2, "nothing was deleted");
+        let loser = ids
+            .iter()
+            .copied()
+            .find(|id| state_of(&store, *id) == "quarantined")
+            .expect("one side is quarantined");
+        let survivors = uncapped_search(&store);
+        assert_eq!(survivors.len(), 1);
+        assert_ne!(survivors[0].id, loser);
+
+        assert!(store.unquarantine(loser).unwrap());
+        assert_eq!(state_of(&store, loser), "trial");
+    }
+
+    fn uncapped_search(store: &Store) -> Vec<Memory> {
+        store.search(&[0.577, 0.577, 0.577], 8, false).unwrap()
     }
 
     #[test]
@@ -2415,11 +2631,14 @@ mod tests {
 
         store.resolve_contradictions_for_id(id2).unwrap();
 
+        // No NLI model: the lexical verdict quarantines the loser instead of archiving it.
         assert_eq!(
-            store.count().unwrap(),
+            count_in_state(&store, "quarantined"),
             1,
-            "contradiction resolution must archive the loser"
+            "contradiction resolution must quarantine the loser"
         );
+        assert_eq!(archived_count(&store), 0);
+        assert_eq!(store.count().unwrap(), 2);
     }
 
     #[test]
@@ -3014,12 +3233,13 @@ mod tests {
     }
 
     #[test]
-    fn contradiction_mode_off_never_supersedes() {
+    fn contradiction_mode_decides_how_a_contradiction_is_resolved() {
         let emb = [0.577_f32, 0.577, 0.577];
-        for (mode, expected) in [
-            (ContradictionMode::Off, 2),
-            (ContradictionMode::Legacy, 1),
-            (ContradictionMode::Nli, 1),
+        // (mode, quarantined, archived)
+        for (mode, quarantined, archived) in [
+            (ContradictionMode::Off, 0, 0),
+            (ContradictionMode::Nli, 1, 0),
+            (ContradictionMode::Legacy, 0, 1),
         ] {
             let store = Store::in_memory_with_config(ScoringConfig {
                 contradiction_mode: mode,
@@ -3037,7 +3257,12 @@ mod tests {
                 .insert_with_quality("always use floats", &emb, &m2)
                 .unwrap();
             store.resolve_contradictions_for_id(id2).unwrap();
-            assert_eq!(store.count().unwrap(), expected, "mode {mode:?}");
+            assert_eq!(
+                count_in_state(&store, "quarantined"),
+                quarantined,
+                "{mode:?}"
+            );
+            assert_eq!(archived_count(&store), archived, "{mode:?}");
         }
     }
 
@@ -3104,5 +3329,150 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 3);
+    }
+
+    // ---- Step 8b-2: shadow corroboration ----
+
+    fn shadow_meta(text: &str) -> QualityMeta {
+        let mut meta = QualityMeta::default_active(text);
+        meta.store_state = "shadow".to_string();
+        meta.claim_value = Some(detect_polarity(text).as_str().to_string());
+        meta
+    }
+
+    #[test]
+    fn corroboration_promotes_a_shadow_row_without_counting_evidence() {
+        let store = Store::in_memory().unwrap();
+        let id = store
+            .insert_with_quality(
+                "set a timeout on every outbound request",
+                &[1.0, 0.0, 0.0],
+                &shadow_meta("set a timeout on every outbound request"),
+            )
+            .unwrap();
+        assert!(store.search(&[1.0, 0.0, 0.0], 3, false).unwrap().is_empty());
+
+        let promoted = store
+            .corroborate_shadow(
+                "outbound requests should always get a timeout",
+                &[0.99, 0.141, 0.0],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(promoted, Some(id));
+        assert_eq!(state_of(&store, id), "trial");
+        assert_eq!(raw_feedback_row(&store, id).reinforcement_count, 0);
+        assert_eq!(raw_feedback_row(&store, id).failure_count, 0);
+        assert_eq!(store.count().unwrap(), 1, "no duplicate row");
+        assert_eq!(store.search(&[1.0, 0.0, 0.0], 3, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn corroboration_requires_similarity_independence_and_a_shadow_row() {
+        let store = Store::in_memory().unwrap();
+        let shadow = store
+            .insert_with_quality(
+                "shadow lesson",
+                &[1.0, 0.0, 0.0],
+                &shadow_meta("shadow lesson"),
+            )
+            .unwrap();
+        let mut quarantined_meta = shadow_meta("quarantined lesson");
+        quarantined_meta.store_state = "quarantined".to_string();
+        let quarantined = store
+            .insert_with_quality("quarantined lesson", &[0.0, 1.0, 0.0], &quarantined_meta)
+            .unwrap();
+        let live = store.insert("live lesson", &[0.0, 0.0, 1.0]).unwrap();
+
+        // Below the 0.92 cosine bar.
+        assert_eq!(
+            store
+                .corroborate_shadow("x", &[0.9, 0.436, 0.0], &[])
+                .unwrap(),
+            None
+        );
+        // Rows inserted earlier in the same ingest call never corroborate themselves.
+        assert_eq!(
+            store
+                .corroborate_shadow("x", &[1.0, 0.0, 0.0], &[shadow])
+                .unwrap(),
+            None
+        );
+        assert_eq!(state_of(&store, shadow), "shadow");
+        // Quarantined and already-live rows are not promoted.
+        assert_eq!(
+            store
+                .corroborate_shadow("x", &[0.0, 1.0, 0.0], &[])
+                .unwrap(),
+            None
+        );
+        assert_eq!(state_of(&store, quarantined), "quarantined");
+        assert_eq!(
+            store
+                .corroborate_shadow("x", &[0.0, 0.0, 1.0], &[])
+                .unwrap(),
+            None
+        );
+        assert_eq!(state_of(&store, live), "trial");
+        // Control: with a qualifying near-duplicate and no exclusion, it promotes.
+        assert_eq!(
+            store
+                .corroborate_shadow("x", &[1.0, 0.0, 0.0], &[])
+                .unwrap(),
+            Some(shadow)
+        );
+    }
+
+    #[test]
+    fn a_closer_quarantined_duplicate_does_not_block_corroborating_a_shadow_row() {
+        let store = Store::in_memory().unwrap();
+        let mut quarantined_meta = shadow_meta("quarantined twin");
+        quarantined_meta.store_state = "quarantined".to_string();
+        let quarantined = store
+            .insert_with_quality("quarantined twin", &[1.0, 0.0, 0.0], &quarantined_meta)
+            .unwrap();
+        // Cosine 0.95 with the query: below the quarantined twin (1.0) but above the bar.
+        let shadow = store
+            .insert_with_quality(
+                "shadow twin",
+                &[0.95, 0.312, 0.0],
+                &shadow_meta("shadow twin"),
+            )
+            .unwrap();
+
+        let promoted = store
+            .corroborate_shadow("a restatement", &[1.0, 0.0, 0.0], &[])
+            .unwrap();
+        assert_eq!(promoted, Some(shadow));
+        assert_eq!(state_of(&store, shadow), "trial");
+        assert_eq!(state_of(&store, quarantined), "quarantined");
+    }
+
+    #[test]
+    fn corroboration_never_promotes_a_row_the_incoming_text_contradicts() {
+        let emb = [0.577_f32, 0.577, 0.577];
+        for (mode, expected_promoted) in [
+            (ContradictionMode::Nli, false),
+            (ContradictionMode::Legacy, false),
+            (ContradictionMode::Off, true),
+        ] {
+            let store = Store::in_memory_with_config(ScoringConfig {
+                contradiction_mode: mode,
+                ..ScoringConfig::default()
+            })
+            .unwrap();
+            let id = store
+                .insert_with_quality("never use floats", &emb, &shadow_meta("never use floats"))
+                .unwrap();
+            let promoted = store
+                .corroborate_shadow("always use floats", &emb, &[])
+                .unwrap();
+            assert_eq!(promoted.is_some(), expected_promoted, "{mode:?}");
+            assert_eq!(
+                state_of(&store, id),
+                if expected_promoted { "trial" } else { "shadow" },
+                "{mode:?}"
+            );
+        }
     }
 }

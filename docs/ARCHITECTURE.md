@@ -78,7 +78,7 @@ Vec<Vec<f32>>  (one 384-dim vector per chunk)
     ▼
 Store::insert_with_quality(chunk_text, embedding, scoring_config)
     │   Serialises f32 slice to LE bytes (BLOB column)
-    │   Computes quality score (actionability, novelty, evidence, …)
+    |   Computes quality features (actionability, consequence, reusability scored; novelty, evidence recorded only)
     |   Trust starts at the neutral prior 0.5 (not derived from the quality score)
     │   Sets last_used_at = now()
     │   Writes to memories table in WAL-mode SQLite (CHECK constraints enforced)
@@ -449,19 +449,19 @@ The MCP server instance cache key is `(db_path, namespace)` — different namesp
 
 ## NLI Contradiction Detection (P3.3)
 
-`resolve_contradictions_for_id` (`src/store.rs`) is called after every `remember()` for each new chunk. When `ScoringConfig::contradiction_mode` is `Nli` (default), candidates are compared with `NliChecker` (`src/quality.rs`) against existing `active`/`shadow`, non-archived rows in the same namespace.
+`resolve_contradictions_for_id` (`src/store.rs`) is called after every `remember()` for each new chunk. When `ScoringConfig::contradiction_mode` is `Nli` (default), candidates are compared with `NliChecker` (`src/quality.rs`) against existing `trial`/`active`/`shadow`, non-archived rows in the same namespace.
 
 ### Step 1 — Cosine gate
 Pairs with cosine similarity below `nli_cosine_threshold` (default 0.80) are treated as different topics and skipped.
 
 ### Step 2 — Classification
 - **ONNX NLI model supplied** (`Memoire::with_nli_model(path)` → `OnnxNliChecker`, labels read from the model's `config.json` `id2label`): its label is **authoritative**.
-- **No ONNX model, or ONNX inference returned an error**: lexical fallback (`NliChecker::lexical_label`). `detect_polarity()` classifies each text as `Affirmative`, `Negative` or `Neutral` with a small keyword lexicon; only `Affirmative↔Negative` pairs can be labelled `Contradiction`. `negation_asymmetry(a, b)` is computed as a secondary signal, but both of its branches (score ≥ 1 and the conservative fallback) currently return `Contradiction`, so it does not change the outcome.
+- **No ONNX model, or ONNX inference returned an error**: lexical fallback (`NliChecker::lexical_label`). `detect_polarity()` classifies each text as `Affirmative`, `Negative` or `Neutral` with a small keyword lexicon; only `Affirmative`/`Negative` pairs can be labelled `Contradiction`, and only when `negation_asymmetry(a, b)` is at least 1, i.e. some negation term appears in exactly one of the texts. Opposing polarity without that asymmetry is `Neutral`. Polarity and asymmetry share one negation lexicon (`NEGATIVE_TERMS`, plus `not` / `no` for asymmetry only). Matching is on whitespace-delimited tokens, so a term followed by punctuation is not matched.
 
 Known gap: `resolve_contradictions_for_id` returns early when the **new** memory's polarity is `Neutral`, so an ONNX model never sees such pairs. There is no automated test that runs a real MNLI model.
 
 ### Resolution
-`quality::should_supersede(incoming_importance, existing_gravity)`: the incoming memory wins only if `importance_base > 0.50 + 0.40 × gravity`, where gravity comes from `compute_gravity_radius` (posterior trust of the existing memory, `reinforcement_count`, age). The loser is archived (`archived = 1`, `superseded_by` set to the winner's id), removed from the in-memory embedding cache and logged; its row is kept, not deleted. If the incoming memory loses, it is the one archived.
+`quality::should_supersede(incoming_importance, existing_gravity)`: the incoming memory wins only if `importance_base > 0.50 + 0.40 x gravity`, where gravity comes from `compute_gravity_radius` (posterior trust of the existing memory, `reinforcement_count`, age). The loser is hidden in one of two ways, chosen by `NliChecker::check_with_source`: a verdict from an installed ONNX model (`NliSource::Onnx`) **archives** it (`archived = 1`, `superseded_by` set to the winner's id, removed from the in-memory embedding cache; maintenance deletes archived rows after seven days); a verdict from the lexical fallback (`NliSource::Lexical`) only **quarantines** it (`store_state = 'quarantined'`, cache entry marked hidden, still stored, recoverable with `unquarantine`). The `Legacy` polarity gate keeps its historical archiving.
 
 `ScoringConfig::contradiction_mode` selects `Nli` (default), `Legacy` (cosine + stored polarity only) or `Off` (this step is skipped entirely).
 
@@ -521,7 +521,7 @@ Memoire includes an asynchronous background maintenance scheduler that cleans up
 ## Prototype Recomputation (Component 7)
 
 - **Purpose**: Over time, as embedding models evolve or are fine-tuned, the original scoring prototype centroids can drift.
-- **Action**: `recompute_prototypes()` re-embeds the 15 fixed prototype sentences (covering consequence, actionability, and reusability dimensions) using the current embedder. This updates the centroids stored in `self.prototypes` in-place, keeping quality scoring aligned with the latest embedding space.
+- **Action**: `recompute_prototypes()` re-embeds the 15 fixed prototype sentences (covering consequence, actionability, and reusability dimensions) using the current embedder. This updates the centroids stored in `self.prototypes` in-place, keeping quality scoring aligned with the latest embedding space. The exemplar list deliberately avoids benchmark-task rules (the former "Always use Decimal ..." exemplar was replaced); some exemplars still touch payments, hashing, parameterized queries and input validation, so any evaluation task in those domains should report its cosine to the exemplars.
 
 ---
 
