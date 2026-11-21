@@ -1137,6 +1137,19 @@ impl Store {
         top_k: usize,
         include_hidden: bool,
     ) -> Result<Vec<Memory>> {
+        self.search_filtered(query_vec, top_k, include_hidden, None)
+    }
+
+    /// [`Store::search`] with an optional `created_at >= min_created_at` filter applied
+    /// *before* the trial cap and before `last_used_at` is written, so rows the filter
+    /// removes neither occupy a trial slot nor have their usage timestamp bumped.
+    fn search_filtered(
+        &self,
+        query_vec: &[f32],
+        top_k: usize,
+        include_hidden: bool,
+        min_created_at: Option<i64>,
+    ) -> Result<Vec<Memory>> {
         if top_k == 0 {
             return Ok(vec![]);
         }
@@ -1205,6 +1218,10 @@ impl Store {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+
+            if min_created_at.is_some_and(|min| created_at < min) {
+                continue;
+            }
 
             let age_days = ((now - created_at).max(0) as f32) / 86_400.0;
             let weight = effective_weight(importance_base, age_days, reinforcement_count);
@@ -1305,12 +1322,12 @@ impl Store {
         max_age_days: f32,
     ) -> Result<Vec<Memory>> {
         let cutoff_ts = now_ts() - (max_age_days * 86_400.0) as i64;
-        let pool = self.search(query_vec, (top_k * 4).max(20), false)?;
-        Ok(pool
-            .into_iter()
-            .filter(|m| m.created_at >= cutoff_ts)
-            .take(top_k)
-            .collect())
+        // Candidates are the nearest rows overall, so over-fetch to leave room after the
+        // age filter; the filter itself runs inside the search, ahead of the trial cap.
+        let pool_k = (top_k * 4).max(20);
+        let mut pool = self.search_filtered(query_vec, pool_k, false, Some(cutoff_ts))?;
+        pool.truncate(top_k);
+        Ok(pool)
     }
 
     /// Corroborate a hidden `shadow` row: if `content` / `embedding` independently
@@ -1491,11 +1508,14 @@ impl Store {
     ///
     /// `Legacy` is the original cosine + polarity gate, kept for backward compatibility.
     ///
-    /// The loser of a contradiction is hidden in one of two ways. A verdict backed by an
-    /// installed NLI model archives it (`archived = 1`, deleted by maintenance after a
-    /// week). A verdict from the lexical fallback is only a heuristic, so the loser is
-    /// `quarantined` instead: hidden from default recall but recoverable with
-    /// `unquarantine`. The `Legacy` polarity gate keeps its historical archiving.
+    /// The loser of a contradiction is hidden in one of two ways. Only a verdict backed by
+    /// an installed NLI model archives it (`archived = 1`, deleted by maintenance after a
+    /// week). Every heuristic verdict (the lexical fallback and the `Legacy` polarity
+    /// gate) `quarantines` the loser instead: hidden from default recall but recoverable
+    /// with `unquarantine`, so no heuristic path destroys a memory.
+    ///
+    /// The winner is decided by feedback evidence (`should_supersede`): the side with
+    /// more demonstrated value wins and a tie goes to the newer memory.
     pub fn resolve_contradictions_for_id(&self, id: i64) -> Result<()> {
         if self.config.contradiction_mode == ContradictionMode::Off {
             return Ok(());
@@ -1505,23 +1525,23 @@ impl Store {
         let ns = self.namespace.clone();
 
         let target_row = conn.query_row(
-            "SELECT content, embedding, importance_base, confidence, evidence, created_at, claim_value
+            "SELECT content, embedding, created_at, claim_value,
+                    reinforcement_count, failure_count
              FROM memories WHERE id = ?1 AND namespace = ?2 AND archived = 0",
             params![id, ns],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Vec<u8>>(1)?,
-                    r.get::<_, f32>(2)?,
-                    r.get::<_, f32>(3)?,
-                    r.get::<_, f32>(4)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
                     r.get::<_, i64>(5)?,
-                    r.get::<_, Option<String>>(6)?,
                 ))
             },
         );
 
-        let (new_content, new_blob, imp, _conf, _ev, _created_at, stored_polarity) =
+        let (new_content, new_blob, new_created_at, stored_polarity, new_rc, new_fc) =
             match target_row {
                 Ok(v) => v,
                 Err(_) => return Ok(()),
@@ -1593,7 +1613,8 @@ impl Store {
                     source == NliSource::Lexical,
                 )
             } else {
-                // Legacy path: cosine + polarity only (historical archiving).
+                // Legacy path: cosine + polarity only. A polarity flip is a guess, so
+                // the loser is quarantined (recoverable), never archived.
                 let sim = cosine_similarity(&new_emb, &other_emb);
                 if sim < 0.80 {
                     continue;
@@ -1604,7 +1625,7 @@ impl Store {
                     .unwrap_or_else(|| detect_polarity(&other_content).as_str().to_string());
                 let new_pol = Polarity::from_stored(&new_polarity_str);
                 let other_pol = Polarity::from_stored(&other_polarity_str);
-                (new_pol.opposes(&other_pol), false)
+                (new_pol.opposes(&other_pol), true)
             };
 
             if is_contradiction {
@@ -1642,7 +1663,17 @@ impl Store {
                     )
                 })
                 .unwrap_or(0.0);
-            let should_replace = should_supersede(imp as f64, existing_gravity);
+            let existing_created = existing.map(|(_, _, created)| created).unwrap_or(0);
+            let incoming_gravity = compute_gravity_radius(
+                posterior_trust(new_rc, new_fc) as f64,
+                new_rc,
+                ((now - new_created_at).max(0) as f64) / 86_400.0,
+            );
+            let should_replace = should_supersede(
+                incoming_gravity,
+                existing_gravity,
+                new_created_at >= existing_created,
+            );
             let (winner_id, loser_id) = if should_replace {
                 (id, other_id)
             } else {
@@ -3235,11 +3266,11 @@ mod tests {
     #[test]
     fn contradiction_mode_decides_how_a_contradiction_is_resolved() {
         let emb = [0.577_f32, 0.577, 0.577];
-        // (mode, quarantined, archived)
+        // (mode, quarantined, archived): no heuristic mode archives.
         for (mode, quarantined, archived) in [
             (ContradictionMode::Off, 0, 0),
             (ContradictionMode::Nli, 1, 0),
-            (ContradictionMode::Legacy, 0, 1),
+            (ContradictionMode::Legacy, 1, 0),
         ] {
             let store = Store::in_memory_with_config(ScoringConfig {
                 contradiction_mode: mode,
@@ -3264,6 +3295,108 @@ mod tests {
             );
             assert_eq!(archived_count(&store), archived, "{mode:?}");
         }
+    }
+
+    fn insert_tls_pair(store: &Store) -> Vec<i64> {
+        let emb = [0.577_f32, 0.577, 0.577];
+        let mut ids = Vec::new();
+        for text in [
+            "TLS verification disabled in staging",
+            "always enable TLS verification",
+        ] {
+            let mut meta = QualityMeta::default_active(text);
+            meta.claim_value = Some(detect_polarity(text).as_str().to_string());
+            ids.push(store.insert_with_quality(text, &emb, &meta).unwrap());
+        }
+        ids
+    }
+
+    #[test]
+    fn newer_unverified_statement_displaces_an_older_unverified_one() {
+        let store = Store::in_memory().unwrap();
+        let ids = insert_tls_pair(&store);
+        store.resolve_contradictions_for_id(ids[1]).unwrap();
+        assert_eq!(state_of(&store, ids[0]), "quarantined", "older loses");
+        assert_ne!(state_of(&store, ids[1]), "quarantined", "newer wins");
+    }
+
+    #[test]
+    fn incumbent_with_feedback_evidence_beats_an_unverified_newcomer() {
+        let store = Store::in_memory().unwrap();
+        let ids = insert_tls_pair(&store);
+        store
+            .pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET reinforcement_count = 4, created_at = created_at - 3000000
+                 WHERE id = ?1",
+                params![ids[0]],
+            )
+            .unwrap();
+        store.resolve_contradictions_for_id(ids[1]).unwrap();
+        assert_eq!(
+            state_of(&store, ids[1]),
+            "quarantined",
+            "unverified newcomer loses"
+        );
+        assert_ne!(state_of(&store, ids[0]), "quarantined");
+        assert!(store.unquarantine(ids[1]).unwrap(), "and is recoverable");
+    }
+
+    #[test]
+    fn legacy_contradiction_quarantines_and_is_recoverable() {
+        let store = Store::in_memory_with_config(ScoringConfig {
+            contradiction_mode: ContradictionMode::Legacy,
+            ..ScoringConfig::default()
+        })
+        .unwrap();
+        let ids = insert_tls_pair(&store);
+        store.resolve_contradictions_for_id(ids[1]).unwrap();
+        assert_eq!(archived_count(&store), 0);
+        assert_eq!(store.count().unwrap(), 2);
+        assert!(store.unquarantine(ids[0]).unwrap());
+    }
+
+    #[test]
+    fn search_within_days_filters_age_before_the_trial_cap() {
+        let store = Store::in_memory().unwrap(); // trial_cap = 1
+        let q = [1.0_f32, 0.0, 0.0];
+        let old = store
+            .insert_with_quality("old lesson", &q, &QualityMeta::default_active("old lesson"))
+            .unwrap();
+        let fresh = store
+            .insert_with_quality(
+                "fresh lesson",
+                &[0.8, 0.6, 0.0],
+                &QualityMeta::default_active("fresh lesson"),
+            )
+            .unwrap();
+        store
+            .pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET created_at = created_at - 8640000, last_used_at = 1
+                 WHERE id = ?1",
+                params![old],
+            )
+            .unwrap();
+
+        // The old row is the nearest and would take the single trial slot; it must not.
+        let got = store.search_within_days(&q, 5, 30.0).unwrap();
+        assert_eq!(got.iter().map(|m| m.id).collect::<Vec<_>>(), vec![fresh]);
+        let last_used: i64 = store
+            .pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT last_used_at FROM memories WHERE id = ?1",
+                params![old],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_used, 1, "a filtered-out row is not marked as used");
     }
 
     #[test]

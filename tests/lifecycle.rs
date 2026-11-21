@@ -166,8 +166,8 @@ fn contradiction_mode_decides_how_a_contradiction_is_resolved() {
         // No ONNX model here: the lexical verdict is a heuristic, so the loser is
         // quarantined (hidden, recoverable) rather than archived.
         (ContradictionMode::Nli, 1, 2),
-        // The legacy polarity gate keeps its historical archiving.
-        (ContradictionMode::Legacy, 0, 1),
+        // The legacy polarity gate is a heuristic too: quarantine, never archive.
+        (ContradictionMode::Legacy, 1, 2),
     ] {
         let m = engine(ScoringConfig {
             contradiction_mode: mode,

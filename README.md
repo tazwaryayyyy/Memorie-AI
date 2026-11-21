@@ -222,7 +222,12 @@ not fitted or validated.
 | Default (`MemoryPolicy()`) | `trust >= 0.70` | `trust >= 0.40` | `trust < 0.40` |
 | Strict (`MemoryPolicy(strict=True)`) | `trust >= 0.80` | `trust >= 0.50` | `trust < 0.50` |
 
-`inject_context()` only emits text for FOLLOW and HINT decisions.
+`inject_context()` only emits text for FOLLOW and HINT decisions. The four thresholds are
+defined once in Rust (`memoire::quality::{FOLLOW,HINT,STRICT_FOLLOW,STRICT_HINT}_THRESHOLD`)
+and read from the native extension by `MemoryPolicy`
+(`memoire_engine.policy_thresholds(strict=False)`) and the MCP server. Comparisons allow
+`1e-6` of slack because a float32 trust of exactly `0.70` reaches Python as slightly
+below `0.70`.
 
 ## Core API
 
@@ -268,9 +273,13 @@ with Memoire("agent.db") as m:
     m.import_namespace(snapshot)                            # preserve_trust=False by default
 ```
 
-`recall_mmr` and `recall_reranked` exist on the native class
-(`memoire_engine.memoire_engine.Memoire`) but are **not wrapped** by the high-level
-`memoire_engine.Memoire` class. Use Rust or the native class if you need them.
+`recall_mmr(query, top_k=5, mmr_lambda=0.5)` is wrapped by the high-level class. It
+reranks the live candidates returned by the default recall, so the default `trial_cap` of
+`1` applies to them: with no feedback history it can return at most one result. Pass
+`trial_cap=` to `Memoire(...)` to widen that. `recall_reranked` exists on the native class
+(`memoire_engine.memoire_engine.Memoire`) but is **not wrapped**; use Rust or the native
+class if you need it. `recall(..., include_hidden=True)` returns hidden rows too, and
+`reinforce_declared(memory_id, session_id=None)` records a success with no text gate.
 
 Thread safety: the native class serializes calls behind a mutex, but the wrapper class
 documents itself as not thread-safe. Use one instance per thread.
@@ -288,13 +297,13 @@ Run after each `remember()` for each new chunk, against live `trial`/`active` an
    texts must have opposing polarity (from a small keyword lexicon) **and** at least one
    negation term (from the same lexicon, plus `not` / `no`) must appear in exactly one of
    them. Opposing polarity without that asymmetry is `Neutral`.
-3. The incoming row replaces the existing one only if its importance exceeds
-   `0.50 + 0.40 * existing_gravity`; otherwise the incoming row is the loser.
-4. The loser is hidden. A model-backed verdict **archives** it (`archived = 1`,
+3. The side with more feedback evidence (`compute_gravity_radius`: posterior trust,
+   reinforcement count, age) wins; between two unverified memories the newer one wins.
+   Ingest importance is not consulted.
+4. The loser is hidden. Only a model-backed verdict **archives** it (`archived = 1`,
    `superseded_by` set; maintenance deletes archived rows after seven days). A lexical-only
-   verdict **quarantines** it instead: hidden from default recall, never deleted, restored
-   with `unquarantine` (CLI: `memoire-cli unquarantine <ID>`). The `Legacy` polarity gate
-   keeps its historical archiving.
+   or `Legacy` verdict **quarantines** it instead: hidden from default recall, never
+   deleted, restored with `unquarantine` (CLI: `memoire-cli unquarantine <ID>`).
 
 Caveats: the lexical fallback is a keyword heuristic and will produce false positives and
 false negatives. If the new memory's polarity is neutral the check is skipped entirely, so an NLI
@@ -378,12 +387,23 @@ Tools: `memoire_health`, `memoire_remember`, `memoire_recall`, `memoire_recall_e
 and `memoire_import` are listed only when `MEMOIRE_ENABLE_ADMIN_TOOLS=1`. Tools other than
 `memoire_health` accept a `namespace` parameter.
 
-`memoire_recall` and `memoire_recall_explained` hide `shadow` memories unless
-`include_shadow=true`. This is the MCP layer's own filter and is now redundant: the Rust
-`recall` returns only live (`trial` / `active`) rows, and `include_hidden` (the renamed
-`include_shadow` argument of `recall_with_options` / `Store::search`) additionally returns
-`shadow`, `probationary` and `quarantined` rows with no trial cap. The MCP tools do not yet
-expose `exposure`, pass a session id, or let you configure `trial_cap`.
+`memoire_recall` and `memoire_recall_explained` have no Python-side filter or over-fetch:
+the engine's default recall returns only live (`trial` / `active`) rows, and
+`include_shadow=true` is passed through as `include_hidden`, which also returns `shadow`,
+`probationary` and `quarantined` rows and skips the trial cap (an operator view). Results
+carry `exposure` (`follow` / `hint` / `trial` / `hidden`); `memoire_remember` returns
+`memory_ids`. Feedback tools pass a per-process session id (`session_id` in
+`memoire_status`), so the engine refuses to reinforce a memory twice in a row from the same
+server process. The engine only compares against the *most recent* reinforcing session, so
+this is not a per-(memory, session) vote count across interleaved sessions.
+
+`MEMOIRE_TRIAL_CAP` (non-negative integer; an invalid value stops the server with exit
+code `2`) overrides the engine's `trial_cap`. The engine default is `1`: with no feedback
+history every memory is unverified, so a recall returns at most one result. Raise it if
+agents need several results before any feedback has been recorded.
+`memoire_identify_gaps` (`min_trust`, default now the engine's HINT threshold `0.40`) and
+`memoire_namespace_health` (`trust_threshold` in its output) read that threshold from the
+engine instead of hardcoding `0.45`.
 
 ## Experimental: HTTP Server and Dashboard
 
@@ -433,13 +453,12 @@ resolve inside `MEMOIRE_ALLOWED_PATHS` (default: the server's working directory)
 5. **Not published.** No registry package exists yet; there are no prebuilt wheels or
    binaries. Linux `manylinux` compatibility of the ONNX Runtime wheels, macOS x86_64 and
    musl targets are untested.
-6. **Python wrapper gaps** (`recall_mmr`, `recall_reranked`) and per-query `Memoire`
-   construction in `memoire_engine.adapters` (reloads the embedder on each retrieval).
+6. **Python wrapper gap** (`recall_reranked`) and per-query `Memoire` construction in
+   `memoire_engine.adapters` (reloads the embedder on each retrieval).
 7. Other known debt: `resolve_contradictions_for_id` skips new memories whose polarity is
-   neutral; `memoire_identify_gaps` / `memoire_namespace_health` use a hardcoded `0.45`
-   trust cut-off (default `min_trust` / `best_trust >= 0.45`) that differs from
-   `MemoryPolicy`'s `0.40` / `0.50`; there is no automated test with a real NLI model; some
-   source comments contain mojibake.
+   neutral; there is no automated test with a real NLI model; the one-vote-per-session rule
+   only compares against the most recent reinforcing session; some source comments contain
+   mojibake.
 
 ## Tests and CI
 

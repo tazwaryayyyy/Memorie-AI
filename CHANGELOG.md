@@ -12,6 +12,42 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ---
 
 ## [Unreleased]
+### Changed (Step 8b-3: SDK / MCP alignment and 8b-2 cleanups; breaking, pre-publish)
+- **`should_supersede(incoming_gravity, existing_gravity, incoming_is_newer)`**: the winner of
+  a contradiction is the side with more feedback evidence (`compute_gravity_radius`); ties go
+  to the newer memory. The old `importance > 0.50 + 0.40 * gravity` rule made every newcomer
+  lose under centroid-only importance, hiding corrections in favour of the lesson they
+  correct. `resolve_contradictions_for_id` now reads both sides' feedback counts.
+- **`ContradictionMode::Legacy`** quarantines the loser (recoverable with `unquarantine`)
+  instead of setting `archived = 1`. Only an installed ONNX NLI verdict archives.
+- **Lexicon matching ignores surrounding punctuation** (`"disabled."`, `"(never"`) and folds
+  the typographic apostrophe, in `detect_polarity` / `negation_asymmetry` (new
+  `lexicon_text`; `normalize_text`, which feeds fingerprints, is unchanged).
+- **`ScoringConfig::quality_gate_threshold`** (default `0.50`, `DEFAULT_QUALITY_GATE_THRESHOLD`);
+  `decide_store(score, dup, threshold)` and `build_quality_meta(.., quality_gate_threshold)` take
+  it. Python: `Memoire(..., quality_gate_threshold=)` (outside [0, 1] or NaN raises `MemoireError`).
+- **Policy thresholds live in Rust**: `quality::{FOLLOW,HINT,STRICT_FOLLOW,STRICT_HINT}_THRESHOLD`,
+  exported by the native module and read by `MemoryPolicy` and the MCP server via
+  `memoire_engine.policy_thresholds(strict=False)`. `MemoryPolicy` compares with `1e-6` slack
+  (float32 `0.70` is below `0.70`).
+- **`search_within_days` applies the age filter before the trial cap** (`Store::search_filtered`).
+  Before, one stale-but-nearest unverified row could take the single trial slot and be filtered
+  out afterwards, returning nothing, and filtered-out rows had `last_used_at` bumped.
+- **Python SDK**: `recall_mmr`, `recall(.., include_hidden=)`, `recall_explained(.., include_hidden=)`;
+  Rust `Memoire::recall_explained_with_options`.
+- **MCP server**: removed the Python shadow filter and 3x over-fetch (the engine hides hidden
+  rows); `include_shadow` maps to `include_hidden`; results carry `exposure`; `memoire_remember`
+  returns `memory_ids`; feedback tools pass a per-process `session_id`; `MEMOIRE_TRIAL_CAP`;
+  `memoire_identify_gaps` `min_trust` defaults to the engine HINT threshold (`0.40`, was `0.45`)
+  and `memoire_namespace_health` reports `trust_threshold`.
+
+### Known gaps (Step 8b-3)
+- `trial_cap = 1` means a no-feedback recall (including `recall_mmr`, `recall_reranked`,
+  `search_within_days`, and every script under `examples/`) returns at most one result.
+- The one-vote-per-session check compares only with the most recent reinforcing session.
+- `DefaultOracle::verify_weak` still hardcodes `0.50`; it is independent of
+  `quality_gate_threshold`.
+
 ### Changed (Step 8b-2: weights, contradiction verdicts, shadow corroboration; breaking, pre-publish)
 - **`ScoringWeights::default()`**: `novelty` and `evidence` weigh `0.0`; the three semantic
   centroid weights are renormalised to `3/7`, `5/14`, `3/14` (original 0.30 : 0.25 : 0.15
@@ -46,10 +82,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   prove keyword evidence cannot buy a pass.
 
 ### Known gaps (not addressed here)
-- Tokens are whitespace-delimited, so a lexicon term followed by punctuation (`disabled.`)
-  is not matched by `detect_polarity` / `negation_asymmetry`.
-- `should_supersede` still compares the incoming memory's ingest importance with
-  `0.50 + 0.40 * gravity`; with the new weights the existing memory almost always wins.
+- (Fixed in 8b-3) Whitespace-delimited tokens missed a lexicon term followed by punctuation.
+- (Fixed in 8b-3) `should_supersede` compared ingest importance with `0.50 + 0.40 * gravity`, so
+  the existing memory almost always won.
 - Remaining exemplars still touch payments, hashing, parameterized queries and input
   validation.
 

@@ -6,8 +6,11 @@ access to download the embedding model):
     cd bindings/python && maturin develop --release
     pytest tests/ -v
 """
+import struct
+from types import SimpleNamespace
+
 import pytest
-from memoire_engine import Memoire, Memory, MemoireError
+from memoire_engine import Memoire, Memory, MemoireError, MemoryPolicy, policy_thresholds
 
 
 @pytest.fixture
@@ -261,3 +264,121 @@ class TestImportNamespace:
         got = m.recall("validate external inputs", top_k=1)[0]
         assert got.reinforcement_count == 50
         assert 0.0 <= got.trust <= 1.0
+
+
+# ─── Step 8b-3: recall_mmr, include_hidden, quality gate, declared feedback ──
+
+_LESSONS = [
+    "Always close database connections in a finally block to avoid leaks",
+    "Use parameterized queries to prevent SQL injection in user search",
+    "Retry HTTP calls with exponential backoff when the API returns 503",
+]
+
+
+@pytest.fixture
+def wide():
+    """In-memory instance whose trial cap does not hide unverified rows."""
+    with Memoire(":memory:", trial_cap=10) as instance:
+        yield instance
+
+
+class TestRecallMmr:
+    def test_returns_at_most_top_k_memories(self, wide):
+        for lesson in _LESSONS:
+            wide.remember(lesson)
+        results = wide.recall_mmr("database safety and queries", top_k=2)
+        assert 1 <= len(results) <= 2
+        assert all(isinstance(r, Memory) for r in results)
+
+    def test_lambda_one_matches_plain_recall_order(self, wide):
+        for lesson in _LESSONS:
+            wide.remember(lesson)
+        query = "retry failed http requests"
+        assert [r.id for r in wide.recall_mmr(query, top_k=3, mmr_lambda=1.0)] == [
+            r.id for r in wide.recall(query, top_k=3)
+        ]
+
+    def test_empty_store_returns_empty_list(self, wide):
+        assert wide.recall_mmr("anything") == []
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.1, float("nan"), float("inf")])
+    def test_rejects_out_of_range_lambda(self, wide, bad):
+        with pytest.raises(ValueError):
+            wide.recall_mmr("q", mmr_lambda=bad)
+
+    def test_rejects_bad_top_k_and_query_type(self, wide):
+        with pytest.raises(ValueError):
+            wide.recall_mmr("q", top_k=0)
+        with pytest.raises(TypeError):
+            wide.recall_mmr(123)
+
+    def test_default_trial_cap_limits_unverified_candidates(self, m):
+        for lesson in _LESSONS:
+            m.remember(lesson)
+        # trial_cap defaults to 1 and nothing has feedback yet.
+        assert len(m.recall_mmr("database safety and queries", top_k=3)) == 1
+
+
+class TestQualityGateThreshold:
+    def test_default_threshold_leaves_admit_all_untouched(self, m):
+        ids = m.remember_ids(_LESSONS[0])
+        assert [r.id for r in m.recall("database connections", top_k=1)] == ids
+
+    def test_threshold_one_hides_everything_under_quality_gate(self):
+        with Memoire(":memory:", admission="quality_gate", quality_gate_threshold=1.0) as q:
+            ids = q.remember_ids(_LESSONS[0])
+            assert len(ids) == 1
+            assert q.recall("database connections", top_k=3) == []
+            hidden = q.recall("database connections", top_k=3, include_hidden=True)
+            assert [r.id for r in hidden] == ids
+            assert hidden[0].state == "shadow"
+            assert hidden[0].exposure == "hidden"
+
+    def test_threshold_zero_admits_everything_under_quality_gate(self):
+        with Memoire(":memory:", admission="quality_gate", quality_gate_threshold=0.0) as q:
+            ids = q.remember_ids(_LESSONS[0])
+            assert [r.id for r in q.recall("database connections", top_k=1)] == ids
+
+    @pytest.mark.parametrize("bad", [-0.01, 1.01, float("nan")])
+    def test_rejects_out_of_range_threshold(self, bad):
+        with pytest.raises(MemoireError):
+            Memoire(":memory:", quality_gate_threshold=bad)
+
+
+class TestRecallExplainedIncludeHidden:
+    def test_hidden_rows_only_with_the_flag(self):
+        with Memoire(":memory:", admission="quality_gate", quality_gate_threshold=1.0) as q:
+            ids = q.remember_ids(_LESSONS[1])
+            assert q.recall_explained("sql injection", top_k=3) == []
+            shown = q.recall_explained("sql injection", top_k=3, include_hidden=True)
+            assert [a.memory.id for a in shown] == ids
+
+
+class TestReinforceDeclared:
+    def test_one_vote_per_session(self, m):
+        (mid,) = m.remember_ids(_LESSONS[2])
+        assert m.reinforce_declared(mid, session_id="s1") is True
+        assert m.reinforce_declared(mid, session_id="s1") is False
+        assert m.reinforce_declared(mid, session_id="s2") is True
+        assert m.recall("retry http backoff", top_k=1)[0].reinforcement_count == 2
+
+    def test_unknown_id_is_not_reinforced(self, m):
+        assert m.reinforce_declared(999_999, session_id="s1") is False
+
+
+class TestPolicyThresholdsComeFromRust:
+    def test_values(self):
+        assert policy_thresholds() == (0.70, 0.40)
+        assert policy_thresholds(strict=True) == (0.80, 0.50)
+
+    def test_memory_policy_uses_them(self):
+        default, strict = MemoryPolicy(), MemoryPolicy(strict=True)
+        assert (default.FOLLOW_THRESHOLD, default.HINT_THRESHOLD) == (0.70, 0.40)
+        assert (strict.FOLLOW_THRESHOLD, strict.HINT_THRESHOLD) == (0.80, 0.50)
+
+    def test_float32_trust_on_the_boundary_still_follows(self):
+        # A posterior of exactly 0.70 reaches Python as float32(0.7) < 0.7.
+        trust = struct.unpack("f", struct.pack("f", 0.70))[0]
+        assert trust < 0.70
+        mem = SimpleNamespace(trust=trust, state="active", content="x")
+        assert MemoryPolicy().evaluate([mem])[0].action == "follow"

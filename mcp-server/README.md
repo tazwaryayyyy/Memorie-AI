@@ -82,8 +82,13 @@ freshly remembered one. At most 1000 memories per call. `memoire_forget` is not 
 
 ## Tool notes
 
-- `memoire_recall` and `memoire_recall_explained` exclude `shadow` memories unless
-  `include_shadow=true`.
+- `memoire_recall` and `memoire_recall_explained` return live memories only unless
+  `include_shadow=true`, which is passed to the engine as `include_hidden` (hidden rows
+  included, trial cap skipped). Each memory has an `exposure` label.
+- `MEMOIRE_TRIAL_CAP` overrides the engine's `trial_cap` (default `1`: with no feedback a
+  recall returns at most one result). Non-integer or negative values stop the server.
+- Feedback tools send one session id per server process (`memoire_status` shows it).
+- `memoire_identify_gaps` `min_trust` defaults to the engine HINT threshold (0.40).
 - `memoire_export` returns `{"ok": true, "error": null, "snapshot": {...}}`; pass the
   `snapshot` value to `memoire_import`.
 

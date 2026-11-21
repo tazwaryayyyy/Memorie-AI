@@ -5,6 +5,7 @@ import math
 import os
 import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
@@ -28,7 +29,7 @@ except ModuleNotFoundError as _exc:
     # Otherwise the import below raises the normal ModuleNotFoundError.
 
 from memoire_engine import Memoire  # noqa: E402
-from memoire_engine.client import _get_lib  # noqa: E402
+from memoire_engine.client import _TRUST_EPS, _get_lib, policy_thresholds  # noqa: E402
 
 # Setup structured logging
 
@@ -102,6 +103,32 @@ _memoire_locks: Dict[Tuple[str, str], threading.Lock] = {}
 _instance_lock = threading.Lock()
 T = TypeVar("T")
 
+# One id per server process. Feedback tools pass it to the engine, which refuses a
+# second reinforcement of a memory whose most recent reinforcing session is this one.
+# Two concurrent clients (each with its own server process) get different ids.
+SESSION_ID = f"mcp-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+
+def trial_cap_from_env() -> Optional[int]:
+    """Operator override for the engine's `trial_cap` (MEMOIRE_TRIAL_CAP).
+
+    `trial_cap` bounds how many unverified memories (no feedback yet) one recall may
+    return; the engine default is 1, so until feedback arrives a recall returns at most
+    one result. Unset or blank keeps the engine default. A non-integer or negative value
+    raises ValueError rather than being silently ignored.
+    """
+    raw = os.environ.get("MEMOIRE_TRIAL_CAP", "").strip()
+    if not raw:
+        return None
+    try:
+        cap = int(raw)
+    except ValueError:
+        cap = -1
+    if cap < 0:
+        raise ValueError(
+            f"MEMOIRE_TRIAL_CAP must be a non-negative integer, got {raw!r}")
+    return cap
+
 
 def ok_response(**payload: Any) -> Dict[str, Any]:
     """Return a stable success envelope for MCP tool callers."""
@@ -136,20 +163,25 @@ def serialize_memory(memory: Any) -> Dict[str, Any]:
         "ingestion_driver": getattr(memory, "ingestion_driver", "Unknown"),
         "uncertainty": memory.uncertainty,
         "state": memory.state,
+        "exposure": getattr(memory, "exposure", None),
         "created_at": memory.created_at,
         "last_used_at": getattr(memory, "last_used_at", None),
     }
 
-# The native recall applies top_k before the Python-side shadow gate (and the
-# core `include_shadow=False` flag still returns 'shadow' rows), so over-fetch
-# and trim afterwards. Heuristic factor: if more than ~2/3 of the candidates
-# are shadow, fewer than top_k results can still come back.
-_SHADOW_OVERFETCH = 3
-_MAX_FETCH = 150
 
-
-def _fetch_k(top_k: int, include_shadow: bool) -> int:
-    return top_k if include_shadow else min(top_k * _SHADOW_OVERFETCH, _MAX_FETCH)
+def _status_message(memory: Any) -> str:
+    """Human-readable offer level, derived from the engine's `exposure` label."""
+    exposure = getattr(memory, "exposure", None)
+    if exposure == "follow":
+        return "Verified by feedback and above the follow threshold."
+    if exposure == "hint":
+        return "Has some feedback evidence but is below the follow threshold; verify before acting."
+    if exposure == "trial":
+        return "Unverified: no feedback recorded yet. Treat as a hint and verify before acting."
+    if exposure == "hidden":
+        return (f"WARNING: hidden memory (state={memory.state}); default recall does not "
+                "offer it. Use with caution.")
+    return "Judge confidence from trust, uncertainty and exposure."
 
 
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -332,7 +364,11 @@ def get_memoire(db_path: str, namespace: str = "default") -> Memoire:
         if cache_key not in _memoire_instances:
             logger.info("event=memoire_init db_path=%s namespace=%s",
                         db_path, namespace)
-            _memoire_instances[cache_key] = Memoire(db_path, namespace)
+            options: Dict[str, Any] = {}
+            trial_cap = trial_cap_from_env()
+            if trial_cap is not None:
+                options["trial_cap"] = trial_cap
+            _memoire_instances[cache_key] = Memoire(db_path, namespace, **options)
             _memoire_locks[cache_key] = threading.Lock()
     return _memoire_instances[cache_key]
 
@@ -353,9 +389,11 @@ def memoire_remember(content: str, ctx: Context, namespace: str = "default") -> 
         return error_response("invalid_argument", "content must not be empty")
 
     try:
-        chunks = run_memoire(ctx, lambda memoire: memoire.remember(
+        ids = run_memoire(ctx, lambda memoire: memoire.remember_ids(
             content), namespace=namespace)
-        return ok_response(chunks_stored=chunks)
+        # memory_ids are what memoire_reinforce / memoire_penalize take. A chunk that
+        # exactly duplicates an existing memory is not stored and has no id here.
+        return ok_response(chunks_stored=len(ids), memory_ids=list(ids))
     except Exception as e:
         logger.exception("event=memoire_remember_failed")
         return error_response("remember_failed", str(e))
@@ -365,7 +403,13 @@ def memoire_remember(content: str, ctx: Context, namespace: str = "default") -> 
 def memoire_recall(query: str, ctx: Context, top_k: int = 5, include_shadow: bool = False, namespace: str = "default") -> dict:
     """
     Return the `top_k` memories most semantically similar to `query`.
-    If include_shadow is False (default), shadow memories are hard-gated out of the response.
+
+    Each memory carries an `exposure` label: "follow" (verified, trust >= 0.70),
+    "hint" (some feedback, lower trust), "trial" (no feedback yet) or "hidden".
+    At most `trial_cap` (engine default 1, MEMOIRE_TRIAL_CAP) trial memories are
+    returned per call, so until feedback arrives a recall can return a single result.
+    If include_shadow is True the operator view is returned instead: hidden rows
+    (shadow, probationary, quarantined) are included and the trial cap is skipped.
     """
     if not query or not query.strip():
         return error_response("invalid_argument", "query must not be empty")
@@ -374,32 +418,21 @@ def memoire_recall(query: str, ctx: Context, top_k: int = 5, include_shadow: boo
 
     try:
         results = run_memoire(ctx, lambda memoire: memoire.recall(
-            query, top_k=_fetch_k(top_k, include_shadow)), namespace=namespace)
-        final_results = []
-
-        for r in results:
-            if not include_shadow and r.state == "shadow":
-                continue
-            if len(final_results) >= top_k:
-                break
-
-            # "active" only means "not shadow"; confidence is in trust/uncertainty.
-            status_msg = "Active. Judge confidence from trust and uncertainty."
-            if r.state == "shadow":
-                status_msg = "WARNING: This is a shadow memory with low trust. Use with caution."
-
-            final_results.append({
+            query, top_k=top_k, include_hidden=include_shadow), namespace=namespace)
+        return ok_response(memories=[
+            {
                 "id": r.id,
                 "content": r.content,
                 "score": r.score,
                 "trust": r.trust,
                 "uncertainty": r.uncertainty,
                 "state": r.state,
+                "exposure": getattr(r, "exposure", None),
                 "created_at": r.created_at,
-                "status": status_msg
-            })
-
-        return ok_response(memories=final_results)
+                "status": _status_message(r),
+            }
+            for r in results
+        ])
     except Exception as e:
         logger.exception("event=memoire_recall_failed")
         return error_response("recall_failed", str(e))
@@ -419,7 +452,7 @@ def memoire_reinforce(memory_id: int, agent_output: str, task_succeeded: bool, c
         reinforced = run_memoire(
             ctx,
             lambda memoire: memoire.reinforce_if_used(
-                memory_id, agent_output, task_succeeded),
+                memory_id, agent_output, task_succeeded, session_id=SESSION_ID),
             namespace=namespace,
         )
         return ok_response(memory_id=memory_id, reinforced=reinforced)
@@ -482,7 +515,8 @@ def memoire_batch_feedback(memory_ids: List[int], task_succeeded: bool, task_out
 
             reinforced_count = 0
             for mid in memory_ids:
-                if memoire.reinforce_if_used(mid, task_output, task_succeeded=True):
+                if memoire.reinforce_if_used(
+                        mid, task_output, task_succeeded=True, session_id=SESSION_ID):
                     reinforced_count += 1
             return ok_response(
                 task_succeeded=True,
@@ -501,7 +535,7 @@ def memoire_batch_feedback(memory_ids: List[int], task_succeeded: bool, task_out
 def memoire_recall_explained(query: str, ctx: Context, top_k: int = 5, include_shadow: bool = False, namespace: str = "default") -> dict:
     """
     Recall memories with attribution signals explaining the ranking.
-    Shadow memories are excluded unless include_shadow is True.
+    include_shadow has the same meaning as in memoire_recall (operator view with hidden rows).
     """
     if not query or not query.strip():
         return error_response("invalid_argument", "query must not be empty")
@@ -510,39 +544,18 @@ def memoire_recall_explained(query: str, ctx: Context, top_k: int = 5, include_s
 
     try:
         def op(memoire: Memoire) -> List[Dict[str, Any]]:
-            if hasattr(memoire, "recall_explained"):
-                explained = [
-                    item for item in memoire.recall_explained(
-                        query, top_k=_fetch_k(top_k, include_shadow))
-                    if include_shadow or item.memory.state != "shadow"
-                ][:top_k]
-                return [
-                    {
-                        "memory": serialize_memory(item.memory),
-                        "semantic_score": item.semantic_score,
-                        "trust": item.trust,
-                        "uncertainty": item.uncertainty,
-                        "effective_weight": item.effective_weight,
-                        "rank_score": item.rank_score,
-                        "reasons": list(item.reasons),
-                    }
-                    for item in explained
-                ]
             return [
                 {
-                    "memory": serialize_memory(memory),
-                    "semantic_score": memory.score,
-                    "trust": memory.trust,
-                    "uncertainty": memory.uncertainty,
-                    "effective_weight": getattr(memory, "effective_weight", 0.0),
-                    "rank_score": memory.score,
-                    "reasons": ["legacy binding fallback"],
+                    "memory": serialize_memory(item.memory),
+                    "semantic_score": item.semantic_score,
+                    "trust": item.trust,
+                    "uncertainty": item.uncertainty,
+                    "effective_weight": item.effective_weight,
+                    "rank_score": item.rank_score,
+                    "reasons": list(item.reasons),
                 }
-                for memory in [
-                    m for m in memoire.recall(
-                        query, top_k=_fetch_k(top_k, include_shadow))
-                    if include_shadow or m.state != "shadow"
-                ][:top_k]
+                for item in memoire.recall_explained(
+                    query, top_k=top_k, include_hidden=include_shadow)
             ]
 
         return ok_response(attributions=run_memoire(ctx, op, namespace=namespace))
@@ -552,16 +565,23 @@ def memoire_recall_explained(query: str, ctx: Context, top_k: int = 5, include_s
 
 
 @mcp.tool()
-def memoire_identify_gaps(queries: List[str], ctx: Context, top_k: int = 3, min_trust: float = 0.45, namespace: str = "default") -> dict:
+def memoire_identify_gaps(queries: List[str], ctx: Context, top_k: int = 3, min_trust: Optional[float] = None, namespace: str = "default") -> dict:
     """
     Identify queries whose recalled memories are missing or below the trust threshold.
+    `min_trust` defaults to the engine's HINT threshold (0.40), the same bar
+    MemoryPolicy uses to decide whether a memory is worth offering at all.
     """
     if not queries:
         return error_response("invalid_argument", "queries must not be empty")
     if top_k < 1 or top_k > 20:
         return error_response("invalid_argument", "top_k must be between 1 and 20", top_k=top_k)
+    if min_trust is not None and (not math.isfinite(min_trust) or not 0.0 <= min_trust <= 1.0):
+        return error_response(
+            "invalid_argument", "min_trust must be between 0.0 and 1.0", min_trust=min_trust)
 
     try:
+        threshold = policy_thresholds()[1] if min_trust is None else min_trust
+
         def op(memoire: Memoire) -> List[Dict[str, Any]]:
             gaps = []
             for query in queries:
@@ -570,7 +590,7 @@ def memoire_identify_gaps(queries: List[str], ctx: Context, top_k: int = 3, min_
                 memories = memoire.recall(query, top_k=top_k)
                 best_trust = max((m.trust for m in memories), default=0.0)
                 best_score = max((m.score for m in memories), default=0.0)
-                if not memories or best_trust < min_trust:
+                if not memories or best_trust + _TRUST_EPS < threshold:
                     gaps.append({
                         "query": query,
                         "reason": "no_recall" if not memories else "low_trust",
@@ -580,7 +600,8 @@ def memoire_identify_gaps(queries: List[str], ctx: Context, top_k: int = 3, min_
                     })
             return gaps
 
-        return ok_response(gaps=run_memoire(ctx, op, namespace=namespace))
+        return ok_response(
+            gaps=run_memoire(ctx, op, namespace=namespace), min_trust=threshold)
     except Exception as e:
         logger.exception("event=memoire_identify_gaps_failed")
         return error_response("identify_gaps_failed", str(e))
@@ -592,6 +613,8 @@ def memoire_namespace_health(ctx: Context, probes: List[str] | None = None, name
     Summarize namespace recall health and optional probe coverage.
     """
     try:
+        hint_threshold = policy_thresholds()[1]
+
         def op(memoire: Memoire) -> Dict[str, Any]:
             total = memoire.count()
             probe_rows = []
@@ -606,13 +629,16 @@ def memoire_namespace_health(ctx: Context, probes: List[str] | None = None, name
                         "best_score": max((m.score for m in memories), default=0.0),
                         "best_trust": max((m.trust for m in memories), default=0.0),
                     })
-            covered = sum(1 for row in probe_rows if row["hits"] > 0 and row["best_trust"] >= 0.45)
+            covered = sum(
+                1 for row in probe_rows
+                if row["hits"] > 0 and row["best_trust"] + _TRUST_EPS >= hint_threshold)
             coverage = covered / len(probe_rows) if probe_rows else None
             return {
                 "namespace": namespace,
                 "total_memories": total,
                 "probe_count": len(probe_rows),
                 "coverage": coverage,
+                "trust_threshold": hint_threshold,
                 "probes": probe_rows,
             }
 
@@ -638,6 +664,8 @@ def memoire_status(ctx: Context, namespace: str = "default") -> dict:
             db_path=db_path,
             db_size_bytes=db_size,
             total_memories=total_memories,
+            session_id=SESSION_ID,
+            trial_cap=trial_cap_from_env(),
         )
     except Exception as e:
         logger.exception("event=memoire_status_failed")
@@ -762,6 +790,11 @@ def memoire_import(snapshot: dict, ctx: Context, namespace: str = "default") -> 
 
 
 def main():
+    try:
+        trial_cap_from_env()
+    except ValueError as exc:
+        logger.error("event=startup_aborted error=%s", exc)
+        raise SystemExit(2)
     health = startup_health_check()
     if not health["ok"]:
         logger.error("event=startup_aborted error=%s", health["error"])

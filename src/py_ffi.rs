@@ -1,5 +1,8 @@
 use crate::panic_guard::catch_panic;
-use crate::quality::{AdmissionMode, ContradictionMode, ScoringConfig};
+use crate::quality::{
+    AdmissionMode, ContradictionMode, ScoringConfig, FOLLOW_THRESHOLD, HINT_THRESHOLD,
+    STRICT_FOLLOW_THRESHOLD, STRICT_HINT_THRESHOLD,
+};
 use crate::{store::Memory, Memoire};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -144,7 +147,8 @@ impl PyMemoire {
         namespace = "default",
         admission = None,
         contradiction = None,
-        trial_cap = None
+        trial_cap = None,
+        quality_gate_threshold = None
     ))]
     fn new(
         db_path: &str,
@@ -152,6 +156,7 @@ impl PyMemoire {
         admission: Option<&str>,
         contradiction: Option<&str>,
         trial_cap: Option<usize>,
+        quality_gate_threshold: Option<f32>,
     ) -> PyResult<Self> {
         // Validate options before the (expensive) store/embedder is built.
         let mut config = ScoringConfig::default();
@@ -171,6 +176,14 @@ impl PyMemoire {
         }
         if let Some(cap) = trial_cap {
             config.trial_cap = cap;
+        }
+        if let Some(threshold) = quality_gate_threshold {
+            if !(0.0..=1.0).contains(&threshold) {
+                return Err(MemoireError::new_err(format!(
+                    "quality_gate_threshold must be a number in [0.0, 1.0], got {threshold}"
+                )));
+            }
+            config.quality_gate_threshold = threshold;
         }
         // Opening can panic (e.g. ONNX Runtime / model initialisation), and
         // there is no lock to protect yet, so catch it here too.
@@ -201,9 +214,14 @@ impl PyMemoire {
         self.with_inner("remember_ids", |m| m.remember(content).map_err(db_err))
     }
 
-    fn recall(&self, query: &str, top_k: usize) -> PyResult<Vec<PyMemory>> {
+    /// `include_hidden=True` also returns hidden rows (`shadow`, `probationary`,
+    /// `quarantined`) and skips the trial cap; the default returns live rows only.
+    #[pyo3(signature = (query, top_k, include_hidden = false))]
+    fn recall(&self, query: &str, top_k: usize, include_hidden: bool) -> PyResult<Vec<PyMemory>> {
         self.with_inner("recall", |m| {
-            let memories = m.recall(query, top_k).map_err(db_err)?;
+            let memories = m
+                .recall_with_options(query, top_k, include_hidden)
+                .map_err(db_err)?;
             Ok(memories.into_iter().map(py_memory).collect())
         })
     }
@@ -232,9 +250,17 @@ impl PyMemoire {
         })
     }
 
-    fn recall_explained(&self, query: &str, top_k: usize) -> PyResult<Vec<PyRecallAttribution>> {
+    #[pyo3(signature = (query, top_k, include_hidden = false))]
+    fn recall_explained(
+        &self,
+        query: &str,
+        top_k: usize,
+        include_hidden: bool,
+    ) -> PyResult<Vec<PyRecallAttribution>> {
         self.with_inner("recall_explained", |m| {
-            let attributions = m.recall_explained(query, top_k).map_err(db_err)?;
+            let attributions = m
+                .recall_explained_with_options(query, top_k, include_hidden)
+                .map_err(db_err)?;
             Ok(attributions
                 .into_iter()
                 .map(|a| PyRecallAttribution {
@@ -360,5 +386,10 @@ fn memoire_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemory>()?;
     m.add_class::<PyRecallAttribution>()?;
     m.add("MemoireError", m.py().get_type_bound::<MemoireError>())?;
+    // Trust thresholds: Rust owns them; Python MemoryPolicy and the MCP server read these.
+    m.add("FOLLOW_THRESHOLD", FOLLOW_THRESHOLD)?;
+    m.add("HINT_THRESHOLD", HINT_THRESHOLD)?;
+    m.add("STRICT_FOLLOW_THRESHOLD", STRICT_FOLLOW_THRESHOLD)?;
+    m.add("STRICT_HINT_THRESHOLD", STRICT_HINT_THRESHOLD)?;
     Ok(())
 }

@@ -421,6 +421,7 @@ impl Memoire {
                     .prototypes
                     .lock()
                     .map_err(|_| MemoireError::LockPoisoned)?,
+                self.store.config.quality_gate_threshold,
             );
 
             // Default admission: ingest text features never gate exposure, so a chunk the
@@ -771,7 +772,19 @@ impl Memoire {
 
     /// Recall memories together with an attribution breakdown for ranking and policy use.
     pub fn recall_explained(&self, query: &str, top_k: usize) -> Result<Vec<RecallAttribution>> {
-        let memories = self.recall(query, top_k)?;
+        self.recall_explained_with_options(query, top_k, false)
+    }
+
+    /// [`Memoire::recall_explained`] with the `include_hidden` switch of
+    /// [`Memoire::recall_with_options`]: `true` also returns hidden rows (`shadow`,
+    /// `probationary`, `quarantined`) and skips the trial cap.
+    pub fn recall_explained_with_options(
+        &self,
+        query: &str,
+        top_k: usize,
+        include_hidden: bool,
+    ) -> Result<Vec<RecallAttribution>> {
+        let memories = self.recall_with_options(query, top_k, include_hidden)?;
         Ok(memories
             .into_iter()
             .map(|memory| {

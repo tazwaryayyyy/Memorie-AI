@@ -4,13 +4,22 @@ Core Python client for Memoire. Wraps the PyO3 native extension.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # Import the compiled PyO3 native module (memoire_engine.memoire_engine)
 _NATIVE_IMPORT_ERROR: Optional[BaseException] = None
 try:
-    from .memoire_engine import Memoire as _NativeMemoire, Memory as _NativeMemory, MemoireError
+    from .memoire_engine import (
+        FOLLOW_THRESHOLD as _FOLLOW_THRESHOLD,
+        HINT_THRESHOLD as _HINT_THRESHOLD,
+        STRICT_FOLLOW_THRESHOLD as _STRICT_FOLLOW_THRESHOLD,
+        STRICT_HINT_THRESHOLD as _STRICT_HINT_THRESHOLD,
+        Memoire as _NativeMemoire,
+        Memory as _NativeMemory,
+        MemoireError,
+    )
 except ImportError as _exc:
     # If the native module is not compiled yet, import placeholder exceptions.
     # Keep the original error: it also covers a present-but-unloadable extension.
@@ -20,6 +29,8 @@ except ImportError as _exc:
         """Raised when the Memoire library returns an error."""
     _NativeMemoire = None
     _NativeMemory = None
+    _FOLLOW_THRESHOLD = _HINT_THRESHOLD = None
+    _STRICT_FOLLOW_THRESHOLD = _STRICT_HINT_THRESHOLD = None
 
 # Re-export the native Memory class
 Memory = _NativeMemory
@@ -45,6 +56,30 @@ def _get_lib():
     return _NativeMemoire
 
 
+# Float32 trust values widened to Python floats can sit a hair below the decimal
+# threshold they equal (float32(0.7) < 0.7), so policy comparisons allow this slack.
+_TRUST_EPS = 1e-6
+
+
+def policy_thresholds(strict: bool = False) -> Tuple[float, float]:
+    """
+    Return ``(follow, hint)`` trust thresholds.
+
+    The values are defined once, in Rust (``memoire::quality::{FOLLOW,HINT}_THRESHOLD``
+    and the ``STRICT_*`` pair), and read from the native extension here, so
+    ``MemoryPolicy`` and the MCP server cannot drift from the engine.
+
+    Raises:
+        MemoireError: if the native extension is unavailable.
+    """
+    if _FOLLOW_THRESHOLD is None:
+        _get_lib()  # raises MemoireError with build instructions
+        raise MemoireError("native policy thresholds are unavailable")
+    if strict:
+        return _STRICT_FOLLOW_THRESHOLD, _STRICT_HINT_THRESHOLD
+    return _FOLLOW_THRESHOLD, _HINT_THRESHOLD
+
+
 class Memoire:
     """
     Local-first semantic memory engine for AI coding agents.
@@ -66,6 +101,7 @@ class Memoire:
         admission: Optional[str] = None,
         contradiction: Optional[str] = None,
         trial_cap: Optional[int] = None,
+        quality_gate_threshold: Optional[float] = None,
     ) -> None:
         """
         Open or create a Memoire database at `db_path` scoped to `namespace`.
@@ -82,6 +118,11 @@ class Memoire:
             trial_cap: Maximum unverified memories one recall may return (default 1).
                 With no feedback history every memory is unverified, so a default
                 recall returns at most one result; raise this for no-feedback use.
+            quality_gate_threshold: Ingest importance at or above which
+                ``admission="quality_gate"`` admits a chunk as ``trial`` (default 0.50);
+                below it the chunk is stored hidden as ``shadow``. Values outside
+                [0.0, 1.0] (and NaN) raise ``MemoireError``. Ignored under ``admission="admit_all"``. Calibrate it on a
+                dev split, not on the data you report results on.
 
         Raises:
             MemoireError: if the library fails to initialise.
@@ -99,6 +140,8 @@ class Memoire:
                 options["contradiction"] = contradiction
             if trial_cap is not None:
                 options["trial_cap"] = trial_cap
+            if quality_gate_threshold is not None:
+                options["quality_gate_threshold"] = float(quality_gate_threshold)
             self._impl = _NativeMemoire(db_path, namespace, **options)
         except Exception as e:
             raise MemoireError(f"Failed to initialize Memoire: {e}") from e
@@ -162,13 +205,16 @@ class Memoire:
         except Exception as e:
             raise MemoireError(f"remember_ids() failed: {e}") from e
 
-    def recall(self, query: str, top_k: int = 5) -> List[Memory]:
+    def recall(self, query: str, top_k: int = 5, include_hidden: bool = False) -> List[Memory]:
         """
         Return the `top_k` memories most semantically similar to `query`.
 
         Args:
             query: Natural language question or keyword phrase.
             top_k: Maximum number of results to return (default 5).
+            include_hidden: Also return hidden rows (``shadow``, ``probationary``,
+                ``quarantined``; ``exposure == "hidden"``) and skip the trial cap.
+                An operator / debugging view; the default returns live rows only.
 
         Returns:
             List of Memory objects, sorted by score descending (0–1).
@@ -179,9 +225,35 @@ class Memoire:
         if top_k < 1:
             raise ValueError(f"top_k must be >= 1, got {top_k}")
         try:
-            return self._impl.recall(query, top_k)
+            return self._impl.recall(query, top_k, include_hidden)
         except Exception as e:
             raise MemoireError(f"recall() failed: {e}") from e
+
+    def recall_mmr(self, query: str, top_k: int = 5, mmr_lambda: float = 0.5) -> List[Memory]:
+        """
+        Recall with Maximal Marginal Relevance reranking to reduce near-duplicates.
+
+        Fetches ``max(3 * top_k, 20)`` live candidates (the default trial cap applies to
+        them, so with no feedback history at most ``trial_cap`` unverified rows are
+        candidates) and reranks them for relevance versus diversity.
+
+        Args:
+            query: Natural language question or keyword phrase.
+            top_k: Maximum number of results to return (default 5).
+            mmr_lambda: ``1.0`` is pure relevance (same order as :meth:`recall`), ``0.0``
+                is pure diversity; default 0.5. Must be within [0.0, 1.0].
+        """
+        self._check_open()
+        if not isinstance(query, str):
+            raise TypeError(f"query must be str, got {type(query).__name__}")
+        if top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
+        if not math.isfinite(mmr_lambda) or not 0.0 <= mmr_lambda <= 1.0:
+            raise ValueError(f"mmr_lambda must be within [0.0, 1.0], got {mmr_lambda}")
+        try:
+            return self._impl.recall_mmr(query, top_k, mmr_lambda)
+        except Exception as e:
+            raise MemoireError(f"recall_mmr() failed: {e}") from e
 
     def reinforce_if_used(
         self,
@@ -265,9 +337,13 @@ class Memoire:
         except Exception as e:
             raise MemoireError(f"penalize_if_used() failed: {e}") from e
 
-    def recall_explained(self, query: str, top_k: int = 5) -> List[object]:
+    def recall_explained(
+        self, query: str, top_k: int = 5, include_hidden: bool = False
+    ) -> List[object]:
         """
         Return recalled memories with attribution signals explaining their ranking.
+
+        ``include_hidden`` has the same meaning as in :meth:`recall`.
         """
         self._check_open()
         if not isinstance(query, str):
@@ -275,7 +351,7 @@ class Memoire:
         if top_k < 1:
             raise ValueError(f"top_k must be >= 1, got {top_k}")
         try:
-            return self._impl.recall_explained(query, top_k)
+            return self._impl.recall_explained(query, top_k, include_hidden)
         except Exception as e:
             raise MemoireError(f"recall_explained() failed: {e}") from e
 
@@ -403,12 +479,10 @@ class MemoryPolicy:
 
     def __init__(self, strict: bool = False) -> None:
         self.strict = strict
-        if strict:
-            self.FOLLOW_THRESHOLD: float = 0.80
-            self.HINT_THRESHOLD: float = 0.50
-        else:
-            self.FOLLOW_THRESHOLD = 0.70
-            self.HINT_THRESHOLD = 0.40
+        # Defined once in Rust and read from the native extension (see policy_thresholds).
+        self.FOLLOW_THRESHOLD: float
+        self.HINT_THRESHOLD: float
+        self.FOLLOW_THRESHOLD, self.HINT_THRESHOLD = policy_thresholds(strict)
 
     def evaluate(self, memories: List[Memory]) -> List[PolicyDecision]:
         decisions = []
@@ -426,12 +500,12 @@ class MemoryPolicy:
         trust = mem.trust
         state = mem.state
 
-        if trust >= self.FOLLOW_THRESHOLD:
+        if trust + _TRUST_EPS >= self.FOLLOW_THRESHOLD:
             reason = f"trust={trust:.2f} {state} reinforced"
             injection = f"[MEMORY - HIGH TRUST]: {mem.content}"
             return "follow", reason, injection
 
-        if trust >= self.HINT_THRESHOLD:
+        if trust + _TRUST_EPS >= self.HINT_THRESHOLD:
             reason = f"trust={trust:.2f} {state} low-confidence"
             injection = f"[MEMORY - HINT ONLY, verify before acting]: {mem.content}"
             return "hint", reason, injection

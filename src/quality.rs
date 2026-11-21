@@ -415,11 +415,26 @@ const NEGATIVE_TERMS: &[&str] = &[
 /// polarity by themselves.
 const PLAIN_NEGATIONS: &[&str] = &["not", "no"];
 
+/// Lowercase `text` and strip punctuation around each whitespace-delimited token, so a
+/// lexicon term followed by punctuation (`"disabled."`, `"(never"`) still matches while
+/// interior apostrophes (`"don't"`) survive; the typographic apostrophe is folded to
+/// ASCII. Used only for lexicon matching: [`normalize_text`] feeds fingerprints and must
+/// not change.
+fn lexicon_text(text: &str) -> String {
+    text.to_lowercase()
+        .replace('\u{2019}', "'")
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Count negation tokens present in one text but absent in the other.
 /// High values indicate one text strongly negates what the other asserts.
 fn negation_asymmetry(a: &str, b: &str) -> usize {
-    let na = normalize_text(a);
-    let nb = normalize_text(b);
+    let na = lexicon_text(a);
+    let nb = lexicon_text(b);
     let in_a = |t: &&str| -> bool {
         if t.contains(' ') {
             na.contains(*t)
@@ -451,7 +466,8 @@ pub enum AdmissionMode {
     /// oracle) enters as `trial`. Ingest-text features never gate exposure. Default.
     #[default]
     AdmitAll,
-    /// Legacy centroid gate: `decide_store(score) >= 0.50` -> `trial`, else `shadow`.
+    /// Centroid gate: importance `>= ScoringConfig::quality_gate_threshold` (default 0.50)
+    /// -> `trial`, else `shadow`.
     /// Hidden `shadow` rows only become live via `Store::promote_shadow`.
     QualityGate,
 }
@@ -492,6 +508,20 @@ impl ContradictionMode {
     }
 }
 
+/// Trust at or above which a memory is offered as `follow` (default policy). Single
+/// source of truth for the Python `MemoryPolicy` and the MCP server; the integer rule
+/// [`meets_follow`] is the same threshold written without floats.
+pub const FOLLOW_THRESHOLD: f64 = 0.70;
+/// Trust at or above which a memory is offered as a `hint` (default policy). Below it
+/// the default policy ignores the memory; [`should_quarantine`] uses the same bar.
+pub const HINT_THRESHOLD: f64 = 0.40;
+/// `follow` bar of the strict policy.
+pub const STRICT_FOLLOW_THRESHOLD: f64 = 0.80;
+/// `hint` bar of the strict policy.
+pub const STRICT_HINT_THRESHOLD: f64 = 0.50;
+/// Default for [`ScoringConfig::quality_gate_threshold`].
+pub const DEFAULT_QUALITY_GATE_THRESHOLD: f32 = 0.50;
+
 /// Configuration for trust scoring, exposure and reinforcement attribution.
 ///
 /// Trust is a Beta posterior over "this memory helps when used" (see
@@ -527,6 +557,12 @@ pub struct ScoringConfig {
     /// Minimum cosine similarity for an unverified memory to be eligible for a trial
     /// slot. Default 0.0 (no floor); to be calibrated on a dev split, never on test data.
     pub trial_min_cos: f32,
+    /// Ingest importance at or above which `AdmissionMode::QualityGate` admits a chunk
+    /// as `trial`; below it the chunk is stored hidden as `shadow`. Ignored under
+    /// `AdmitAll`. Range: [0.0, 1.0]. Default 0.50, which hides most realistic lessons
+    /// under the centroid-only scoring weights, so calibrate it on a dev split (never on
+    /// test data) before using `QualityGate`.
+    pub quality_gate_threshold: f32,
 }
 
 impl Default for ScoringConfig {
@@ -540,6 +576,7 @@ impl Default for ScoringConfig {
             admission: AdmissionMode::AdmitAll,
             trial_cap: 1,
             trial_min_cos: 0.0,
+            quality_gate_threshold: DEFAULT_QUALITY_GATE_THRESHOLD,
         }
     }
 }
@@ -632,7 +669,7 @@ impl Polarity {
 /// False negatives (missed contradictions) are harmless; false positives are handled
 /// by the quality-weighted archiving step in `resolve_contradictions_for_id`.
 pub fn detect_polarity(text: &str) -> Polarity {
-    let norm = normalize_text(text);
+    let norm = lexicon_text(text);
     let words: Vec<&str> = norm.split_whitespace().collect();
 
     const AFFIRMATIVE: &[&str] = &[
@@ -834,11 +871,14 @@ pub fn score_importance(features: &QualityFeatures, weights: &ScoringWeights) ->
         .clamp(0.0, 1.0)
 }
 
-pub fn decide_store(score: f32, dup_similarity: f32) -> IngestDecision {
+/// Admission decision for a scored chunk: `Reject` for an over-similar duplicate,
+/// `Active` when `score >= threshold` (see [`ScoringConfig::quality_gate_threshold`]),
+/// otherwise `Shadow`. A NaN threshold admits nothing, so callers validate it.
+pub fn decide_store(score: f32, dup_similarity: f32, threshold: f32) -> IngestDecision {
     if dup_similarity > 1.001 {
         return IngestDecision::Reject;
     }
-    if score >= 0.50 {
+    if score >= threshold {
         IngestDecision::Active
     } else {
         IngestDecision::Shadow
@@ -1031,9 +1071,27 @@ pub fn compute_gravity_radius(trust_ema: f64, reinforcement_count: i64, age_days
     trust * reinforcement_factor * age_stability
 }
 
-pub fn should_supersede(incoming_importance: f64, existing_gravity: f64) -> bool {
-    let threshold = 0.50 + 0.40 * existing_gravity.clamp(0.0, 1.0);
-    incoming_importance > threshold
+/// Whether the incoming memory displaces the existing one in a contradiction.
+///
+/// The decision rests on feedback evidence ([`compute_gravity_radius`]), not on ingest
+/// importance. Importance is now a weighted centroid cosine that rarely exceeds 0.5, so
+/// the old rule `importance > 0.50 + 0.40 * gravity` made the incoming memory lose to
+/// every incumbent, including one with no evidence at all, which hid corrections in
+/// favour of the lesson they correct. Now the side with more demonstrated value wins;
+/// on a tie (two unverified memories) the newer one wins, because a later statement is
+/// more likely to reflect the current state of the code.
+pub fn should_supersede(
+    incoming_gravity: f64,
+    existing_gravity: f64,
+    incoming_is_newer: bool,
+) -> bool {
+    let incoming = incoming_gravity.clamp(0.0, 1.0);
+    let existing = existing_gravity.clamp(0.0, 1.0);
+    if (incoming - existing).abs() <= 1e-9 {
+        incoming_is_newer
+    } else {
+        incoming > existing
+    }
 }
 
 /// Build quality metadata for a memory chunk.
@@ -1049,10 +1107,11 @@ pub fn build_quality_meta(
     source_kind: &str,
     weights: &ScoringWeights,
     prototypes: &ScoringPrototypes,
+    quality_gate_threshold: f32,
 ) -> (QualityMeta, IngestDecision) {
     let features = extract_features(embedding, content, prototypes, novelty);
     let score = score_importance(&features, weights);
-    let decision = decide_store(score, 1.0 - novelty);
+    let decision = decide_store(score, 1.0 - novelty, quality_gate_threshold);
     let polarity = detect_polarity(content);
 
     let state = ingest_state(&decision).to_string();
@@ -1624,10 +1683,14 @@ mod tests {
                 let t = posterior_trust(s, f);
                 assert_eq!(
                     should_quarantine(s, f),
-                    t < 0.40,
+                    t < HINT_THRESHOLD as f32,
                     "quarantine ({s},{f}) t={t}"
                 );
-                assert_eq!(meets_follow(s, f), t >= 0.70, "follow ({s},{f}) t={t}");
+                assert_eq!(
+                    meets_follow(s, f),
+                    t >= FOLLOW_THRESHOLD as f32,
+                    "follow ({s},{f}) t={t}"
+                );
                 let want = if t < 0.40 {
                     "quarantined"
                 } else if t >= 0.70 {
@@ -1731,6 +1794,90 @@ mod tests {
         assert_eq!(cfg.trial_cap, 1);
         assert_eq!(cfg.trial_min_cos, 0.0);
         assert_eq!(cfg.admission, AdmissionMode::AdmitAll);
+        assert_eq!(cfg.quality_gate_threshold, 0.50);
+    }
+
+    // ---- Step 8b-3: configurable gate, supersede rule, punctuation ----
+
+    #[test]
+    fn decide_store_uses_the_supplied_threshold() {
+        assert_eq!(decide_store(0.42, 0.0, 0.50), IngestDecision::Shadow);
+        assert_eq!(decide_store(0.42, 0.0, 0.40), IngestDecision::Active);
+        assert_eq!(decide_store(0.50, 0.0, 0.50), IngestDecision::Active);
+        // Duplicates are rejected whatever the threshold.
+        assert_eq!(decide_store(0.99, 1.5, 0.0), IngestDecision::Reject);
+    }
+
+    #[test]
+    fn quality_gate_threshold_changes_the_ingest_decision() {
+        let protos = ScoringPrototypes::neutral(3);
+        let emb = [1.0_f32, 0.0, 0.0];
+        let w = ScoringWeights::default();
+        let (meta, _) = build_quality_meta("plain note", &emb, 0.0, "agent", &w, &protos, 0.5);
+        let score = meta.importance_base;
+        let (_, strict) =
+            build_quality_meta("plain note", &emb, 0.0, "agent", &w, &protos, score + 0.01);
+        let (_, lenient) = build_quality_meta("plain note", &emb, 0.0, "agent", &w, &protos, score);
+        assert_eq!(strict, IngestDecision::Shadow);
+        assert_eq!(lenient, IngestDecision::Active);
+    }
+
+    #[test]
+    fn policy_threshold_constants_keep_their_documented_values() {
+        assert_eq!(FOLLOW_THRESHOLD, 0.70);
+        assert_eq!(HINT_THRESHOLD, 0.40);
+        assert_eq!(STRICT_FOLLOW_THRESHOLD, 0.80);
+        assert_eq!(STRICT_HINT_THRESHOLD, 0.50);
+        const {
+            assert!(
+                STRICT_FOLLOW_THRESHOLD > FOLLOW_THRESHOLD
+                    && STRICT_HINT_THRESHOLD > HINT_THRESHOLD
+            );
+        }
+    }
+
+    #[test]
+    fn should_supersede_follows_evidence_and_breaks_ties_by_recency() {
+        // Two unverified memories: the newer statement wins, the older one does not.
+        assert!(should_supersede(0.0, 0.0, true));
+        assert!(!should_supersede(0.0, 0.0, false));
+        // An incumbent that earned evidence beats an unverified newcomer.
+        let proven = compute_gravity_radius(posterior_trust(4, 0) as f64, 4, 40.0);
+        assert!(proven > 0.5, "gravity {proven}");
+        assert!(!should_supersede(0.0, proven, true));
+        // ...and an incoming memory with more evidence displaces a weaker incumbent.
+        assert!(should_supersede(proven, 0.0, false));
+    }
+
+    #[test]
+    fn trailing_punctuation_does_not_hide_lexicon_terms() {
+        assert_eq!(
+            detect_polarity("TLS verification disabled."),
+            Polarity::Negative
+        );
+        assert_eq!(detect_polarity("(never skip review)"), Polarity::Negative);
+        assert_eq!(detect_polarity("Always enable TLS,"), Polarity::Affirmative);
+        assert_eq!(detect_polarity("We don't use it."), Polarity::Negative);
+        // Typographic apostrophe folds to the ASCII lexicon entry.
+        assert_eq!(
+            detect_polarity("We don\u{2019}t use it."),
+            Polarity::Negative
+        );
+        assert_eq!(
+            negation_asymmetry("verification disabled.", "verification enabled"),
+            1
+        );
+        assert_eq!(negation_asymmetry("not ok!", "ok"), 1);
+        assert_eq!(negation_asymmetry("disabled.", "disabled"), 0);
+        assert_eq!(
+            NliChecker::lexical_label(
+                "always enable TLS verification",
+                "TLS verification disabled."
+            ),
+            NliLabel::Contradiction
+        );
+        // Fingerprint normalisation is untouched by the lexicon helper.
+        assert_eq!(normalize_text("Disabled."), "disabled.");
     }
 
     // ---- Step 8b-2: weights, lexicons, lexical gate, verdict source ----
@@ -1752,7 +1899,7 @@ mod tests {
         let protos = ScoringPrototypes::neutral(3);
         let emb = [1.0_f32, 0.0, 0.0];
         let w = ScoringWeights::default();
-        let (plain, _) = build_quality_meta("plain note", &emb, 0.0, "agent", &w, &protos);
+        let (plain, _) = build_quality_meta("plain note", &emb, 0.0, "agent", &w, &protos, 0.5);
         let (stuffed, _) = build_quality_meta(
             "tested confirmed verified measured benchmark metrics 123",
             &emb,
@@ -1760,6 +1907,7 @@ mod tests {
             "agent",
             &w,
             &protos,
+            0.5,
         );
         assert!(
             stuffed.evidence > plain.evidence,
