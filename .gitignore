@@ -20,3 +20,6 @@ mcp-server/target/
 mcp-server/__pycache__/
 dump.py
 rustup-init.exe
+
+# eval harness outputs (raw LLM transcripts)
+eval/results/
