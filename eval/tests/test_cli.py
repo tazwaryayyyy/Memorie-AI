@@ -56,7 +56,7 @@ def test_summarize_flags_ceiling_and_in_range(tmp_path, capsys):
     assert "15/15" in out and "OUT OF RANGE" in out and "Harden dev tasks" in out
     # 5 of 15 pass -> in range
     (tmp_path / "second").mkdir()
-    path = _fixture(tmp_path / "second", lambda t: "ref" if t.family == "tz_offsets" or t.session == 3 and t.family in ("keyset_pagination", "loop_closures") else "naive")
+    path = _fixture(tmp_path / "second", lambda t: "ref" if t.family == "http_status" or (t.session == 3 and t.family in ("lock_ordering", "wire_timestamp")) else "naive")
     main(["summarize", "--results", path])
     assert "IN RANGE" in capsys.readouterr().out
 
@@ -77,7 +77,7 @@ def _capture_client(monkeypatch):
             self._llm = None
 
         def complete(self, messages, seed=None):
-            fams = select_families(load_split("dev"), ["loop_closures"])
+            fams = select_families(load_split("dev"), ["wire_timestamp"])
             self._llm = self._llm or ScriptedLLM([t for f in fams for t in f.tasks])
             self.total_requests += 1
             return self._llm.complete(messages, seed)
@@ -90,7 +90,7 @@ def _capture_client(monkeypatch):
 def test_cli_defaults_do_not_send_api_seed_and_keep_large_max_tokens(tmp_path, monkeypatch):
     made = _capture_client(monkeypatch)
     out = str(tmp_path / "d.jsonl")
-    assert main(BASE + [out, "--families", "loop_closures", "--seeds", "5"]) == 0
+    assert main(BASE + [out, "--families", "wire_timestamp", "--seeds", "5"]) == 0
     assert made[0].kw["send_api_seed"] is False and made[0].kw["max_tokens"] == 4096
     rec = json.loads(open(out).readline())
     assert rec["seed"] == 5 and rec["send_api_seed"] is False  # seed still keys the run locally
@@ -99,7 +99,7 @@ def test_cli_defaults_do_not_send_api_seed_and_keep_large_max_tokens(tmp_path, m
 def test_cli_opt_in_flag_reaches_the_client_and_the_record(tmp_path, monkeypatch):
     made = _capture_client(monkeypatch)
     out = str(tmp_path / "o.jsonl")
-    assert main(BASE + [out, "--families", "loop_closures", "--send-api-seed"]) == 0
+    assert main(BASE + [out, "--families", "wire_timestamp", "--send-api-seed"]) == 0
     assert made[0].kw["send_api_seed"] is True
     assert json.loads(open(out).readline())["send_api_seed"] is True
 
@@ -107,9 +107,9 @@ def test_cli_opt_in_flag_reaches_the_client_and_the_record(tmp_path, monkeypatch
 def test_send_api_seed_is_part_of_the_run_fingerprint(tmp_path, monkeypatch):
     made = _capture_client(monkeypatch)
     out = str(tmp_path / "f.jsonl")
-    assert main(BASE + [out, "--families", "loop_closures"]) == 0
-    assert main(BASE + [out, "--families", "loop_closures", "--send-api-seed"]) == 3  # refuses to mix
-    fams = select_families(load_split("dev"), ["loop_closures"])
+    assert main(BASE + [out, "--families", "wire_timestamp"]) == 0
+    assert main(BASE + [out, "--families", "wire_timestamp", "--send-api-seed"]) == 3  # refuses to mix
+    fams = select_families(load_split("dev"), ["wire_timestamp"])
     assert _settings_for(fams).fingerprint(fams) != _settings_for(fams, send_api_seed=True).fingerprint(fams)
 
 

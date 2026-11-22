@@ -17,7 +17,7 @@ def settings(families, sessions=(1, 2, 3), **kw):
 
 def run(arm, tmp_path, families=None, choose=lambda t: "ref", declare=lambda n: [1] if n else [], seed=0,
         fake=None, events=None, name="r.jsonl", max_calls=0, results=None, llm=None):
-    families = families or select_families(DEV, ["loop_closures"])
+    families = families or select_families(DEV, ["wire_timestamp"])
     st = settings(families)
     fake = fake or FakeMemoire(events)
     tasks = [t for f in families for t in f.tasks]
@@ -38,7 +38,7 @@ def test_arm_a_touches_no_memory_and_prompt_has_no_notes(tmp_path):
     def boom():
         raise AssertionError("Arm A must not construct a memory store")
 
-    fams = select_families(DEV, ["loop_closures"])
+    fams = select_families(DEV, ["wire_timestamp"])
     st = settings(fams)
     tasks = [t for f in fams for t in f.tasks]
     llm = ScriptedLLM(tasks)
@@ -76,7 +76,7 @@ def test_arm_c1_reinforces_declared_on_pass_and_penalizes_declared_on_fail(tmp_p
     rei = [c for c in fake.calls if c[0] == "reinforce_declared"]
     assert len(pen) == 1 and len(pen[0][1][0]) == 2 and pen[0][1][1] == 1.0
     assert len(rei) == 4  # two declared notes x two passing sessions
-    assert {c[1][1] for c in rei} == {"loop_closures-s2-seed0", "loop_closures-s3-seed0"}
+    assert {c[1][1] for c in rei} == {"wire_timestamp-s2-seed0", "wire_timestamp-s3-seed0"}
     assert s1["feedback_events"][0]["op"] == "penalize" and s2["feedback_events"][0]["op"] == "reinforce"
     shown_keys = [r["key"] for r in s1["retrieved"]]
     assert s1["used_keys"] == [shown_keys[0], shown_keys[2]]
@@ -111,7 +111,7 @@ def test_hidden_test_grading_and_record_fields(tmp_path):
 
 def test_poison_enters_the_store_immediately_before_session_two_only(tmp_path):
     events = []
-    fams = select_families(DEV, ["loop_closures"])
+    fams = select_families(DEV, ["wire_timestamp"])
     run(ARM_C0, tmp_path, families=fams, events=events)
     fam = fams[0]
     timeline = []
@@ -122,8 +122,8 @@ def test_poison_enters_the_store_immediately_before_session_two_only(tmp_path):
             timeline.append(("run", args))
     bank = [("ingest", l.text) for l in fam.bank_lessons]
     assert timeline[:3] == bank
-    assert timeline[3:] == [("run", "loop_closures/s1"), ("ingest", fam.poison.text),
-                            ("run", "loop_closures/s2"), ("run", "loop_closures/s3")]
+    assert timeline[3:] == [("run", "wire_timestamp/s1"), ("ingest", fam.poison.text),
+                            ("run", "wire_timestamp/s2"), ("run", "wire_timestamp/s3")]
 
 
 def test_each_run_gets_a_fresh_store(tmp_path):
@@ -135,6 +135,6 @@ def test_each_run_gets_a_fresh_store(tmp_path):
 
 
 def test_seed_is_forwarded_and_part_of_the_key(tmp_path):
-    fams = select_families(DEV, ["loop_closures"])
+    fams = select_families(DEV, ["wire_timestamp"])
     _, _, llm, results = run(ARM_A, tmp_path, families=fams, seed=7)
     assert set(llm.seeds) == {7} and all(r["seed"] == 7 for r in results.ordered)

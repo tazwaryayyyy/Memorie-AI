@@ -9,7 +9,7 @@ from eval.tests.fakes import FakeMemoire, ScriptedLLM
 from eval.tests.test_arms_and_runner import run, settings
 
 DEV = load_split("dev")
-FAMS = select_families(DEV, ["loop_closures", "half_up_rounding"])
+FAMS = select_families(DEV, ["wire_timestamp", "fee_rounding"])
 FAIL_FIRST = lambda t: "naive" if t.session == 1 else "ref"
 
 
