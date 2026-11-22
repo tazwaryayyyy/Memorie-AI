@@ -23,6 +23,7 @@ class Task:
     entrypoints: Tuple[str, ...]
     reference: str          # full solution.py: must pass visible + hidden
     naive: str              # full solution.py: must pass visible, fail hidden
+    alternates: Tuple[str, ...] = ()  # other legitimate options: each must pass visible, fail hidden
 
     @property
     def task_id(self) -> str:
@@ -93,6 +94,7 @@ def build_family(
                 entrypoints=tuple(entry),
                 reference=expand(templates["reference"], params).strip() + "\n",
                 naive=expand(templates["naive"], params).strip() + "\n",
+                alternates=tuple(expand(t, params).strip() + "\n" for t in templates.get("alternates", ())),
             )
         )
     poison_params = variants[poison_session - 1]

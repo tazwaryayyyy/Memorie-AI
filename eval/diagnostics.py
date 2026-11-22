@@ -8,7 +8,7 @@ than a centroid cosine. Advisory only; it never gates anything. Cosine comes fro
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Mapping
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 # Copied from src/lib.rs::compute_prototypes; eval/tests/test_diagnostics.py parses lib.rs and
 # fails if these drift.
@@ -62,3 +62,50 @@ def exemplar_cosines(memoire_factory: Callable[[], Any], texts: Mapping[str, str
                 if entry["max_cos"] is None or score > entry["max_cos"]:
                     entry["max_cos"], entry["argmax"] = round(score, 4), sentence
     return results
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def quality_scores(memoire_factory: Callable[[], Any], texts: Mapping[str, str]) -> Dict[str, Optional[dict]]:
+    """Ingest-time quality score per text: the stored `importance_base` (weighted features under
+    the engine's default ScoringWeights) and `confidence`, read back through `export_namespace()`.
+
+    [Verified from src/quality.rs] with the default weights novelty and evidence weigh 0, so the
+    score depends only on the text's embedding vs the three prototype centroids, not on what else
+    is in the store or on ingestion order. A text that is a duplicate, was rejected or was split
+    into several chunks cannot be mapped back and maps to None.
+    """
+    memoire = memoire_factory()
+    for text in texts.values():
+        memoire.remember_ids(text)
+    stored = {_norm(m["content"]): m for m in memoire.export_namespace().get("memories", [])}
+    out: Dict[str, Optional[dict]] = {}
+    for key, text in texts.items():
+        row = stored.get(_norm(text))
+        out[key] = None if row is None else {
+            "importance_base": round(float(row["importance_base"]), 4),
+            "confidence": round(float(row["confidence"]), 4),
+        }
+    return out
+
+
+TAU_GRID = (0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60)
+
+
+def summarize_quality(lessons_by_key: Mapping[str, str], scores: Mapping[str, Optional[dict]]) -> Dict[str, dict]:
+    """Per lesson kind: count, min/mean/max importance_base and how many would be admitted
+    (`importance_base >= tau`) at each tau in TAU_GRID. `lessons_by_key` maps 'lesson:<fam>:<kind>' -> text."""
+    kinds: Dict[str, List[float]] = {}
+    for key in lessons_by_key:
+        info = scores.get(key)
+        if info is not None:
+            kinds.setdefault(key.rsplit(":", 1)[1], []).append(info["importance_base"])
+    return {
+        kind: {
+            "n": len(vals), "min": min(vals), "mean": round(sum(vals) / len(vals), 4), "max": max(vals),
+            "admitted": {f"{tau:.2f}": sum(v >= tau for v in vals) for tau in TAU_GRID},
+        }
+        for kind, vals in kinds.items()
+    }

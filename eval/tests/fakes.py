@@ -119,3 +119,56 @@ class ScriptedLLM:
                 text += f"USED_MEMORY: [{', '.join(str(u) for u in used)}]\n"
         return LLMResponse(text=text, prompt_tokens=100, completion_tokens=50, latency_s=0.01,
                            attempts=1, model_returned="scripted-1", finish_reason="stop")
+
+
+class EngineModel:
+    """Python mirror of the Rust exposure / quarantine rules, for timeline reasoning only.
+
+    Mirrors src/quality.rs (posterior_trust Beta(2,2), should_quarantine `2f > 3s + 2`,
+    meets_follow `3s >= 8 + 7f`) and src/store.rs (`unverified` = s+f == 0, `exposure_label`,
+    `select_with_trial_cap`, final score = 0.75 sim + 0.20 trust). Recency and decay are ignored.
+    eval/tests/test_native_integration.py asserts the same facts against the real engine; if that
+    test ever disagrees with this class, this class is wrong.
+    """
+
+    def __init__(self, sims: dict, trial_cap: int = 1, k: int = 3) -> None:
+        self.sims, self.trial_cap, self.k = dict(sims), trial_cap, k
+        self.s: dict = {}
+        self.f: dict = {}
+        self.hidden: set = set()
+
+    def add(self, key: str) -> None:
+        self.s[key], self.f[key] = 0, 0
+
+    @staticmethod
+    def posterior(s: int, f: int) -> float:
+        return (2 + s) / (4 + s + f)
+
+    def exposure(self, key: str) -> str:
+        if key in self.hidden:
+            return "hidden"
+        s, f = self.s[key], self.f[key]
+        if s + f == 0:
+            return "trial"
+        return "follow" if 3 * s >= 8 + 7 * f else "hint"
+
+    def reinforce(self, key: str) -> None:
+        self.s[key] += 1
+
+    def penalize(self, keys) -> None:
+        for key in keys:
+            if key in self.hidden:
+                continue
+            self.f[key] += 1
+            if 2 * self.f[key] > 3 * self.s[key] + 2:
+                self.hidden.add(key)
+
+    def recall(self) -> list:
+        live = [key for key in self.s if key not in self.hidden]
+        score = {key: 0.75 * self.sims.get(key, 0.0) + 0.20 * self.posterior(self.s[key], self.f[key]) for key in live}
+        verified = sorted((k for k in live if self.s[k] + self.f[k] > 0), key=lambda k: -score[k])
+        trial = sorted((k for k in live if self.s[k] + self.f[k] == 0), key=lambda k: -score[k])
+        max_trial = min(self.trial_cap, self.k)
+        n_trial = min(len(trial), max_trial) if not verified else (0 if self.k < 2 else min(len(trial), max_trial, self.k - 1))
+        n_verified = min(len(verified), max(self.k - n_trial, 0))
+        return sorted(verified[:n_verified] + trial[:n_trial], key=lambda k: -score[k])

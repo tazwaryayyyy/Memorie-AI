@@ -69,45 +69,58 @@ def test_entrypoints_are_defined_in_stub_and_tests_do_not_leak(task):
     assert "Hidden" not in task.spec + task.solution_stub + task.visible_tests
 
 
-# ---- Step 8c-2: convention-family fairness guards ---------------------------------------------
+# ---- Step 8c-3: single-choice convention families -------------------------------------------
 
-# Tokens that carry the convention. They must be in the gold lesson, must NOT be in the wrong
-# lesson, and must NOT be recoverable from anything the agent sees without memory.
+from eval.tasks.design import DESIGN  # noqa: E402
+
+# Tokens that carry the gold choice. They must be in the gold lesson, must NOT be in the wrong
+# lesson, and must NOT be recoverable from anything the agent sees without memory. `must_not`
+# tokens belong to the alternative the wrong lesson states.
 CONVENTION = {
-    "wire_timestamp": (["Z suffix", "three fractional digits"], ["+00:00"]),
-    "lock_ordering": (["modulo 16"], []),
-    "fee_rounding": (["up to the next cent"], ["half-up"]),
-    "cache_key_format": (["kv3:", "%25", "%3A"], ["cache:v1"]),
-    "http_status": (["422", "503"], ["504"]),
-    "money_wire": (["amount_minor"], ["amount as a string"]),
-    "idempotency_key": (["idem_", "32 hex"], ["full hex digest"]),
-    "retry_backoff": (["half a second", "30 seconds"], ["60 seconds"]),
+    "wire_timestamp": (["literal Z"], ["+00:00"]),
+    "lock_ordering": (["lower account id first"], ["higher account id first"]),
+    "fee_rounding": (["nearest even cent"], ["ROUND_HALF_UP"]),
+    "cache_key_format": (["only the tenant is lowercased"], ["every part lowercased"]),
+    "http_status": (["422"], ["400"]),
+    "money_wire": (["integer count of minor units"], ["decimal strings in the major unit"]),
+    "percentile_method": (["nearest-rank"], ["linear interpolation"]),
+    "retry_backoff": (["doubles the wait"], ["grows the wait linearly"]),
     "cursor_ties": (["id ascending"], ["both descending"]),
-    "semver_bump": (["major version is 0"], ["always increments the major"]),
-    "slug_rules": (["40 characters", "untitled"], ["no length limit"]),
-    "event_tiebreak": (["system first"], ["alphabetically"]),
-    "histogram_bucket": (["upper-inclusive"], ["lower-inclusive"]),
+    "semver_bump": (["minor number for a breaking change"], ["next major number"]),
+    "slug_separator": (["single underscore"], ["single hyphen"]),
+    "event_tiebreak": (["order they arrived"], ["by seq ascending"]),
+    "histogram_bucket": (["lower-inclusive"], ["upper-inclusive"]),
 }
 LEAK_TOKENS = {
-    "wire_timestamp": ["%f", ".000", "[:3]", "// 1000"],
-    "lock_ordering": ["% 16", "%16", "shard"],
-    "fee_rounding": ["CEILING", "ROUND_UP", "per line,", "ceil"],
-    "cache_key_format": ["kv3", "%25", "%3A"],
-    "http_status": ["422", "503"],
-    "money_wire": ["amount_minor", "minor unit"],
-    "idempotency_key": ["idem_", "sha256", "[:32]"],
-    "retry_backoff": ["0.5", "** ", "30.0"],
+    "wire_timestamp": ["literal Z", "ends with Z"],
+    "lock_ordering": ["sorted(", "lower account id", "ascending", "descending"],
+    "fee_rounding": ["HALF_EVEN", "HALF_UP", "banker", "nearest even"],
+    "cache_key_format": ["only the tenant", "tenant.lower"],
+    "http_status": ["422"],
+    "money_wire": ["minor unit", "cents"],
+    "percentile_method": ["nearest", "ceil", "interpol"],
+    "retry_backoff": ["doubl", "2.0 **", "** "],
     "cursor_ties": ["ascending", "id asc"],
-    "semver_bump": ["0.5.0", "pre-1.0 policy"],
-    "slug_rules": ["untitled", "[:40]", "40"],
-    "event_tiebreak": ["priority", "system first"],
-    "histogram_bucket": ["bisect", "inclusive"],
+    "semver_bump": ["0.5.0", "minor number"],
+    "slug_separator": ["underscore", "creme_brulee"],
+    "event_tiebreak": ["arrival", "stable"],
+    "histogram_bucket": ["bisect", "lower-inclusive", "upper-inclusive"],
 }
 ARM_A_VISIBLE = lambda t: "\n".join((t.spec, t.solution_stub, t.visible_tests))
 
 
-def test_every_family_has_convention_metadata():
-    assert {f.name for f in ALL_FAMILIES} == set(CONVENTION) == set(LEAK_TOKENS)
+def test_every_family_has_convention_and_design_metadata():
+    assert {f.name for f in ALL_FAMILIES} == set(CONVENTION) == set(LEAK_TOKENS) == set(DESIGN)
+    for fam in ALL_FAMILIES:
+        d = DESIGN[fam.name]
+        assert d["split"] == fam.split and d["gold"] in d["options"] and 2 <= len(d["options"]) <= 3, fam.name
+
+
+def test_test_split_gold_choices_follow_the_preregistered_parity_rule():
+    for index, fam in enumerate(TEST, start=1):
+        d = DESIGN[fam.name]
+        assert d["position"] == index, fam.name
+        assert d["gold_is"] == ("common" if index % 2 == 1 else "less-common"), fam.name
 
 
 def test_every_spec_declares_an_undocumented_convention_without_stating_it():
@@ -116,26 +129,34 @@ def test_every_spec_declares_an_undocumented_convention_without_stating_it():
         assert "Convention note:" in flat and "not documented in this" in flat, task.task_id
 
 
-def test_gold_states_the_convention_and_wrong_states_the_alternative():
+def test_gold_states_the_choice_and_wrong_states_the_alternative():
     for fam in ALL_FAMILIES:
-        gold = fam.lessons[0].text
-        wrong = fam.lessons[2].text
+        gold, wrong = fam.lessons[0].text, fam.lessons[2].text
         must, must_not = CONVENTION[fam.name]
         assert all(tok in gold for tok in must), (fam.name, [t for t in must if t not in gold])
         assert not any(tok in wrong for tok in must), fam.name
-        assert all(tok in wrong or tok in fam.poison.text for tok in must_not), (fam.name, must_not)
+        assert all(tok in wrong for tok in must_not), (fam.name, must_not)
         assert not any(tok in gold for tok in must_not), fam.name
 
 
-def test_the_convention_cannot_be_read_off_agent_visible_material():
+def test_the_choice_cannot_be_read_off_agent_visible_material():
     for task in ALL_TASKS:
         text = ARM_A_VISIBLE(task)
         leaked = [t for t in LEAK_TOKENS[task.family] if t in text]
         assert not leaked, (task.task_id, leaked)
 
 
-def test_visible_tests_do_not_discriminate_the_reference_from_the_naive_solution():
-    # Same as the contract test, stated as the fairness property: both pass visible, only one hidden.
-    for fam in ALL_FAMILIES:
-        task = fam.tasks[0]
-        assert grade(task, task.reference).visible.ok and grade(task, task.naive).visible.ok
+@pytest.mark.parametrize("task", [t for t in ALL_TASKS if t.alternates], ids=lambda t: t.task_id)
+def test_every_other_legitimate_option_passes_visible_and_fails_hidden(task):
+    for code in task.alternates:
+        result = grade(task, code)
+        assert result.visible.ok, f"visible tests must be neutral across options:\n{result.visible.output}"
+        assert not result.hidden.ok and not result.hidden.timed_out
+
+
+def test_three_option_families_cover_every_option_with_naive_plus_alternates():
+    three = [n for n, d in DESIGN.items() if len(d["options"]) == 3]
+    assert set(three) == {"lock_ordering", "cache_key_format"}
+    for name in three:
+        fam = next(f for f in ALL_FAMILIES if f.name == name)
+        assert all(t.alternates for t in fam.tasks), name

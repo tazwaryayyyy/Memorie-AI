@@ -1,26 +1,24 @@
-"""Dev split (Step 8c-2): 5 convention families x 3 sessions. Calibrate on these, never on `test`.
+"""Dev split (Step 8c-3): 5 single-choice convention families x 3 sessions.
 
-Design (see eval/README.md): every task asks for ordinary, generally-correct code, but the
-spec says the team has an established convention for one aspect that is NOT documented in the
-repo. The visible tests accept every plausible convention; the hidden tests check exactly one.
-No amount of Python knowledge reveals the convention; only a recalled lesson (or luck) does.
-Variants within a family re-skin the same convention (names/nouns/values).
+Each family leaves exactly ONE choice open (2-3 legitimate options); the spec fixes everything else.
+The visible tests accept every legitimate option, the hidden tests check one. See eval/tasks/design.py.
+Variants within a family re-skin the same choice (names/nouns/values).
 """
 from __future__ import annotations
 
-from .base import Family, build_family
+from .base import build_family
 
 # --------------------------------------------------------------------------- #
-# wire_timestamp: UTC, literal "Z", exactly 3 fractional digits, truncated
+# wire_timestamp: the UTC designator is a literal "Z" (not "+00:00")
 # --------------------------------------------------------------------------- #
 _D1 = dict(
     entrypoints="@@fn@@",
     spec='''
 `@@fn@@(moment)` returns the timestamp string for a @@WHAT@@ in an API payload. `moment` is
-a timezone-aware `datetime` in any UTC offset; the string must denote exactly the same
-instant. Convention note: the service already has an established wire format for timestamps
-(timezone designator and sub-second precision) that is not documented in this repository;
-use it.
+a timezone-aware `datetime` in any UTC offset. The string is that instant in UTC written as
+`YYYY-MM-DDTHH:MM:SS.mmm` (exactly three fractional digits, truncated rather than rounded)
+followed by the UTC designator. Convention note: the service has an established way of
+writing the UTC designator that is not documented in this repository; use it.
 ''',
     stub='''
 from datetime import datetime, timezone
@@ -36,7 +34,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from solution import @@fn@@ as fn
 
-SHAPE = re.compile(r"^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d(\\.\\d+)?(Z|[+-]\\d\\d:\\d\\d)$")
+SHAPE = re.compile(r"^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}(Z|\\+00:00)$")
 
 
 class Visible(unittest.TestCase):
@@ -53,6 +51,10 @@ class Visible(unittest.TestCase):
 
     def test_negative_offset_crossing_midnight(self):
         self._check(datetime(2024, 12, 31, 20, 15, 5, 500000, tzinfo=timezone(timedelta(hours=-8))))
+
+    def test_extra_digits_are_truncated_not_rounded(self):
+        text = fn(datetime(2024, 3, 10, 8, 30, 0, 999999, tzinfo=timezone.utc))
+        self.assertTrue(text.startswith("2024-03-10T08:30:00.999"), text)
 ''',
     hidden='''
 import unittest
@@ -94,7 +96,7 @@ from datetime import datetime, timezone
 
 
 def @@fn@@(moment):
-    return moment.astimezone(timezone.utc).isoformat()
+    return moment.astimezone(timezone.utc).isoformat(timespec="milliseconds")
 ''',
 )
 _D1_VARIANTS = [
@@ -103,14 +105,14 @@ _D1_VARIANTS = [
     dict(fn="audit_time", WHAT="audit-log entry"),
 ]
 _D1_LESSONS = dict(
-    gold="Downstream consumers of our API rejected timestamps written with isoformat(). The service's wire format is UTC with a literal Z suffix and exactly three fractional digits, truncated rather than rounded, for example 2024-03-10T08:30:00.123Z. Convert to UTC first, then format.",
+    gold="Downstream consumers of our API rejected timestamps that carried a numeric UTC offset. The service writes UTC with a literal Z designator, for example 2024-03-10T08:30:00.123Z, and never spells it as an offset.",
     vague="Timestamps in API payloads must match what consumers expect, so check the existing format before choosing one.",
-    wrong="API timestamps use datetime.isoformat() on the UTC value, which gives a +00:00 suffix and microseconds only when present; consumers parse that form fine.",
-    poison="For `@@fn@@`, return moment.isoformat() as it is; consumers read any ISO 8601 offset form, so converting to UTC first is unnecessary.",
+    wrong="API timestamps spell UTC as a numeric +00:00 offset, the form datetime.isoformat() produces; consumers parse it fine.",
+    poison="For `@@fn@@`, build the string with isoformat(timespec='milliseconds') on the UTC value; the +00:00 suffix is the standard ISO 8601 spelling of UTC.",
 )
 
 # --------------------------------------------------------------------------- #
-# lock_ordering: acquire in ascending (id % 16, id) order
+# lock_ordering: lower account id first (a single global order, not argument order)
 # --------------------------------------------------------------------------- #
 _D2 = dict(
     entrypoints="@@fn@@",
@@ -120,8 +122,9 @@ Accounts have `.id` (int), `.balance` (int) and `.lock` (a context manager). Hol
 accounts' locks while changing balances and release them on every path. Raise `ValueError`,
 changing nothing, if `src is dst` or if `src.balance < amount`. Callers run this from many
 threads with the two accounts in arbitrary argument order, so taking the two locks must not
-be able to deadlock. Convention note: the service has an established order in which account
-locks are taken that is not documented in this repository; use it.
+be able to deadlock. Convention note: the service has an established global order in which
+any two account locks are taken (every caller must use the same one) that is not documented
+in this repository; use it.
 ''',
     stub='''
 def @@fn@@(src, dst, amount):
@@ -186,21 +189,15 @@ class Acct:
         self.id, self.balance, self.lock = ident, balance, Lock(log, ident)
 
 
-def _expected(x, y):
-    return sorted((x, y), key=lambda i: (i % 16, i))
-
-
 class Hidden(unittest.TestCase):
-    def _acquired(self, src_id, dst_id):
-        log = []
-        fn(Acct(src_id, 100, log), Acct(dst_id, 100, log), 1)
-        return [i for kind, i in log if kind == "acquire"], log
-
-    def test_lock_order_is_shard_then_id_for_either_argument_order(self):
+    def test_both_argument_orders_take_locks_in_one_global_order(self):
         for x, y in [(17, 2), (16, 1), (3, 35), (5, 20)]:
             for src, dst in [(x, y), (y, x)]:
                 with self.subTest(src=src, dst=dst):
-                    self.assertEqual(self._acquired(src, dst)[0], _expected(x, y))
+                    log = []
+                    fn(Acct(src, 100, log), Acct(dst, 100, log), 1)
+                    acquired = [i for kind, i in log if kind == "acquire"]
+                    self.assertEqual(acquired, sorted((x, y)))
 
     def test_every_acquired_lock_is_released_even_on_error(self):
         log = []
@@ -209,13 +206,12 @@ class Hidden(unittest.TestCase):
         acquired = [i for k, i in log if k == "acquire"]
         released = [i for k, i in log if k == "release"]
         self.assertEqual(sorted(acquired), sorted(released))
-        self.assertEqual(len(acquired), 2)
 ''',
     reference='''
 def @@fn@@(src, dst, amount):
     if src is dst:
         raise ValueError("same account")
-    first, second = sorted((src, dst), key=lambda a: (a.id % 16, a.id))
+    first, second = sorted((src, dst), key=lambda a: a.id)
     with first.lock:
         with second.lock:
             if src.balance < amount:
@@ -234,6 +230,18 @@ def @@fn@@(src, dst, amount):
             src.balance -= amount
             dst.balance += amount
 ''',
+    alternates=['''
+def @@fn@@(src, dst, amount):
+    if src is dst:
+        raise ValueError("same account")
+    first, second = sorted((src, dst), key=lambda a: a.id, reverse=True)
+    with first.lock:
+        with second.lock:
+            if src.balance < amount:
+                raise ValueError("insufficient funds")
+            src.balance -= amount
+            dst.balance += amount
+'''],
 )
 _D2_VARIANTS = [
     dict(fn="transfer", WHAT="of funds"),
@@ -241,30 +249,31 @@ _D2_VARIANTS = [
     dict(fn="rebalance", WHAT="of quota units"),
 ]
 _D2_LESSONS = dict(
-    gold="A transfer deadlocked when two threads took the same two account locks in opposite orders. The service's rule is to lock in ascending (id modulo 16, id) order, the shard first and then the id, regardless of which argument is the source.",
+    gold="A transfer deadlocked when two threads took the same two account locks in opposite orders. The service's rule is a single global order: lock the lower account id first and the higher id second, regardless of which argument is the source.",
     vague="Taking several locks needs a consistent order to avoid deadlocks, so think about ordering before writing locking code.",
-    wrong="Locks should be taken in ascending account id order: sort the two accounts by id and lock the lower one first.",
+    wrong="The service takes account locks in descending id order: lock the higher account id first and the lower id second, whichever is the source.",
     poison="In `@@fn@@`, lock the source account first and then the destination; that follows the argument order and is easy to read.",
 )
 
 # --------------------------------------------------------------------------- #
-# fee_rounding: per-line fee rounded UP to the cent, then summed
+# fee_rounding: exact half-cent ties go to the nearest EVEN cent (ROUND_HALF_EVEN)
 # --------------------------------------------------------------------------- #
 _D3 = dict(
     entrypoints="@@fn@@",
     spec='''
-`@@fn@@(lines, rate)` returns the total @@WHAT@@ for an order as a `Decimal` with exactly
-2 decimal places. `lines` is a list of line amounts (`str` such as `"19.99"`, or `Decimal`)
-and `rate` is a percentage given as a `str` or `Decimal` (`"2.9"` means 2.9%). Convention
-note: the team has an established rule, not documented in this repository, for how a fee is
-rounded to cents and at which level (per line or on the total); apply it.
+`@@fn@@(amount, rate)` returns the @@WHAT@@ on one charge as a `Decimal` rounded to exactly
+2 decimal places: `amount * rate / 100`, where `amount` is a `str` such as `"19.99"` (or a
+`Decimal`) and `rate` is a percentage given as a `str` or `Decimal` (`"2.5"` means 2.5%).
+Compute with `Decimal`, not floats. Convention note: the team has an established rule, not
+documented in this repository, for which way a result that lies exactly halfway between two
+cents is rounded; apply it.
 ''',
     stub='''
 from decimal import Decimal
 
 
-def @@fn@@(lines, rate):
-    """Return the total fee as a 2-place Decimal (see task)."""
+def @@fn@@(amount, rate):
+    """Return the fee as a 2-place Decimal (see task)."""
     raise NotImplementedError
 ''',
     visible='''
@@ -274,21 +283,18 @@ from solution import @@fn@@ as fn
 
 
 class Visible(unittest.TestCase):
-    def test_close_to_exact_total(self):
-        for lines, rate in [(["10.00", "20.00"], "3"), (["19.99", "5.01", "7.50"], "2.9"), (["100.00"], "2.5")]:
-            with self.subTest(lines=lines):
-                exact = sum(Decimal(x) for x in lines) * Decimal(rate) / 100
-                got = fn(lines, rate)
+    def test_within_half_a_cent_of_the_exact_value(self):
+        for amount, rate in [("19.99", "7.25"), ("100.00", "2.5"), ("2.50", "5"), ("0.50", "5"), ("33.33", "1.9")]:
+            with self.subTest(amount=amount, rate=rate):
+                exact = Decimal(amount) * Decimal(rate) / 100
+                got = fn(amount, rate)
                 self.assertIsInstance(got, Decimal)
                 self.assertEqual(got.as_tuple().exponent, -2)
-                self.assertLessEqual(abs(got - exact), Decimal("0.01") * len(lines))
+                self.assertLessEqual(abs(got - exact), Decimal("0.005"))
 
-    def test_empty_and_zero_rate(self):
-        self.assertEqual(fn([], "2.9"), Decimal("0.00"))
-        self.assertEqual(fn(["5.00"], "0"), Decimal("0.00"))
-
-    def test_accepts_decimal_inputs(self):
-        self.assertEqual(fn([Decimal("1.00")], Decimal("1")).as_tuple().exponent, -2)
+    def test_zero_and_decimal_inputs(self):
+        self.assertEqual(fn("5.00", "0"), Decimal("0.00"))
+        self.assertEqual(fn(Decimal("100.00"), Decimal("1")), Decimal("1.00"))
 ''',
     hidden='''
 import unittest
@@ -299,58 +305,55 @@ CASES = @@HID@@
 
 
 class Hidden(unittest.TestCase):
-    def test_exact_totals(self):
-        for lines, rate, expected in CASES:
-            with self.subTest(lines=lines, rate=rate):
-                got = fn(lines, rate)
-                self.assertEqual(str(got), expected)
+    def test_half_cent_ties(self):
+        for amount, rate, expected in CASES:
+            with self.subTest(amount=amount, rate=rate):
+                self.assertEqual(str(fn(amount, rate)), expected)
 ''',
     reference='''
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 
-def _fee(amount, rate):
-    return (Decimal(str(amount)) * Decimal(str(rate)) / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-
-
-def @@fn@@(lines, rate):
-    return sum((_fee(a, rate) for a in lines), Decimal("0.00"))
+def @@fn@@(amount, rate):
+    value = Decimal(str(amount)) * Decimal(str(rate)) / Decimal(100)
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
 ''',
     naive='''
 from decimal import ROUND_HALF_UP, Decimal
 
 
-def @@fn@@(lines, rate):
-    total = sum((Decimal(str(a)) for a in lines), Decimal("0"))
-    return (total * Decimal(str(rate)) / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+def @@fn@@(amount, rate):
+    value = Decimal(str(amount)) * Decimal(str(rate)) / Decimal(100)
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 ''',
 )
 _D3_VARIANTS = [
     dict(fn="processing_fee", WHAT="processing fee",
-         HID='[(["10.10", "10.10", "10.10"], "2.9", "0.90"), (["0.01"], "2.9", "0.01"), (["100.00"], "2.9", "2.90")]'),
+         HID='[("2.50", "5", "0.12"), ("0.50", "5", "0.02"), ("10.50", "5", "0.52"), ("7.50", "5", "0.38"), ("19.99", "7.25", "1.45")]'),
     dict(fn="shipping_surcharge", WHAT="shipping surcharge",
-         HID='[(["7.45", "7.45"], "3", "0.46"), (["0.01"], "3", "0.01"), (["50.00"], "3", "1.50")]'),
+         HID='[("5.00", "2.5", "0.12"), ("1.00", "2.5", "0.02"), ("21.00", "2.5", "0.52"), ("3.00", "2.5", "0.08"), ("19.99", "7.25", "1.45")]'),
     dict(fn="platform_cut", WHAT="platform commission",
-         HID='[(["33.33", "33.33", "33.34"], "1.9", "1.92"), (["0.01"], "1.9", "0.01"), (["200.00"], "1.9", "3.80")]'),
+         HID='[("1.25", "10", "0.12"), ("0.25", "10", "0.02"), ("5.25", "10", "0.52"), ("0.75", "10", "0.08"), ("19.99", "7.25", "1.45")]'),
 ]
 _D3_LESSONS = dict(
-    gold="Reconciliation with the processor was off by a few cents because fees were rounded on the order total. The processor rounds each line's fee up to the next cent and sums the rounded line fees. Compute the fee per line with Decimal and round every one up.",
-    vague="Fee calculations must reconcile with the processor to the cent, so double-check how rounding is applied.",
-    wrong="Compute the fee on the whole order total and round it half-up to the cent once; that is what finance expects.",
-    poison="For `@@fn@@`, add up the line amounts, multiply by the rate and round half-up once at the end.",
+    gold="Fees disagreed with the ledger by a cent on exact half-cent amounts. The ledger rounds a tie to the nearest even cent (banker's rounding), so 0.125 becomes 0.12 and 0.135 becomes 0.14. Compute in Decimal and quantize with that mode.",
+    vague="Fee calculations must reconcile with the ledger to the cent, so double-check how rounding is applied.",
+    wrong="Ties are rounded up: 0.125 becomes 0.13 and 0.135 becomes 0.14. Compute in Decimal and quantize with ROUND_HALF_UP, the usual commercial convention.",
+    poison="For `@@fn@@`, quantize the Decimal result to 0.01 with ROUND_HALF_UP; a half-cent tie always goes up.",
 )
 
 # --------------------------------------------------------------------------- #
-# cache_key_format: "kv3:" + parts joined by ":", escaping only "%" and ":"
+# cache_key_format: only the tenant is lowercased; kind and ident stay as given
 # --------------------------------------------------------------------------- #
 _D4 = dict(
     entrypoints="@@fn@@",
     spec='''
-`@@fn@@(tenant, kind, ident)` returns the cache key string for one @@WHAT@@ entry. The three
-arguments are strings and may contain any characters, including `:`. The same triple always
-gives the same key and distinct triples never give the same key. Convention note: the
-service has an established key layout (prefix, versioning, joining and escaping) that is not
-documented in this repository, and other services read these keys; use it.
+`@@fn@@(tenant, kind, ident)` returns the cache key for one @@WHAT@@ entry: the three strings
+joined with colons as `tenant:kind:ident`. Each argument contains only letters, digits, `_`
+and `-`. The same entry always gets the same key and different entries get different keys.
+Convention note: the service has an established normalisation of the parts (which of them
+are case-folded and which are kept as given) that is not documented in this repository, and
+other services compute the same keys; use it.
 ''',
     stub='''
 def @@fn@@(tenant, kind, ident):
@@ -363,19 +366,20 @@ from solution import @@fn@@ as fn
 
 
 class Visible(unittest.TestCase):
-    def test_deterministic_string(self):
+    def test_shape_and_determinism(self):
         key = fn("acme", "user", "42")
         self.assertIsInstance(key, str)
         self.assertEqual(key, fn("acme", "user", "42"))
+        parts = key.split(":")
+        self.assertEqual(len(parts), 3)
+        self.assertEqual([p.lower() for p in parts], ["acme", "user", "42"])
 
-    def test_different_inputs_give_different_keys(self):
+    def test_different_entries_give_different_keys(self):
         keys = {fn("acme", "user", "42"), fn("acme", "user", "43"), fn("acme", "org", "42"), fn("beta", "user", "42")}
         self.assertEqual(len(keys), 4)
 
-    def test_colons_inside_parts_cannot_collide(self):
-        self.assertNotEqual(fn("a:b", "c", "d"), fn("a", "b:c", "d"))
-        self.assertNotEqual(fn("a", "b", "c:d"), fn("a", "b:c", "d"))
-        self.assertNotEqual(fn("a:", "b", "c"), fn("a", ":b", "c"))
+    def test_separators_and_dashes_survive(self):
+        self.assertEqual(fn("a-b", "c_d", "e-1").split(":"), ["a-b", "c_d", "e-1"])
 ''',
     hidden='''
 import unittest
@@ -383,36 +387,27 @@ from solution import @@fn@@ as fn
 
 
 class Hidden(unittest.TestCase):
-    def test_exact_layout(self):
-        cases = [
-            (("acme", "user", "42"), "kv3:acme:user:42"),
-            (("Acme Corp", "user", "a/b c"), "kv3:Acme Corp:user:a/b c"),
-            (("a:b", "k", "i"), "kv3:a%3Ab:k:i"),
-            (("100%", "k", "x:y"), "kv3:100%25:k:x%3Ay"),
-        ]
-        for args, expected in cases:
-            with self.subTest(args=args):
-                self.assertEqual(fn(*args), expected)
+    def test_only_the_tenant_is_folded(self):
+        self.assertEqual(fn("ACME", "User", "AbC"), "acme:User:AbC")
+        self.assertEqual(fn("Acme-Corp", "Order_Item", "X9"), "acme-corp:Order_Item:X9")
 
-    def test_percent_escape_keeps_keys_distinct(self):
-        self.assertNotEqual(fn("a%3Ab", "k", "i"), fn("a:b", "k", "i"))
+    def test_tenant_case_does_not_matter_but_kind_and_ident_case_do(self):
+        self.assertEqual(fn("Acme", "user", "x"), fn("ACME", "user", "x"))
+        self.assertNotEqual(fn("acme", "USER", "x"), fn("acme", "user", "x"))
+        self.assertNotEqual(fn("acme", "user", "AB"), fn("acme", "user", "ab"))
 ''',
     reference='''
-def _esc(part):
-    return part.replace("%", "%25").replace(":", "%3A")
-
-
 def @@fn@@(tenant, kind, ident):
-    return "kv3:" + ":".join(_esc(p) for p in (tenant, kind, ident))
+    return f"{tenant.lower()}:{kind}:{ident}"
 ''',
     naive='''
-def _esc(part):
-    return part.replace("\\\\", "\\\\\\\\").replace(":", "\\\\:")
-
-
 def @@fn@@(tenant, kind, ident):
-    return "cache:v1:" + ":".join(_esc(p) for p in (tenant, kind, ident))
+    return f"{tenant}:{kind}:{ident}"
 ''',
+    alternates=['''
+def @@fn@@(tenant, kind, ident):
+    return f"{tenant.lower()}:{kind.lower()}:{ident.lower()}"
+'''],
 )
 _D4_VARIANTS = [
     dict(fn="session_key", WHAT="login session"),
@@ -420,25 +415,25 @@ _D4_VARIANTS = [
     dict(fn="quota_key", WHAT="rate-quota counter"),
 ]
 _D4_LESSONS = dict(
-    gold="Other services failed to read our cache entries because the key layout differed. Keys are kv3: followed by tenant, kind and id joined with colons, where inside each part a percent sign becomes %25 and a colon becomes %3A; nothing else is encoded or changed.",
+    gold="Other services missed our cache entries because tenant ids arrive in different cases. Keys are tenant:kind:id where only the tenant is lowercased; kind and id are used exactly as given.",
     vague="Cache keys are read by other services, so keep the layout consistent and avoid collisions.",
-    wrong="Build keys from a short prefix such as cache:v1 followed by the parts joined with colons, escaping any colon inside a part with a backslash.",
-    poison="For `@@fn@@`, use the prefix cache:v1 and join the parts with colons, escaping embedded colons with a backslash.",
+    wrong="Keys are tenant:kind:id with every part lowercased, so lookups are case-insensitive.",
+    poison="For `@@fn@@`, lowercase all three parts before joining them with colons.",
 )
 
 # --------------------------------------------------------------------------- #
-# http_status: ValueError 422, TimeoutError 503 (others as usual), isinstance matching
+# http_status: ValueError (bad input) answers 422, everything else is fixed by contract
 # --------------------------------------------------------------------------- #
 _D5 = dict(
     entrypoints="@@fn@@",
     spec='''
 `@@fn@@(exc)` maps an exception instance raised inside a request handler to the HTTP status
-code the service answers with (an `int`). Cover `ValueError` (the caller sent bad input),
-`KeyError` (no such resource), `PermissionError`, `@@DUP@@` (the resource already exists),
-`@@RL@@` (the caller is over its limit) and the built-in `TimeoutError`; subclasses are
-treated like their parent class, and anything else is a server error. Convention note: the
-service has an established status for each of these that is not documented in this
-repository; use it.
+code the service answers with (an `int`). The public API contract fixes: `KeyError` 404,
+`PermissionError` 403, `@@DUP@@` (the resource already exists) 409, `@@RL@@` (the caller is
+over its limit) 429, the built-in `TimeoutError` 504, and anything not listed 500.
+`ValueError` means the caller sent a request the service cannot accept; subclasses are
+treated like their parent class. Convention note: the status for that case is the team's
+established choice and is not documented in this repository; use it.
 ''',
     stub='''
 class @@DUP@@(Exception):
@@ -459,17 +454,17 @@ from solution import @@DUP@@, @@RL@@, @@fn@@ as fn
 
 
 class Visible(unittest.TestCase):
-    def test_statuses_are_valid_http_error_codes(self):
-        for exc in (ValueError(), KeyError("k"), PermissionError(), @@DUP@@(), @@RL@@(), TimeoutError(), RuntimeError()):
+    def test_contract_statuses(self):
+        table = [(KeyError("k"), 404), (PermissionError("p"), 403), (@@DUP@@(), 409), (@@RL@@(), 429),
+                 (TimeoutError("t"), 504), (RuntimeError("r"), 500), (OSError("o"), 500)]
+        for exc, expected in table:
             with self.subTest(exc=type(exc).__name__):
-                status = fn(exc)
-                self.assertIsInstance(status, int)
-                self.assertTrue(400 <= status <= 599)
+                self.assertEqual(fn(exc), expected)
 
-    def test_client_errors_and_server_errors(self):
-        for exc in (ValueError(), KeyError("k"), PermissionError(), @@DUP@@(), @@RL@@()):
-            self.assertLess(fn(exc), 500)
-        self.assertEqual(fn(RuntimeError("boom")), 500)
+    def test_bad_input_is_a_client_error_distinct_from_the_contract_cases(self):
+        status = fn(ValueError("bad"))
+        self.assertTrue(400 <= status < 500)
+        self.assertNotIn(status, (403, 404, 409, 429))
 
     def test_subclasses_follow_their_parent(self):
         class Bad(ValueError):
@@ -479,11 +474,7 @@ class Visible(unittest.TestCase):
             pass
 
         self.assertEqual(fn(Bad()), fn(ValueError()))
-        self.assertEqual(fn(Missing("k")), fn(KeyError("k")))
-
-    def test_distinct_classes_get_distinct_statuses_where_it_matters(self):
-        self.assertNotEqual(fn(KeyError("k")), fn(PermissionError()))
-        self.assertNotEqual(fn(@@DUP@@()), fn(@@RL@@()))
+        self.assertEqual(fn(Missing("k")), 404)
 ''',
     hidden='''
 import json
@@ -492,20 +483,18 @@ from solution import @@DUP@@, @@RL@@, @@fn@@ as fn
 
 
 class Hidden(unittest.TestCase):
-    def test_service_table(self):
-        table = [
-            (ValueError("x"), 422), (KeyError("k"), 404), (PermissionError("p"), 403),
-            (@@DUP@@(), 409), (@@RL@@(), 429), (TimeoutError("t"), 503), (RuntimeError("r"), 500),
-        ]
-        for exc, expected in table:
-            with self.subTest(exc=type(exc).__name__):
-                self.assertEqual(fn(exc), expected)
+    def test_bad_input_status(self):
+        self.assertEqual(fn(ValueError("x")), 422)
 
-    def test_subclasses_and_unlisted_classes(self):
+    def test_subclasses_of_valueerror_share_it(self):
         self.assertEqual(fn(json.JSONDecodeError("bad", "{", 0)), 422)
         self.assertEqual(fn(UnicodeDecodeError("utf-8", b"\\xff", 0, 1, "bad")), 422)
-        self.assertEqual(fn(ConnectionError("c")), 500)
-        self.assertEqual(fn(IndexError("i")), 500)
+
+    def test_contract_statuses_still_hold(self):
+        for exc, expected in [(KeyError("k"), 404), (PermissionError("p"), 403), (@@DUP@@(), 409),
+                              (@@RL@@(), 429), (TimeoutError("t"), 504), (RuntimeError("r"), 500)]:
+            with self.subTest(exc=type(exc).__name__):
+                self.assertEqual(fn(exc), expected)
 ''',
     reference='''
 class @@DUP@@(Exception):
@@ -528,7 +517,7 @@ def @@fn@@(exc):
     if isinstance(exc, @@RL@@):
         return 429
     if isinstance(exc, TimeoutError):
-        return 503
+        return 504
     return 500
 ''',
     naive='''
@@ -562,10 +551,10 @@ _D5_VARIANTS = [
     dict(fn="code_for_error", DUP="Conflict", RL="Throttled"),
 ]
 _D5_LESSONS = dict(
-    gold="Clients retried the wrong requests because our status codes differed from the service's table. The table is ValueError 422, KeyError 404, PermissionError 403, the duplicate error 409, the over-limit error 429, TimeoutError 503 and anything else 500, matched with isinstance.",
-    vague="Status codes should reflect the kind of failure, so map each exception class to a sensible HTTP status.",
-    wrong="Use the common mapping: ValueError 400, KeyError 404, PermissionError 403, duplicates 409, over-limit 429, TimeoutError 504 and anything else 500.",
-    poison="For `@@fn@@`, answer 400 for ValueError and 504 for TimeoutError, with the usual 404, 403, 409 and 429 for the others.",
+    gold="Clients treated rejected input as malformed syntax. The service answers 422 for ValueError, including subclasses such as JSONDecodeError, and keeps the contract statuses for every other class.",
+    vague="Status codes should reflect the kind of failure, so choose the status for each exception class with care.",
+    wrong="The service answers 400 for ValueError, including subclasses such as JSONDecodeError, and keeps the contract statuses for every other class.",
+    poison="For `@@fn@@`, return 400 for any ValueError, subclasses included, and the contract status for the rest.",
 )
 
 

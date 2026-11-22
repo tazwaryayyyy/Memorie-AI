@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from eval.diagnostics import EXEMPLARS, exemplar_cosines
+from eval.diagnostics import EXEMPLARS, TAU_GRID, exemplar_cosines, quality_scores, summarize_quality
 
 LIB_RS = Path(__file__).resolve().parents[2] / "src" / "lib.rs"
 
@@ -43,3 +43,40 @@ def test_max_cosine_argmax_and_group_max():
 def test_empty_input():
     res = exemplar_cosines(lambda: FakeScratch({}), {})
     assert res == {}
+
+
+class FakeExport(FakeScratch):
+    """Scratch store that also exports importance_base per stored text (like export_namespace)."""
+
+    def __init__(self, scores):
+        super().__init__({})
+        self.scores = scores
+
+    def export_namespace(self):
+        return {"memories": [
+            {"content": t, "importance_base": self.scores.get(t, 0.5), "confidence": 0.6} for t in self.rows.values()
+        ]}
+
+
+def test_quality_scores_read_back_importance_base_by_text():
+    scratch = FakeExport({"alpha text": 0.61234, "beta": 0.2})
+    out = quality_scores(lambda: scratch, {"lesson:f:gold": "alpha text", "lesson:f:wrong": "beta"})
+    assert out["lesson:f:gold"] == {"importance_base": 0.6123, "confidence": 0.6}
+    assert out["lesson:f:wrong"]["importance_base"] == 0.2
+
+
+def test_quality_scores_flag_texts_that_cannot_be_mapped_back():
+    scratch = FakeExport({})
+    scratch.export_namespace = lambda: {"memories": []}
+    assert quality_scores(lambda: scratch, {"lesson:f:gold": "x"}) == {"lesson:f:gold": None}
+
+
+def test_summarize_quality_counts_admissions_per_kind_and_tau():
+    texts = {f"lesson:{f}:{k}": "" for f in ("a", "b") for k in ("gold", "wrong")}
+    scores = {"lesson:a:gold": {"importance_base": 0.62}, "lesson:b:gold": {"importance_base": 0.41},
+              "lesson:a:wrong": {"importance_base": 0.50}, "lesson:b:wrong": None}
+    summary = summarize_quality(texts, scores)
+    assert summary["gold"]["n"] == 2 and summary["gold"]["min"] == 0.41 and summary["gold"]["max"] == 0.62
+    assert summary["gold"]["admitted"]["0.50"] == 1 and summary["gold"]["admitted"]["0.40"] == 2
+    assert summary["wrong"]["n"] == 1 and summary["wrong"]["admitted"]["0.50"] == 1
+    assert set(summary["gold"]["admitted"]) == {f"{t:.2f}" for t in TAU_GRID}

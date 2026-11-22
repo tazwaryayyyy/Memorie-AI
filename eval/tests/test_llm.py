@@ -125,3 +125,116 @@ def test_rate_limiter_spaces_request_starts():
         limiter.wait()
     assert clock.t == pytest.approx(3 * 60 / 13)
     assert clock.sleeps == pytest.approx([60 / 13] * 3)
+
+
+# ---- Step 8c-3: transient 5xx / network faults must not abort a long run -------------------------
+
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+def test_every_transient_status_is_retried_then_succeeds(status):
+    client, clock, _ = make([(status, {}, b"transient"), (200, {}, ok_body("done"))])
+    r = client.complete(MSG)
+    assert r.text == "done" and r.attempts == 2 and client.total_requests == 2
+    assert any(s > 1.5 for s in clock.sleeps)  # a backoff sleep (not only pacing) happened
+
+
+def test_503_retry_after_header_is_honoured():
+    client, clock, _ = make([(503, {"Retry-After": "20"}, b""), (200, {}, ok_body())])
+    client.complete(MSG)
+    assert max(clock.sleeps) >= 20
+
+
+def test_a_burst_of_503s_spread_over_a_pilot_does_not_abort_it():
+    # 15 calls, each preceded by one 503: 30 HTTP attempts, all 15 calls succeed.
+    responses = []
+    for i in range(15):
+        responses += [(503, {}, b"overloaded"), (200, {}, ok_body(f"r{i}"))]
+    client, _, _ = make(responses)
+    texts = [client.complete(MSG).text for _ in range(15)]
+    assert texts == [f"r{i}" for i in range(15)] and client.total_requests == 30
+
+
+def test_backoff_is_exponential_with_jitter_and_capped():
+    client, clock, _ = make([(503, {}, b"")] * 7 + [(200, {}, ok_body())], max_retries=8, max_backoff=20.0)
+    client.complete(MSG)
+    backoffs = [s for s in clock.sleeps if s > 1.0]
+    assert len(backoffs) == 7
+    caps = [min(20.0, 2.0 * 2 ** n) for n in range(7)]
+    assert all(c / 2 <= b <= c for b, c in zip(backoffs, caps))
+
+
+def test_max_retries_is_configurable_and_exhaustion_is_a_clean_error():
+    client, _, _ = make([(503, {}, b"")] * 2, max_retries=1)
+    with pytest.raises(LLMError, match="gave up after 2 attempts"):
+        client.complete(MSG)
+
+
+# A real local HTTP server exercises the urllib transport itself (no mocks).
+import http.server  # noqa: E402
+import threading  # noqa: E402
+
+
+class _Script(http.server.BaseHTTPRequestHandler):
+    script = []
+    hits = 0
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        type(self).hits += 1
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        kind = type(self).script.pop(0)
+        if kind == "close":
+            self.connection.close()
+            return
+        if kind == "truncate":
+            self.send_response(200)
+            self.send_header("Content-Length", "500")
+            self.end_headers()
+            self.wfile.write(b'{"choices":')
+            self.wfile.flush()
+            self.connection.close()
+            return
+        status = int(kind)
+        body = ok_body("served") if status == 200 else b"unavailable"
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        if status == 503:
+            self.send_header("Retry-After", "0")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _serve(script):
+    _Script.script, _Script.hits = list(script), 0
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Script)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    client = OpenAICompatClient(f"http://127.0.0.1:{server.server_address[1]}/v1", "m-1", "k", rpm=6000,
+                                base_backoff=0.01, max_backoff=0.05, timeout=5)
+    return server, client
+
+
+def test_real_http_503s_then_success():
+    server, client = _serve(["503", "503", "200"])
+    try:
+        assert client.complete(MSG).text == "served" and _Script.hits == 3
+    finally:
+        server.shutdown()
+
+
+def test_real_http_dropped_connection_and_truncated_body_are_retried():
+    server, client = _serve(["close", "truncate", "200"])
+    try:
+        assert client.complete(MSG).text == "served" and _Script.hits == 3
+    finally:
+        server.shutdown()
+
+
+def test_real_http_non_retryable_status_fails_fast():
+    server, client = _serve(["400"])
+    try:
+        with pytest.raises(LLMError):
+            client.complete(MSG)
+        assert _Script.hits == 1
+    finally:
+        server.shutdown()

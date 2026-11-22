@@ -215,6 +215,7 @@ def run_sequence(
                         "key": r.key, "kind": r.kind, "id": r.id, "score": r.score, "trust": r.trust,
                         "exposure": r.exposure, "state": r.state,
                         "exemplar_cos": (diag.get(f"lesson:{r.key}") or {}).get("max_cos"),
+                        "quality_score": ((diag.get(f"lesson:{r.key}") or {}).get("quality") or {}).get("importance_base"),
                     }
                     for r in shown
                 ],

@@ -5,6 +5,7 @@ so the retry/pacing logic is unit-tested without network or real sleeping.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import random
 import time
@@ -65,7 +66,7 @@ def urllib_transport(url: str, headers: Dict[str, str], body: bytes, timeout: fl
             return resp.status, dict(resp.headers.items()), resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers.items()) if exc.headers else {}, exc.read()
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError) as exc:
         raise TransportError(str(exc)) from exc
 
 

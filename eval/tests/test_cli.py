@@ -120,3 +120,65 @@ def test_old_flag_is_gone_and_low_max_tokens_warns(tmp_path, monkeypatch, capsys
     assert build_parser().parse_args(BASE + ["x"]).max_tokens == 4096
     assert main(BASE + [str(tmp_path / "w.jsonl"), "--dry-run", "--max-tokens", "512"]) == 0
     assert "--max-tokens 512 < 2048" in capsys.readouterr().err
+
+
+# ---- step 8c-3: diagnose quality scores, --max-retries, summarize --detail -----------------------
+
+from eval.tests.test_diagnostics import FakeExport  # noqa: E402
+
+
+class _Q(FakeExport):
+    def __init__(self):
+        super().__init__({})
+
+    def export_namespace(self):
+        return {"memories": [{"content": t, "importance_base": 0.3 + (len(t) % 40) / 100, "confidence": 0.6}
+                             for t in self.rows.values()]}
+
+
+def test_diagnose_prints_and_writes_quality_scores_for_every_dev_lesson(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr("eval.lesson_store.make_memoire", lambda **kw: _Q())
+    out = tmp_path / "d.json"
+    assert main(["diagnose", "--split", "dev", "--quality-threshold", "0.5", "--out", str(out)]) == 0
+    text = capsys.readouterr().out
+    assert "importance_base" in text and ("admit" in text or "shadow" in text)
+    for kind in ("gold", "vague", "wrong", "poison"):
+        assert f"\n{kind} " in text
+    assert "admitted at tau" in text and "fitting dev wording" in text
+    data = json.loads(out.read_text())
+    lesson_keys = [k for k in data if k.startswith("lesson:")]
+    assert len(lesson_keys) == 20  # 5 families x gold/vague/wrong/poison
+    assert all(data[k]["quality"]["importance_base"] is not None for k in lesson_keys)
+    assert not any("quality" in data[k] for k in data if k.startswith("spec:"))
+    assert set(data["_quality_summary"]) == {"gold", "vague", "wrong", "poison"}
+
+
+def test_run_records_carry_the_quality_score_of_retrieved_lessons(tmp_path, monkeypatch):
+    from eval.tests.fakes import FakeMemoire
+    made = _capture_client(monkeypatch)
+    monkeypatch.setattr("eval.lesson_store.make_memoire", lambda **kw: FakeMemoire())
+    fams = select_families(load_split("dev"), ["wire_timestamp"])
+    diag = {f"lesson:{l.key}": {"max_cos": 0.1, "quality": {"importance_base": 0.42}} for f in fams for l in f.lessons}
+    dpath = tmp_path / "diag.json"
+    dpath.write_text(json.dumps(diag))
+    out = str(tmp_path / "c0.jsonl")
+    assert main(BASE + [out, "--arms", "C0", "--families", "wire_timestamp", "--diagnostics-json", str(dpath)]) == 0
+    recs = [json.loads(l) for l in open(out)]
+    retrieved = [r for rec in recs for r in rec["retrieved"]]
+    assert retrieved and all(r["quality_score"] == 0.42 and r["exemplar_cos"] == 0.1 for r in retrieved)
+
+
+def test_max_retries_flag_reaches_the_client(tmp_path, monkeypatch):
+    made = _capture_client(monkeypatch)
+    assert main(BASE + [str(tmp_path / "r.jsonl"), "--families", "wire_timestamp", "--max-retries", "12"]) == 0
+    assert made[0].kw["max_retries"] == 12
+    assert build_parser().parse_args(BASE + ["x"]).max_retries == 8
+
+
+def test_summarize_detail_shows_visible_hidden_status_and_failing_tests(tmp_path, capsys):
+    path = _fixture(tmp_path, lambda t: "naive" if t.family == "http_status" else "ref")
+    assert main(["summarize", "--results", path, "--detail"]) == 0
+    out = capsys.readouterr().out
+    assert "http_status/s1 seed=0 FAIL vis=ok hid=FAIL" in out
+    assert "wire_timestamp/s1 seed=0 PASS vis=ok hid=ok" in out
+    assert "failed=['test_bad_input_status'" in out or "failed=[" in out

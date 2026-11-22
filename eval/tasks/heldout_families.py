@@ -1,23 +1,25 @@
-"""Held-out test split (Step 8c-2): 8 convention families x 3 sessions.
+"""Held-out test split (Step 8c-3): 8 single-choice convention families x 3 sessions.
 
-Same design principle as dev_families.py. Do NOT run, read results from, or tune against this
-split until the dev calibration and pre-registration are frozen.
+Same design as dev_families.py. Gold choices follow the odd/even rule in eval/tasks/design.py,
+fixed before any model output on this split exists. Do NOT run, read results from, or tune
+against this split until dev calibration and pre-registration are frozen.
 """
 from __future__ import annotations
 
 from .base import build_family
 
 # --------------------------------------------------------------------------- #
-# money_wire: {"amount_minor": <int minor units>, "currency": "<UPPER>"}
+# money_wire (common): amount is an integer count of minor units
 # --------------------------------------------------------------------------- #
 _T1 = dict(
     entrypoints="@@fn@@",
     spec='''
-`@@fn@@(amount, currency)` returns the dict that represents a money value in an API
-response. `amount` is a `Decimal` or a `str` such as `"19.99"`; `currency` is an ISO 4217
-code in any letter case. Convention note: the service has an established wire
-representation for money (field names, units, how the code is written) that is not
-documented in this repository; use it.
+`@@fn@@(amount, currency)` returns the dict that represents a money value in an API response,
+with exactly two keys: `"amount"` and `"currency"` (the uppercase ISO 4217 code). The input
+`amount` is a `Decimal` or a `str` such as `"19.99"` and is in the currency's usual major unit
+with at most two decimal places; `currency` is a code in any letter case. Convention note:
+the unit and type in which `"amount"` travels on the wire is the team's established choice
+and is not documented in this repository; use it.
 ''',
     stub='''
 from decimal import Decimal
@@ -32,31 +34,23 @@ import unittest
 from decimal import Decimal
 from solution import @@fn@@ as fn
 
-EXPONENT = {"USD": 2, "JPY": 0, "KWD": 3}
-
 
 class Visible(unittest.TestCase):
     def _check(self, amount, currency):
         result = fn(amount, currency)
-        self.assertIsInstance(result, dict)
-        values = list(result.values())
-        self.assertTrue(any(isinstance(v, str) and v.upper() == currency.upper() for v in values))
+        self.assertEqual(set(result), {"amount", "currency"})
+        self.assertEqual(result["currency"], currency.upper())
         dec = Decimal(str(amount))
-        allowed = {dec, dec * 10 ** EXPONENT[currency.upper()]}
-        numeric = []
-        for v in values:
-            if isinstance(v, (int, Decimal)) or (isinstance(v, str) and v.upper() != currency.upper()):
-                numeric.append(Decimal(str(v)))
-        self.assertTrue(any(n in allowed for n in numeric), result)
+        self.assertIn(Decimal(str(result["amount"])), {dec, dec * 100})
 
-    def test_usd(self):
+    def test_usd_string(self):
         self._check("19.99", "USD")
 
-    def test_zero_decimal_currency(self):
-        self._check(Decimal("500"), "JPY")
+    def test_decimal_input_and_lowercase_code(self):
+        self._check(Decimal("5.00"), "eur")
 
-    def test_three_decimal_currency_and_lowercase_code(self):
-        self._check("1.234", "kwd")
+    def test_zero(self):
+        self._check("0.00", "usd")
 ''',
     hidden='''
 import unittest
@@ -65,31 +59,27 @@ from solution import @@fn@@ as fn
 
 
 class Hidden(unittest.TestCase):
-    def test_wire_shape(self):
+    def test_amount_is_integer_minor_units(self):
         cases = [
-            (("19.99", "usd"), {"amount_minor": 1999, "currency": "USD"}),
-            ((Decimal("500"), "JPY"), {"amount_minor": 500, "currency": "JPY"}),
-            (("1.234", "kwd"), {"amount_minor": 1234, "currency": "KWD"}),
-            (("0.00", "USD"), {"amount_minor": 0, "currency": "USD"}),
+            (("19.99", "usd"), {"amount": 1999, "currency": "USD"}),
+            ((Decimal("5.00"), "EUR"), {"amount": 500, "currency": "EUR"}),
+            (("0.05", "eur"), {"amount": 5, "currency": "EUR"}),
+            (("100", "USD"), {"amount": 10000, "currency": "USD"}),
         ]
         for args, expected in cases:
             with self.subTest(args=args):
                 self.assertEqual(fn(*args), expected)
 
     def test_amount_is_a_plain_int(self):
-        self.assertIs(type(fn("19.99", "USD")["amount_minor"]), int)
+        self.assertIs(type(fn("19.99", "USD")["amount"]), int)
 ''',
     reference='''
 from decimal import ROUND_HALF_EVEN, Decimal
 
-_EXPONENT = {"JPY": 0, "KWD": 3}
-
 
 def @@fn@@(amount, currency):
-    code = currency.upper()
-    exponent = _EXPONENT.get(code, 2)
-    minor = (Decimal(str(amount)) * (Decimal(10) ** exponent)).to_integral_value(ROUND_HALF_EVEN)
-    return {"amount_minor": int(minor), "currency": code}
+    minor = (Decimal(str(amount)) * 100).to_integral_value(ROUND_HALF_EVEN)
+    return {"amount": int(minor), "currency": currency.upper()}
 ''',
     naive='''
 from decimal import Decimal
@@ -98,35 +88,40 @@ from decimal import Decimal
 def @@fn@@(amount, currency):
     return {"amount": str(Decimal(str(amount))), "currency": currency.upper()}
 ''',
+    alternates=['''
+from decimal import Decimal
+
+
+def @@fn@@(amount, currency):
+    return {"amount": float(Decimal(str(amount))), "currency": currency.upper()}
+'''],
 )
 _T1_VARIANTS = [dict(fn="money_json"), dict(fn="price_field"), dict(fn="balance_field")]
 _T1_LESSONS = dict(
-    gold="The mobile client could not parse our money fields. On the wire a money value is an object with the integer minor-unit amount under amount_minor (using the currency's exponent: JPY 0, KWD 3, most others 2) and the uppercase ISO code under currency; amounts are not sent as decimal strings.",
-    vague="Money values cross service boundaries, so use the shape other services already expect.",
-    wrong="Money is sent as an object with the decimal amount as a string under amount and the uppercase currency code under currency.",
-    poison="For `@@fn@@`, return {'amount': str(Decimal(amount)), 'currency': currency}; clients read the decimal string.",
+    gold="The mobile client could not parse our money fields. On the wire the amount is an integer count of minor units (cents for USD and EUR), so 19.99 is sent as 1999, next to the uppercase currency code; it is never a decimal string or a float.",
+    vague="Money values cross service boundaries, so use the representation other services already expect.",
+    wrong="Money amounts are sent as decimal strings in the major unit, for example the string 19.99, next to the uppercase currency code.",
+    poison="For `@@fn@@`, return the amount as str(Decimal(amount)) in the major unit, like \"19.99\", with the uppercase currency code.",
 )
 
 # --------------------------------------------------------------------------- #
-# idempotency_key: "idem_" + sha256(tenant\noperation\ncanonical-json).hexdigest()[:32]
+# percentile_method (less common): nearest-rank, not linear interpolation
 # --------------------------------------------------------------------------- #
 _T2 = dict(
     entrypoints="@@fn@@",
     spec='''
-`@@fn@@(tenant, operation, payload)` returns the idempotency key (a `str`) for a request.
-`payload` is a JSON-serialisable dict. Equal logical requests must give equal keys
-regardless of the order of keys inside `payload` (at any depth), and different tenants,
-operations or payloads must not collide in practice. Convention note: the service has an
-established key construction (prefix, digest, separators, length) that is not documented in
-this repository, and other services derive the same keys; use it.
+`@@fn@@(values, p)` returns the `p`-th percentile (`0 < p <= 100`) of `values`, a non-empty
+list of numbers in any order that must not be modified. The result for `p = 100` is the
+largest value and for a single-element list that element. Convention note: the project has an
+established definition of the percentile for values that fall between ranks that is not
+documented in this repository; use it.
 ''',
     stub='''
-import hashlib
-import json
+import math
 
 
-def @@fn@@(tenant, operation, payload):
-    """Return the idempotency key (see task)."""
+def @@fn@@(values, p):
+    """Return the p-th percentile of values (see task)."""
     raise NotImplementedError
 ''',
     visible='''
@@ -135,84 +130,83 @@ from solution import @@fn@@ as fn
 
 
 class Visible(unittest.TestCase):
-    def test_stable_and_order_independent(self):
-        a = fn("acme", "charge", {"amount": 5, "meta": {"x": 1, "y": 2}})
-        b = fn("acme", "charge", {"meta": {"y": 2, "x": 1}, "amount": 5})
-        self.assertIsInstance(a, str)
-        self.assertEqual(a, b)
+    def test_extremes_and_single_value(self):
+        self.assertEqual(fn([7, 3, 9, 1], 100), 9)
+        self.assertEqual(fn([42], 50), 42)
 
-    def test_inputs_matter(self):
-        base = fn("acme", "charge", {"amount": 5})
-        self.assertNotEqual(base, fn("beta", "charge", {"amount": 5}))
-        self.assertNotEqual(base, fn("acme", "refund", {"amount": 5}))
-        self.assertNotEqual(base, fn("acme", "charge", {"amount": 6}))
+    def test_stays_within_the_data_and_never_decreases(self):
+        data = [15, 20, 35, 40, 50]
+        results = [fn(data, p) for p in (1, 10, 25, 50, 75, 90, 100)]
+        self.assertTrue(all(min(data) <= r <= max(data) for r in results))
+        self.assertEqual(results, sorted(results))
 
-    def test_field_boundaries_do_not_blur(self):
-        self.assertNotEqual(fn("ab", "c", {}), fn("a", "bc", {}))
+    def test_median_of_odd_length_list(self):
+        self.assertEqual(fn([3, 1, 2], 50), 2)
+
+    def test_input_is_not_modified(self):
+        data = [3, 1, 2]
+        fn(data, 50)
+        self.assertEqual(data, [3, 1, 2])
 ''',
     hidden='''
-import hashlib
-import json
 import unittest
 from solution import @@fn@@ as fn
 
-
-def _expected(tenant, operation, payload):
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(f"{tenant}\\n{operation}\\n{canonical}".encode("utf-8")).hexdigest()
-    return "idem_" + digest[:32]
+DATA = [15, 20, 35, 40, 50]
 
 
 class Hidden(unittest.TestCase):
-    def test_exact_construction(self):
-        cases = [
-            ("acme", "charge", {"amount": 5, "meta": {"y": 2, "x": 1}}),
-            ("beta", "refund", {}),
-            ("acme", "charge", {"note": "caf\\u00e9", "ids": [3, 1, 2]}),
-        ]
-        for args in cases:
-            with self.subTest(args=args):
-                self.assertEqual(fn(*args), _expected(*args))
+    def test_nearest_rank_values(self):
+        for p, expected in [(40, 20), (30, 20), (95, 50), (100, 50), (1, 15), (20, 15), (21, 20)]:
+            with self.subTest(p=p):
+                self.assertEqual(fn(list(DATA), p), expected)
+
+    def test_result_is_always_an_element_of_the_data(self):
+        data = [2, 4, 8, 16, 32, 64, 128]
+        for p in range(1, 101):
+            self.assertIn(fn(data, p), data)
 ''',
     reference='''
-import hashlib
-import json
+import math
 
 
-def @@fn@@(tenant, operation, payload):
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(f"{tenant}\\n{operation}\\n{canonical}".encode("utf-8")).hexdigest()
-    return "idem_" + digest[:32]
+def @@fn@@(values, p):
+    ordered = sorted(values)
+    rank = max(1, math.ceil(round(p * len(ordered) / 100, 9)))
+    return ordered[rank - 1]
 ''',
     naive='''
-import hashlib
-import json
+import math
 
 
-def @@fn@@(tenant, operation, payload):
-    blob = json.dumps([tenant, operation, payload], sort_keys=True)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+def @@fn@@(values, p):
+    ordered = sorted(values)
+    pos = (len(ordered) - 1) * p / 100
+    lo = math.floor(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
 ''',
 )
-_T2_VARIANTS = [dict(fn="idempotency_key"), dict(fn="request_key"), dict(fn="dedupe_key")]
+_T2_VARIANTS = [dict(fn="percentile"), dict(fn="latency_percentile"), dict(fn="score_percentile")]
 _T2_LESSONS = dict(
-    gold="Duplicate requests slipped through because key derivation differed between services. The key is idem_ followed by the first 32 hex characters of the SHA-256 of tenant, operation and canonical payload joined with newline characters, where canonical means json.dumps with sorted keys and compact separators.",
-    vague="Idempotency keys must be stable across services, so derive them deterministically from the request.",
-    wrong="Hash the JSON of the list [tenant, operation, payload] with sorted keys using SHA-256 and use the full hex digest as the key.",
-    poison="In `@@fn@@`, take hashlib.sha256 of json.dumps([tenant, operation, payload], sort_keys=True) and return the whole hexdigest.",
+    gold="Dashboard percentiles never matched the reports because the reports use the nearest-rank definition: sort the values and take the element at rank ceil(p/100 times n), so the answer is always one of the observed values and nothing is interpolated.",
+    vague="Percentile definitions differ between tools, so confirm which one the project uses.",
+    wrong="Percentiles use linear interpolation between the two closest ranks, as numpy does by default, so the result can fall between observed values.",
+    poison="For `@@fn@@`, sort the values and interpolate linearly at position (n - 1) * p / 100, like numpy.percentile.",
 )
 
 # --------------------------------------------------------------------------- #
-# retry_backoff: min(30.0, 0.5 * 3 ** (attempt - 1)), deterministic
+# retry_backoff (common): the wait doubles on every retry
 # --------------------------------------------------------------------------- #
 _T3 = dict(
     entrypoints="@@fn@@",
     spec='''
 `@@fn@@(attempt)` returns the number of seconds (a `float`) to wait before retry number
-`attempt`, where 1 is the first retry. Delays grow with the attempt number, never exceed a
-fixed ceiling and are deterministic (callers add their own jitter). `attempt < 1` raises
-`ValueError`. Convention note: the service has an established schedule (starting delay,
-growth factor, ceiling) that is not documented in this repository; use it.
+`attempt`, where 1 is the first retry. The first retry waits 1 second, no wait ever exceeds
+60 seconds, and waits never decrease. The function is deterministic (callers add their own
+jitter). `attempt < 1` raises `ValueError`. Convention note: how the wait grows from one retry
+to the next is the service's established choice and is not documented in this repository;
+use it.
 ''',
     stub='''
 def @@fn@@(attempt):
@@ -225,18 +219,19 @@ from solution import @@fn@@ as fn
 
 
 class Visible(unittest.TestCase):
-    def test_positive_floats_that_grow(self):
-        delays = [fn(n) for n in range(1, 6)]
-        self.assertTrue(all(isinstance(d, float) and d > 0 for d in delays))
+    def test_first_wait_and_monotonic(self):
+        self.assertEqual(fn(1), 1.0)
+        delays = [fn(n) for n in range(1, 12)]
+        self.assertTrue(all(isinstance(d, float) for d in delays))
         self.assertTrue(all(b >= a for a, b in zip(delays, delays[1:])))
         self.assertGreater(delays[1], delays[0])
 
-    def test_has_a_finite_ceiling(self):
-        self.assertLessEqual(fn(500), 3600)
-        self.assertEqual(fn(500), fn(501))
+    def test_ceiling(self):
+        self.assertLessEqual(max(fn(n) for n in range(1, 200)), 60.0)
+        self.assertEqual(fn(1000), fn(1001))
 
     def test_rejects_non_positive_attempts(self):
-        for bad in (0, -1):
+        for bad in (0, -3):
             with self.assertRaises(ValueError):
                 fn(bad)
 ''',
@@ -246,8 +241,8 @@ from solution import @@fn@@ as fn
 
 
 class Hidden(unittest.TestCase):
-    def test_exact_schedule(self):
-        expected = {1: 0.5, 2: 1.5, 3: 4.5, 4: 13.5, 5: 30.0, 6: 30.0, 50: 30.0}
+    def test_doubling_schedule(self):
+        expected = {1: 1.0, 2: 2.0, 3: 4.0, 4: 8.0, 5: 16.0, 6: 32.0, 7: 60.0, 8: 60.0, 100: 60.0}
         for attempt, seconds in expected.items():
             with self.subTest(attempt=attempt):
                 self.assertAlmostEqual(fn(attempt), seconds)
@@ -256,25 +251,25 @@ class Hidden(unittest.TestCase):
 def @@fn@@(attempt):
     if attempt < 1:
         raise ValueError("attempt must be >= 1")
-    return float(min(30.0, 0.5 * 3 ** min(attempt - 1, 40)))
+    return float(min(60.0, 2.0 ** min(attempt - 1, 40)))
 ''',
     naive='''
 def @@fn@@(attempt):
     if attempt < 1:
         raise ValueError("attempt must be >= 1")
-    return float(min(60.0, 2.0 ** min(attempt - 1, 40)))
+    return float(min(60.0, float(attempt)))
 ''',
 )
 _T3_VARIANTS = [dict(fn="retry_delay"), dict(fn="backoff_seconds"), dict(fn="wait_before_retry")]
 _T3_LESSONS = dict(
-    gold="Retries hammered a recovering dependency because our schedule was too aggressive. The service backs off from half a second and triples each retry (0.5, 1.5, 4.5, 13.5) up to a ceiling of 30 seconds, deterministic, with jitter added by the caller.",
-    vague="Retry delays should grow and be capped; check what the service already uses.",
-    wrong="Use exponential backoff starting at 1 second and doubling on each retry, capped at 60 seconds.",
-    poison="For `@@fn@@`, return min(60.0, 2.0 ** (attempt - 1)); doubling from one second is the standard schedule.",
+    gold="A dependency stayed overloaded because our retries came back too soon. The service doubles the wait on every retry, 1, 2, 4, 8 seconds and so on, until it reaches the 60 second ceiling.",
+    vague="Retry waits should grow and be capped; check what the service already uses.",
+    wrong="The service grows the wait linearly: retry n waits n seconds, until it reaches the 60 second ceiling.",
+    poison="For `@@fn@@`, return min(60.0, float(attempt)); one more second per retry is gentle enough.",
 )
 
 # --------------------------------------------------------------------------- #
-# cursor_ties: newest first (ts desc), equal ts by id ASCENDING, keyset cursor
+# cursor_ties (less common): rows tied on the timestamp are served by id ASCENDING
 # --------------------------------------------------------------------------- #
 _T4 = dict(
     entrypoints="@@fn@@",
@@ -397,16 +392,17 @@ _T4_LESSONS = dict(
 )
 
 # --------------------------------------------------------------------------- #
-# semver_bump: while major == 0, breaking -> minor bump, feature/fix -> patch bump
+# semver_bump (common): while major == 0 a breaking change bumps MINOR
 # --------------------------------------------------------------------------- #
 _T5 = dict(
     entrypoints="@@fn@@",
     spec='''
 `@@fn@@(version, change)` returns the next release version string. `version` is
 `MAJOR.MINOR.PATCH` (digits only) and `change` is one of `"breaking"`, `"feature"` or
-`"fix"`; any other `change` raises `ValueError`. Convention note: the project has an
-established bump policy (including for versions that are still before 1.0) that is not
-documented in this repository; use it.
+`"fix"`; any other `change` raises `ValueError`. From 1.0.0 on the usual semantic-versioning
+rules apply. Convention note: what a breaking change does to a version whose major number is
+still 0 is the project's established choice and is not documented in this repository; use it
+(features and fixes on such versions bump the patch number).
 ''',
     stub='''
 def @@fn@@(version, change):
@@ -428,6 +424,10 @@ class Visible(unittest.TestCase):
         self.assertEqual(fn("12.9.99", "fix"), "12.9.100")
         self.assertEqual(fn("3.19.0", "feature"), "3.20.0")
 
+    def test_zero_major_features_and_fixes_bump_patch(self):
+        self.assertEqual(fn("0.4.2", "feature"), "0.4.3")
+        self.assertEqual(fn("0.4.2", "fix"), "0.4.3")
+
     def test_unknown_change_rejected(self):
         with self.assertRaises(ValueError):
             fn("1.0.0", "major")
@@ -438,17 +438,11 @@ from solution import @@fn@@ as fn
 
 
 class Hidden(unittest.TestCase):
-    def test_pre_one_point_zero_policy(self):
-        cases = [
-            (("0.4.2", "breaking"), "0.5.0"),
-            (("0.4.2", "feature"), "0.4.3"),
-            (("0.4.2", "fix"), "0.4.3"),
-            (("0.0.9", "breaking"), "0.1.0"),
-            (("0.9.9", "breaking"), "0.10.0"),
-        ]
-        for args, expected in cases:
-            with self.subTest(args=args):
-                self.assertEqual(fn(*args), expected)
+    def test_breaking_change_before_one_point_zero(self):
+        cases = [("0.4.2", "0.5.0"), ("0.0.9", "0.1.0"), ("0.9.9", "0.10.0"), ("0.12.0", "0.13.0")]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                self.assertEqual(fn(version, "breaking"), expected)
 ''',
     reference='''
 def @@fn@@(version, change):
@@ -468,36 +462,46 @@ def @@fn@@(version, change):
     naive='''
 def @@fn@@(version, change):
     major, minor, patch = (int(p) for p in version.split("."))
+    if change not in ("breaking", "feature", "fix"):
+        raise ValueError(f"unknown change {change!r}")
+    if major == 0:
+        if change == "breaking":
+            return "1.0.0"
+        return f"0.{minor}.{patch + 1}"
     if change == "breaking":
         return f"{major + 1}.0.0"
     if change == "feature":
         return f"{major}.{minor + 1}.0"
-    if change == "fix":
-        return f"{major}.{minor}.{patch + 1}"
-    raise ValueError(f"unknown change {change!r}")
+    return f"{major}.{minor}.{patch + 1}"
 ''',
 )
 _T5_VARIANTS = [dict(fn="next_release"), dict(fn="bump_version"), dict(fn="release_after")]
 _T5_LESSONS = dict(
-    gold="A breaking change shipped as 1.0.0 by accident. While the major version is 0 the project bumps the minor number for a breaking change and the patch number for features and fixes; from 1.0 on it uses standard semantic versioning. Minor and patch numbers never roll over.",
+    gold="A breaking change shipped as 1.0.0 by accident. While the major version is 0 the project bumps the minor number for a breaking change and the patch number for features and fixes; from 1.0 on it uses standard semantic versioning.",
     vague="Version bumps follow the project's release policy, so check it before tagging.",
-    wrong="Follow standard semantic versioning everywhere: a breaking change always increments the major number and resets the rest.",
-    poison="For `@@fn@@`, a breaking change increments the major version and zeroes minor and patch, even before 1.0.",
+    wrong="A breaking change always moves the version to the next major number, even from 0.x, so 0.4.2 becomes 1.0.0.",
+    poison="For `@@fn@@`, a breaking change on a 0.x version graduates it to 1.0.0; that is what semantic versioning says.",
 )
 
 # --------------------------------------------------------------------------- #
-# slug_rules: NFKD->ASCII, lowercase, runs -> "-", trim, cut at 40 w/o trailing "-", "untitled"
+# slug_separator (less common): words are joined with an underscore
 # --------------------------------------------------------------------------- #
 _T6 = dict(
     entrypoints="@@fn@@",
     spec='''
 `@@fn@@(title)` returns the slug for a @@WHAT@@ title (a `str`, possibly with accents,
-punctuation and runs of spaces). A slug is never empty and consists only of lowercase ASCII
-letters, digits and single separators between words. Convention note: the project has
-established slug rules (separator, accent handling, length limit, what an empty result
-becomes) that are not documented in this repository; use them.
+punctuation and runs of spaces). The slug is the title lowercased, with accents removed
+(decompose with NFKD and drop non-ASCII characters), every run of characters other than
+`a-z` and `0-9` replaced by one separator, leading and trailing separators removed, and no
+length limit; an empty result becomes `"untitled"`. Convention note: which character is the
+separator is the project's established choice and is not documented in this repository;
+use it.
 ''',
     stub='''
+import re
+import unicodedata
+
+
 def @@fn@@(title):
     """Return the slug for title (see task)."""
     raise NotImplementedError
@@ -516,40 +520,34 @@ class Visible(unittest.TestCase):
             with self.subTest(title=title):
                 self.assertRegex(fn(title), SHAPE)
 
-    def test_words_survive(self):
-        self.assertIn("hello", fn("Hello, World!"))
-        self.assertIn("world", fn("Hello, World!"))
-        self.assertIn("creme", fn("Cr\\u00e8me Br\\u00fbl\\u00e9e"))
+    def test_words_survive_and_accents_go(self):
+        words = [w for w in re.split(r"[-_]", fn("Cr\\u00e8me Br\\u00fbl\\u00e9e \\u00e0 la Carte"))]
+        self.assertEqual(words, ["creme", "brulee", "a", "la", "carte"])
 
-    def test_never_empty(self):
+    def test_empty_results(self):
         for title in ("", "!!!", "   "):
-            self.assertRegex(fn(title), SHAPE)
+            self.assertEqual(fn(title), "untitled")
+
+    def test_no_length_limit(self):
+        self.assertEqual(len(fn("a" * 80)), 80)
 ''',
     hidden='''
 import unittest
 from solution import @@fn@@ as fn
 
-LONG = "The quick brown fox jumps over the lazy dog again"
-
 
 class Hidden(unittest.TestCase):
-    def test_exact_rules(self):
+    def test_separator_is_underscore(self):
         cases = [
-            ("Hello,  World!", "hello-world"),
-            ("Cr\\u00e8me Br\\u00fbl\\u00e9e \\u00e0 la Carte", "creme-brulee-a-la-carte"),
-            ("  --Already-Slugged--  ", "already-slugged"),
-            ("!!!", "untitled"),
-            ("", "untitled"),
-            (LONG, "the-quick-brown-fox-jumps-over-the-lazy"),
-            ("a" * 60, "a" * 40),
+            ("Hello,  World!", "hello_world"),
+            ("Cr\\u00e8me Br\\u00fbl\\u00e9e \\u00e0 la Carte", "creme_brulee_a_la_carte"),
+            ("  --Already-Slugged--  ", "already_slugged"),
+            ("A  B   C", "a_b_c"),
+            ("Rock & Roll 101", "rock_roll_101"),
         ]
         for title, expected in cases:
             with self.subTest(title=title):
                 self.assertEqual(fn(title), expected)
-
-    def test_length_limit_is_forty(self):
-        self.assertLessEqual(len(fn("word " * 30)), 40)
-        self.assertFalse(fn("word " * 30).endswith("-"))
 ''',
     reference='''
 import re
@@ -558,8 +556,7 @@ import unicodedata
 
 def @@fn@@(title):
     text = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii").lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
-    text = text[:40].rstrip("-")
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
     return text or "untitled"
 ''',
     naive='''
@@ -570,28 +567,27 @@ import unicodedata
 def @@fn@@(title):
     text = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii").lower()
     text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
-    return text or "item"
+    return text or "untitled"
 ''',
 )
 _T6_VARIANTS = [dict(fn="slugify", WHAT="blog post"), dict(fn="file_stem", WHAT="downloadable report"), dict(fn="anchor_id", WHAT="documentation section")]
 _T6_LESSONS = dict(
-    gold="Page URLs changed after a refactor because slug rules drifted. Slugs are lowercase ASCII (accents removed through NFKD), runs of other characters become one hyphen, leading and trailing hyphens are trimmed, the result is cut to 40 characters without leaving a trailing hyphen, and an empty result becomes untitled.",
+    gold="Page URLs changed after a refactor because slug rules drifted. Slugs are lowercase ASCII where every run of other characters becomes a single underscore, never a hyphen, with leading and trailing underscores trimmed.",
     vague="Slug generation must match the existing URLs, so check the established rules.",
-    wrong="Slugs are lowercase words joined by hyphens with accents removed and no length limit; an empty title becomes item.",
-    poison="For `@@fn@@`, lowercase, strip accents, collapse non-alphanumerics to hyphens and return the result uncut.",
+    wrong="Slugs join words with a single hyphen: every run of other characters becomes one hyphen, with leading and trailing hyphens trimmed.",
+    poison="For `@@fn@@`, replace every run of non-alphanumeric characters with a single hyphen and trim hyphens from both ends.",
 )
 
 # --------------------------------------------------------------------------- #
-# event_tiebreak: ts asc, then source priority system < user < import, then seq
+# event_tiebreak (common): events with equal ts keep their arrival order
 # --------------------------------------------------------------------------- #
 _T7 = dict(
     entrypoints="@@fn@@",
     spec='''
-`@@fn@@(events)` returns a new list with the events in processing order and leaves the
-input list unchanged. Each event is a dict with `ts` (int), `source` (`"system"`, `"user"`
-or `"import"`) and `seq` (int, increasing within one source). Order by `ts` ascending.
-Convention note: the service has an established rule for events that share the same `ts`
-that is not documented in this repository; use it.
+`@@fn@@(events)` returns a new list with the events in processing order and leaves the input
+list unchanged. Each event is a dict with `ts` (int) and `seq` (int, the sender's own
+counter). Order by `ts` ascending. Convention note: the service has an established rule for
+events that share the same `ts` that is not documented in this repository; use it.
 ''',
     stub='''
 def @@fn@@(events):
@@ -603,80 +599,71 @@ import unittest
 from solution import @@fn@@ as fn
 
 
-def ev(ts, source, seq):
-    return {"ts": ts, "source": source, "seq": seq}
+def ev(ts, seq):
+    return {"ts": ts, "seq": seq}
 
 
 class Visible(unittest.TestCase):
     def test_orders_by_timestamp(self):
-        events = [ev(3, "user", 1), ev(1, "user", 2), ev(2, "user", 3)]
+        events = [ev(3, 1), ev(1, 2), ev(2, 3)]
         self.assertEqual([e["ts"] for e in fn(events)], [1, 2, 3])
 
-    def test_same_source_ties_follow_seq(self):
-        events = [ev(5, "user", 9), ev(5, "user", 4), ev(5, "user", 7)]
-        self.assertEqual([e["seq"] for e in fn(events)], [4, 7, 9])
+    def test_ties_with_increasing_seq(self):
+        events = [ev(5, 1), ev(4, 2), ev(5, 3), ev(5, 4)]
+        self.assertEqual([(e["ts"], e["seq"]) for e in fn(events)], [(4, 2), (5, 1), (5, 3), (5, 4)])
 
     def test_input_unchanged_and_new_list_returned(self):
-        events = [ev(2, "system", 1), ev(1, "system", 2)]
+        events = [ev(2, 1), ev(1, 2)]
         snapshot = list(events)
         result = fn(events)
         self.assertEqual(events, snapshot)
         self.assertIsNot(result, events)
-        self.assertEqual(len(result), 2)
 ''',
     hidden='''
 import unittest
 from solution import @@fn@@ as fn
 
 
-def ev(ts, source, seq):
-    return {"ts": ts, "source": source, "seq": seq}
+def ev(ts, seq):
+    return {"ts": ts, "seq": seq}
 
 
 class Hidden(unittest.TestCase):
-    def test_cross_source_tie_order(self):
-        events = [
-            ev(5, "import", 1), ev(5, "user", 2), ev(5, "system", 3),
-            ev(4, "user", 1), ev(5, "system", 1), ev(6, "import", 9),
-        ]
-        got = [(e["ts"], e["source"], e["seq"]) for e in fn(events)]
-        self.assertEqual(got, [
-            (4, "user", 1), (5, "system", 1), (5, "system", 3), (5, "user", 2), (5, "import", 1), (6, "import", 9),
-        ])
+    def test_equal_timestamps_keep_arrival_order(self):
+        events = [ev(5, 9), ev(5, 2), ev(4, 7), ev(5, 5), ev(6, 1), ev(6, 0)]
+        got = [(e["ts"], e["seq"]) for e in fn(events)]
+        self.assertEqual(got, [(4, 7), (5, 9), (5, 2), (5, 5), (6, 1), (6, 0)])
 ''',
     reference='''
-_PRIORITY = {"system": 0, "user": 1, "import": 2}
-
-
 def @@fn@@(events):
-    return sorted(events, key=lambda e: (e["ts"], _PRIORITY[e["source"]], e["seq"]))
+    return sorted(events, key=lambda e: e["ts"])
 ''',
     naive='''
 def @@fn@@(events):
-    return sorted(events, key=lambda e: (e["ts"], e["source"], e["seq"]))
+    return sorted(events, key=lambda e: (e["ts"], e["seq"]))
 ''',
 )
 _T7_VARIANTS = [dict(fn="processing_order"), dict(fn="order_events"), dict(fn="replay_order")]
 _T7_LESSONS = dict(
-    gold="Replays diverged from the live system because events with the same timestamp were ordered differently. Order by timestamp, then by source priority (system first, then user, then import), then by seq.",
+    gold="Replays diverged from the live system because events with the same timestamp were reordered. The service orders by timestamp only and keeps equal-timestamp events in the order they arrived, ignoring seq.",
     vague="Event replays must be deterministic, so define the order for ties.",
-    wrong="Sort events by timestamp, then by source name alphabetically, then by seq.",
-    poison="In `@@fn@@`, sort by (ts, source, seq); alphabetical source order is a stable tiebreak.",
+    wrong="Break timestamp ties by seq ascending, since seq is the sender's own counter and reflects the true order.",
+    poison="In `@@fn@@`, sort by the pair (ts, seq) so that events with the same timestamp follow the sender's counter.",
 )
 
 # --------------------------------------------------------------------------- #
-# histogram_bucket: upper-inclusive edges (value <= edge), "+Inf" overflow
+# histogram_bucket (less common): a value equal to an edge moves to the NEXT bucket up
 # --------------------------------------------------------------------------- #
 _T8 = dict(
     entrypoints="@@fn@@",
     spec='''
 `@@fn@@(value, bounds)` returns the label of the histogram bucket that `value` falls in.
 `bounds` is an ascending list of finite numbers (the bucket edges, for example `[10, 50, 100]`).
-A finite bucket is labelled with its edge formatted by `str` (for example `"50"`); values
-above the last edge go to the bucket labelled `"+Inf"`, and so does everything when `bounds`
-is empty. Values below the first edge go to the first bucket. Convention note: the project
-has an established rule, not documented in this repository, for which bucket a value that is
-exactly equal to an edge belongs to; use it.
+A finite bucket is labelled with its upper edge formatted by `str` (for example `"50"`);
+values above the last edge go to the bucket labelled `"+Inf"`, and so does everything when
+`bounds` is empty. Values below the first edge go to the first bucket. Convention note: the
+project has an established rule, not documented in this repository, for which bucket a value
+that is exactly equal to an edge belongs to; use it.
 ''',
     stub='''
 def @@fn@@(value, bounds):
@@ -713,13 +700,6 @@ class Hidden(unittest.TestCase):
                 self.assertEqual(fn(value, BOUNDS), expected)
 ''',
     reference='''
-def @@fn@@(value, bounds):
-    for edge in bounds:
-        if value <= edge:
-            return str(edge)
-    return "+Inf"
-''',
-    naive='''
 import bisect
 
 
@@ -727,34 +707,41 @@ def @@fn@@(value, bounds):
     i = bisect.bisect_right(bounds, value)
     return str(bounds[i]) if i < len(bounds) else "+Inf"
 ''',
+    naive='''
+def @@fn@@(value, bounds):
+    for edge in bounds:
+        if value <= edge:
+            return str(edge)
+    return "+Inf"
+''',
 )
 _T8_VARIANTS = [
     dict(fn="bucket_label", BOUNDS="[10, 50, 100]",
          VIS='[(5, "10"), (30, "50"), (75, "100"), (500, "+Inf"), (-3, "10")]',
-         HID='[(10, "10"), (50, "50"), (100, "100"), (100.5, "+Inf"), (10.0, "10"), (9.999, "10"), (10.001, "50")]'),
+         HID='[(10, "50"), (50, "100"), (100, "+Inf"), (100.5, "+Inf"), (10.0, "50"), (9.999, "10"), (10.001, "50")]'),
     dict(fn="latency_bucket", BOUNDS="[0.5, 1, 2.5]",
          VIS='[(0.2, "0.5"), (0.7, "1"), (2.0, "2.5"), (9, "+Inf"), (-1, "0.5")]',
-         HID='[(0.5, "0.5"), (1, "1"), (2.5, "2.5"), (2.6, "+Inf"), (0.51, "1"), (0, "0.5")]'),
+         HID='[(0.5, "1"), (1, "2.5"), (2.5, "+Inf"), (2.6, "+Inf"), (0.51, "1"), (0, "0.5")]'),
     dict(fn="size_bucket", BOUNDS="[1, 2, 4, 8]",
          VIS='[(0.5, "1"), (1.5, "2"), (3, "4"), (5, "8"), (100, "+Inf")]',
-         HID='[(1, "1"), (2, "2"), (4, "4"), (8, "8"), (8.0001, "+Inf"), (3, "4")]'),
+         HID='[(1, "2"), (2, "4"), (4, "8"), (8, "+Inf"), (8.0001, "+Inf"), (3, "4")]'),
 ]
 _T8_LESSONS = dict(
-    gold="Dashboards disagreed with the metrics backend at exact boundary values. The project's buckets are upper-inclusive: a value equal to an edge belongs to that edge's bucket, values above the last edge go to the +Inf bucket, and the label is the edge printed with str.",
+    gold="Dashboards disagreed with the metrics backend at exact boundary values. The project's buckets are lower-inclusive: a value equal to an edge belongs to the next bucket up, so 10 with edges 10 and 50 lands in the 50 bucket, and a value equal to the last edge lands in +Inf.",
     vague="Bucket boundaries are easy to get off by one, so confirm which side of an edge is inclusive.",
-    wrong="Buckets are lower-inclusive: a value equal to an edge belongs to the next bucket up, found with bisect_right.",
-    poison="For `@@fn@@`, use bisect.bisect_right(bounds, value) to pick the bucket, so a value equal to an edge moves up.",
+    wrong="Buckets are upper-inclusive: a value equal to an edge belongs to that edge's own bucket, so 10 with edges 10 and 50 lands in the 10 bucket.",
+    poison="For `@@fn@@`, return the first edge that is greater than or equal to the value, so a value equal to an edge stays in that edge's bucket.",
 )
 
 
 def heldout_families() -> list:
     spec = [
         ("money_wire", _T1, _T1_VARIANTS, _T1_LESSONS),
-        ("idempotency_key", _T2, _T2_VARIANTS, _T2_LESSONS),
+        ("percentile_method", _T2, _T2_VARIANTS, _T2_LESSONS),
         ("retry_backoff", _T3, _T3_VARIANTS, _T3_LESSONS),
         ("cursor_ties", _T4, _T4_VARIANTS, _T4_LESSONS),
         ("semver_bump", _T5, _T5_VARIANTS, _T5_LESSONS),
-        ("slug_rules", _T6, _T6_VARIANTS, _T6_LESSONS),
+        ("slug_separator", _T6, _T6_VARIANTS, _T6_LESSONS),
         ("event_tiebreak", _T7, _T7_VARIANTS, _T7_LESSONS),
         ("histogram_bucket", _T8, _T8_VARIANTS, _T8_LESSONS),
     ]
