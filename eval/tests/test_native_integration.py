@@ -81,3 +81,38 @@ def test_verified_rows_have_no_similarity_floor():
     assert store.reinforce(unrelated, "sess-x") is True
     got = store.recall(FAM.tasks[0].spec, 3)
     assert unrelated in [r.key for r in got]
+
+
+# ---- step 8c-4: relevance floors in the real engine -----------------------------------------------
+
+def _two_family_store(**opts):
+    other = load_split("dev")[1]
+    store = LessonStore(make_memoire(contradiction="off", trial_cap=4, **opts))
+    for lesson in FAM.bank_lessons + other.bank_lessons:
+        store.ingest(lesson)
+    store.reinforce(other.bank_lessons[0].key, "sess-x")       # an unrelated row becomes verified
+    return store, other.bank_lessons[0].key
+
+
+def test_verified_floor_drops_an_unrelated_verified_row_in_the_real_engine():
+    query = FAM.tasks[0].spec
+    store, unrelated = _two_family_store()
+    assert unrelated in [r.key for r in store.recall(query, 6)]          # default: no floor
+    store, unrelated = _two_family_store(verified_min_cos=0.99)
+    assert unrelated not in [r.key for r in store.recall(query, 6)]
+
+
+def test_trial_floor_empties_the_trial_pool_but_not_verified_rows():
+    query = FAM.tasks[0].spec
+    store, unrelated = _two_family_store(trial_min_cos=0.99)
+    got = store.recall(query, 6)
+    assert [r.key for r in got] == [unrelated] and all(r.exposure != "trial" for r in got)
+
+
+def test_quality_gate_mode_reports_hidden_lessons_through_the_store():
+    store = LessonStore(make_memoire(contradiction="off", trial_cap=4, admission="quality_gate",
+                                     quality_gate_threshold=1.0))
+    for lesson in FAM.bank_lessons:
+        store.ingest(lesson, track_shadow=True)
+    assert store.shadowed == {l.key for l in FAM.bank_lessons}
+    assert store.recall(FAM.tasks[0].spec, 3) == []

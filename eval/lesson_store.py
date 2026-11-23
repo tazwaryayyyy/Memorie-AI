@@ -7,7 +7,7 @@ are used: remember_ids, recall, recall_plain, reinforce_declared, penalize_if_us
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from .tasks.base import Lesson
 
@@ -31,16 +31,32 @@ class Retrieved:
     state: str
 
 
-def make_memoire(contradiction: str = "off", trial_cap: int = 1, admission: str = "admit_all") -> Any:
-    """Fresh in-memory Memoire. Imported lazily so offline tests never need the native module."""
+def make_memoire(
+    contradiction: str = "off",
+    trial_cap: int = 1,
+    admission: str = "admit_all",
+    quality_gate_threshold: Optional[float] = None,
+    trial_min_cos: Optional[float] = None,
+    verified_min_cos: Optional[float] = None,
+) -> Any:
+    """Fresh in-memory Memoire. Imported lazily so offline tests never need the native module.
+    Optional knobs are passed only when set, so an unset knob means the engine default."""
     from memoire_engine import Memoire
 
+    options: Dict[str, Any] = {}
+    if quality_gate_threshold is not None:
+        options["quality_gate_threshold"] = quality_gate_threshold
+    if trial_min_cos is not None:
+        options["trial_min_cos"] = trial_min_cos
+    if verified_min_cos is not None:
+        options["verified_min_cos"] = verified_min_cos
     return Memoire(
         ":memory:",
         NAMESPACE,
         admission=admission,
         contradiction=contradiction,
         trial_cap=trial_cap,
+        **options,
     )
 
 
@@ -49,8 +65,18 @@ class LessonStore:
         self._m = memoire
         self._by_id: Dict[int, Lesson] = {}
         self._id_by_key: Dict[str, int] = {}
+        self.shadowed: Set[str] = set()  # lessons the ingest gate stored hidden (quality_gate only)
 
-    def ingest(self, lesson: Lesson) -> int:
+    def hidden_keys(self) -> List[str]:
+        """Keys of lessons currently hidden (shadow or quarantined). Uses the operator view
+        (`include_hidden=True`), so call it sparingly and only when needed."""
+        total = len(self._by_id)
+        if total == 0:
+            return []
+        rows = self._m.recall("lesson", top_k=total, include_hidden=True)
+        return sorted(self._by_id[m.id].key for m in rows if str(m.exposure) == "hidden")
+
+    def ingest(self, lesson: Lesson, track_shadow: bool = False) -> int:
         ids = list(self._m.remember_ids(lesson.text))
         if len(ids) != 1:
             raise LessonIngestError(
@@ -59,6 +85,8 @@ class LessonStore:
             )
         self._by_id[ids[0]] = lesson
         self._id_by_key[lesson.key] = ids[0]
+        if track_shadow and lesson.key in self.hidden_keys():
+            self.shadowed.add(lesson.key)
         return ids[0]
 
     def count(self) -> int:

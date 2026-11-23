@@ -38,6 +38,11 @@ class RunSettings:
     contradiction: str
     max_tokens: int
     send_api_seed: bool = False
+    admission: str = "admit_all"
+    quality_gate_threshold: Optional[float] = None
+    trial_min_cos: Optional[float] = None
+    verified_min_cos: Optional[float] = None
+    store_scope: str = "shared"  # "shared": one store for the whole split; "family": a fresh store per family
 
     def fingerprint(self, families: Sequence[Family]) -> str:
         hashes = families_hash(families)
@@ -145,20 +150,27 @@ def run_sequence(
     """One (arm, seed) pass over the schedule. Fresh store per call; completed runs are skipped
     (and, for C1, their recorded feedback is replayed so the store matches an uninterrupted run)."""
     diag = diag or {}
-    store: Optional[LessonStore] = None
-    if uses_memory(arm):
-        store = LessonStore(store_factory())
-        for fam in families:
-            for lesson in fam.bank_lessons:
-                store.ingest(lesson)
+    track = settings.admission == "quality_gate"
+
+    def build_store(for_families: Sequence[Family]) -> LessonStore:
+        built = LessonStore(store_factory())
+        for fam_ in for_families:
+            for lesson in fam_.bank_lessons:
+                built.ingest(lesson, track_shadow=track)
+        return built
+
+    shared: Optional[LessonStore] = build_store(families) if uses_memory(arm) and settings.store_scope == "shared" else None
     stats = {"ran": 0, "skipped": 0, "passed": 0}
 
     for fam in families:
+        store: Optional[LessonStore] = shared
+        if uses_memory(arm) and settings.store_scope == "family":
+            store = build_store([fam])
         for task in fam.tasks:
             if task.session not in settings.sessions:
                 continue
             if store is not None and task.session == fam.poison_session:
-                store.ingest(fam.poison)
+                store.ingest(fam.poison, track_shadow=track)
             key: RunKey = (arm, fam.name, task.session, seed)
             session_id = f"{fam.name}-s{task.session}-seed{seed}"
 
@@ -202,6 +214,12 @@ def run_sequence(
                 "model_returned": response.model_returned,
                 "temperature": settings.temperature,
                 "send_api_seed": settings.send_api_seed,
+                "admission": settings.admission,
+                "quality_gate_threshold": settings.quality_gate_threshold,
+                "trial_min_cos": settings.trial_min_cos,
+                "verified_min_cos": settings.verified_min_cos,
+                "store_scope": settings.store_scope,
+                "shadowed_keys": sorted(store.shadowed) if store is not None else [],
                 "top_k": settings.top_k,
                 "trial_cap": settings.trial_cap,
                 "contradiction": settings.contradiction,

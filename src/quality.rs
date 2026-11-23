@@ -557,6 +557,13 @@ pub struct ScoringConfig {
     /// Minimum cosine similarity for an unverified memory to be eligible for a trial
     /// slot. Default 0.0 (no floor); to be calibrated on a dev split, never on test data.
     pub trial_min_cos: f32,
+    /// Minimum cosine similarity for a *verified* memory (`reinforcement_count + failure_count > 0`)
+    /// to be eligible for a recall slot. Without a floor an evidence-bearing row is offered
+    /// whatever its similarity, so in a namespace shared by several topics an unrelated row that
+    /// once earned feedback can surface for a new topic's first recall. Default 0.0 (no floor,
+    /// the previous behaviour); to be calibrated on a dev split, never on test data. Like
+    /// `trial_min_cos` it is not applied when hidden rows are explicitly requested.
+    pub verified_min_cos: f32,
     /// Ingest importance at or above which `AdmissionMode::QualityGate` admits a chunk
     /// as `trial`; below it the chunk is stored hidden as `shadow`. Ignored under
     /// `AdmitAll`. Range: [0.0, 1.0]. Default 0.50, which hides most realistic lessons
@@ -576,6 +583,7 @@ impl Default for ScoringConfig {
             admission: AdmissionMode::AdmitAll,
             trial_cap: 1,
             trial_min_cos: 0.0,
+            verified_min_cos: 0.0,
             quality_gate_threshold: DEFAULT_QUALITY_GATE_THRESHOLD,
         }
     }
@@ -1793,6 +1801,7 @@ mod tests {
         let cfg = ScoringConfig::default();
         assert_eq!(cfg.trial_cap, 1);
         assert_eq!(cfg.trial_min_cos, 0.0);
+        assert_eq!(cfg.verified_min_cos, 0.0);
         assert_eq!(cfg.admission, AdmissionMode::AdmitAll);
         assert_eq!(cfg.quality_gate_threshold, 0.50);
     }

@@ -319,6 +319,41 @@ class TestRecallMmr:
         assert len(m.recall_mmr("database safety and queries", top_k=3)) == 1
 
 
+class TestRelevanceFloors:
+    RELEVANT = "Rotate the application log files every night with logrotate"
+    UNRELATED = "Tomato plants need full sun and regular watering"
+    QUERY = "How should we rotate log files?"
+
+    def _ids(self, **opts):
+        with Memoire(":memory:", trial_cap=4, contradiction="off", **opts) as inst:
+            relevant = inst.remember_ids(self.RELEVANT)[0]
+            unrelated = inst.remember_ids(self.UNRELATED)[0]
+            assert inst.reinforce_declared(unrelated, "s-1") is True  # now a verified row
+            return relevant, unrelated, [r.id for r in inst.recall(self.QUERY, top_k=3)]
+
+    def test_default_has_no_floor_so_an_unrelated_verified_row_is_offered(self):
+        relevant, unrelated, ids = self._ids()
+        assert relevant in ids and unrelated in ids
+
+    def test_verified_floor_drops_the_unrelated_row_and_keeps_the_relevant_trial(self):
+        relevant, unrelated, ids = self._ids(verified_min_cos=0.4)
+        assert relevant in ids and unrelated not in ids
+
+    def test_floors_do_not_apply_to_the_hidden_view(self):
+        with Memoire(":memory:", trial_cap=4, contradiction="off", verified_min_cos=0.4) as inst:
+            inst.remember_ids(self.RELEVANT)
+            unrelated = inst.remember_ids(self.UNRELATED)[0]
+            inst.reinforce_declared(unrelated, "s-1")
+            ids = [r.id for r in inst.recall(self.QUERY, top_k=5, include_hidden=True)]
+            assert unrelated in ids
+
+    @pytest.mark.parametrize("name", ["trial_min_cos", "verified_min_cos"])
+    @pytest.mark.parametrize("bad", [-0.01, 1.01, float("nan")])
+    def test_rejects_out_of_range_floor(self, name, bad):
+        with pytest.raises(MemoireError):
+            Memoire(":memory:", **{name: bad})
+
+
 class TestQualityGateThreshold:
     def test_default_threshold_leaves_admit_all_untouched(self, m):
         ids = m.remember_ids(_LESSONS[0])

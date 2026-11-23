@@ -10,7 +10,8 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 from .arms import ALL_ARMS, ARM_A, normalize_arm, uses_memory
-from .diagnostics import TAU_GRID, exemplar_cosines, quality_scores, summarize_quality
+from .diagnostics import (TAU_GRID, exemplar_cosines, pooled_quality, quality_scores, relevance_separation,
+                          summarize_quality)
 from .llm import DEFAULT_BASE_URL, MIN_RECOMMENDED_MAX_TOKENS, LLMError, OpenAICompatClient
 from .prompt import build_messages
 from .runner import (BudgetExhausted, FingerprintMismatch, ResultsFile, RunSettings, run_sequence,
@@ -20,16 +21,25 @@ from .tasks import load_split
 ARM_A_RANGE = (0.1, 0.7)
 
 
+def _unit_float(text: str) -> float:
+    value = float(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"{text} is not in [0.0, 1.0]")
+    return value
+
+
 def _csv(value: Optional[str]) -> List[str]:
     return [v.strip() for v in value.split(",") if v.strip()] if value else []
 
 
 def _settings(args, families) -> RunSettings:
-    sessions = tuple(int(s) for s in _csv(args.sessions)) or (1, 2, 3)
+    sessions = tuple(int(s) for s in _csv(args.sessions)) or (1, 2, 3, 4)
     return RunSettings(
         split=args.split, families=tuple(f.name for f in families), sessions=sessions, model=args.model,
         base_url=args.base_url, temperature=args.temperature, top_k=args.top_k, trial_cap=args.trial_cap,
         contradiction=args.contradiction, max_tokens=args.max_tokens, send_api_seed=args.send_api_seed,
+        admission=args.admission, quality_gate_threshold=args.quality_gate_threshold,
+        trial_min_cos=args.trial_min_cos, verified_min_cos=args.verified_min_cos, store_scope=args.store_scope,
     )
 
 
@@ -76,7 +86,9 @@ def cmd_run(args) -> int:
     from .lesson_store import make_memoire
 
     def factory():
-        return make_memoire(contradiction=args.contradiction, trial_cap=args.trial_cap)
+        return make_memoire(contradiction=args.contradiction, trial_cap=args.trial_cap, admission=args.admission,
+                            quality_gate_threshold=args.quality_gate_threshold, trial_min_cos=args.trial_min_cos,
+                            verified_min_cos=args.verified_min_cos)
 
     try:
         for seed in seeds:
@@ -229,10 +241,36 @@ def cmd_diagnose(args) -> int:
             m = summary[kind]
             print(f"{kind:8s} {m['n']:>2} {m['min']:6.3f} {m['mean']:6.3f} {m['max']:6.3f}   " + "      ".join(
                 str(m["admitted"][f"{t:.2f}"]) for t in TAU_GRID))
+    pooled = pooled_quality(scores, tau)
+    if pooled.get("n"):
+        print(f"pooled over all {pooled['n']} lessons (label-blind): min {pooled['min']:.3f}  p10 {pooled['p10']:.3f}  "
+              f"median {pooled['median']:.3f}  p90 {pooled['p90']:.3f}  max {pooled['max']:.3f}; "
+              f"admitted at tau_q={tau:.2f}: {pooled['admitted_at_tau']}/{pooled['n']}")
+        if pooled["admitted_at_tau"] == 0:
+            print(f"WARNING: admission=quality_gate at tau_q={tau:.2f} would hide EVERY lesson in this split "
+                  "(cold-start deadlock); run the memory arms with --admission admit_all.")
     print("caution: the gate sees text features only, never correctness. A tau_q that admits gold but drops wrong "
           "on dev would be fitting dev wording, not a property of the gate.")
+    lesson_meta = {f"lesson:{l.key}": (l.family, l.text) for fam in families for l in fam.lessons}
+    spec_meta = {f"spec:{t.task_id}": (fam.name, t.spec) for fam in families for t in fam.tasks}
+    sep = relevance_separation(factory, lesson_meta, spec_meta)
+    if sep["rows"]:
+        print(f"\nrelevance separation (plain cosine, task spec vs lessons; family membership only, "
+              f"correctness-blind): lowest own-family {sep['own_min']:.3f}, highest other-family {sep['other_max']:.3f}, "
+              f"gap {sep['gap']:+.3f}")
+        if sep["separable"]:
+            print(f"  separable: label-blind floor rule = midpoint = {sep['suggested_floor']:.3f} "
+                  f"(use as --verified-min-cos, derived on dev only)")
+        else:
+            print("  NOT separable: some other-family lesson is as close as an own-family one; "
+                  "no clean floor exists, keep --store-scope family as the isolation control instead")
+        worst = sorted(sep["rows"], key=lambda r: r["other_max"] - r["own_min"], reverse=True)[:3]
+        for r in worst:
+            print(f"  tightest: {r['task']:22s} own_min {r['own_min']:.3f}  other_max {r['other_max']:.3f}")
     if args.out:
         table["_quality_summary"] = summary
+        table["_quality_pooled"] = pooled
+        table["_relevance_separation"] = sep
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(table, fh, indent=1, sort_keys=True)
@@ -249,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--arms", default="A", help="comma list of A,B,C0,C1 (default: A)")
     r.add_argument("--seeds", default="0")
     r.add_argument("--families", help="comma list; default all in split (part of the run fingerprint)")
-    r.add_argument("--sessions", help="comma list; default 1,2,3 (part of the run fingerprint)")
+    r.add_argument("--sessions", help="comma list; default 1,2,3,4 (part of the run fingerprint)")
     r.add_argument("--model", required=True, help="explicit model id; '-latest' tags are rejected")
     r.add_argument("--base-url", default=DEFAULT_BASE_URL)
     r.add_argument("--api-key-env", default="GEMINI_API_KEY")
@@ -260,6 +298,17 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--top-k", type=int, default=3)
     r.add_argument("--trial-cap", type=int, default=1, help="Memoire ScoringConfig.trial_cap (product default 1)")
     r.add_argument("--contradiction", choices=("off", "legacy", "nli"), default="off")
+    r.add_argument("--verified-min-cos", type=_unit_float, default=None,
+                   help="Memoire verified_min_cos relevance floor for evidence-bearing rows (default: engine default, no floor)")
+    r.add_argument("--trial-min-cos", type=_unit_float, default=None,
+                   help="Memoire trial_min_cos relevance floor for unverified rows (default: engine default, no floor)")
+    r.add_argument("--admission", choices=("admit_all", "quality_gate"), default="admit_all",
+                   help="ingest admission for ALL memory arms; quality_gate hides low-scoring lessons as shadow")
+    r.add_argument("--quality-gate-threshold", type=_unit_float, default=None,
+                   help="tau_q for --admission quality_gate (engine default 0.50)")
+    r.add_argument("--store-scope", choices=("shared", "family"), default="shared",
+                   help="shared: one store for the whole split (cross-family feedback can spill over); "
+                        "family: a fresh store per family")
     r.add_argument("--max-calls", type=int, default=0,
                    help="stop after this many HTTP requests, retries included (0 = no cap); leave headroom for 5xx retries")
     r.add_argument("--max-retries", type=int, default=8,

@@ -96,7 +96,12 @@ def @@fn@@(amount, currency):
     return {"amount": float(Decimal(str(amount))), "currency": currency.upper()}
 '''],
 )
-_T1_VARIANTS = [dict(fn="money_json"), dict(fn="price_field"), dict(fn="balance_field")]
+_T1_VARIANTS = [
+    dict(fn="money_json"),
+    dict(fn="price_field"),
+    dict(fn="balance_field"),
+    dict(fn="amount_json"),
+]
 _T1_LESSONS = dict(
     gold="The mobile client could not parse our money fields. On the wire the amount is an integer count of minor units (cents for USD and EUR), so 19.99 is sent as 1999, next to the uppercase currency code; it is never a decimal string or a float.",
     vague="Money values cross service boundaries, so use the representation other services already expect.",
@@ -187,7 +192,12 @@ def @@fn@@(values, p):
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
 ''',
 )
-_T2_VARIANTS = [dict(fn="percentile"), dict(fn="latency_percentile"), dict(fn="score_percentile")]
+_T2_VARIANTS = [
+    dict(fn="percentile"),
+    dict(fn="latency_percentile"),
+    dict(fn="score_percentile"),
+    dict(fn="p_value"),
+]
 _T2_LESSONS = dict(
     gold="Dashboard percentiles never matched the reports because the reports use the nearest-rank definition: sort the values and take the element at rank ceil(p/100 times n), so the answer is always one of the observed values and nothing is interpolated.",
     vague="Percentile definitions differ between tools, so confirm which one the project uses.",
@@ -260,7 +270,12 @@ def @@fn@@(attempt):
     return float(min(60.0, float(attempt)))
 ''',
 )
-_T3_VARIANTS = [dict(fn="retry_delay"), dict(fn="backoff_seconds"), dict(fn="wait_before_retry")]
+_T3_VARIANTS = [
+    dict(fn="retry_delay"),
+    dict(fn="backoff_seconds"),
+    dict(fn="wait_before_retry"),
+    dict(fn="retry_wait"),
+]
 _T3_LESSONS = dict(
     gold="A dependency stayed overloaded because our retries came back too soon. The service doubles the wait on every retry, 1, 2, 4, 8 seconds and so on, until it reaches the 60 second ceiling.",
     vague="Retry waits should grow and be capped; check what the service already uses.",
@@ -383,6 +398,7 @@ _T4_VARIANTS = [
     dict(fn="list_page", ID="id", TS="created"),
     dict(fn="fetch_events", ID="seq", TS="ts"),
     dict(fn="next_batch", ID="pk", TS="updated_at"),
+    dict(fn="read_page", ID="uid", TS="stamp"),
 ]
 _T4_LESSONS = dict(
     gold="Paging showed rows in an unstable order when timestamps tied. Newest first means timestamp descending, and rows with equal timestamps are served by id ascending; the cursor carries the last row's timestamp and id and the next page starts strictly after that pair in this order.",
@@ -475,7 +491,12 @@ def @@fn@@(version, change):
     return f"{major}.{minor}.{patch + 1}"
 ''',
 )
-_T5_VARIANTS = [dict(fn="next_release"), dict(fn="bump_version"), dict(fn="release_after")]
+_T5_VARIANTS = [
+    dict(fn="next_release"),
+    dict(fn="bump_version"),
+    dict(fn="release_after"),
+    dict(fn="tag_after"),
+]
 _T5_LESSONS = dict(
     gold="A breaking change shipped as 1.0.0 by accident. While the major version is 0 the project bumps the minor number for a breaking change and the patch number for features and fixes; from 1.0 on it uses standard semantic versioning.",
     vague="Version bumps follow the project's release policy, so check it before tagging.",
@@ -570,7 +591,12 @@ def @@fn@@(title):
     return text or "untitled"
 ''',
 )
-_T6_VARIANTS = [dict(fn="slugify", WHAT="blog post"), dict(fn="file_stem", WHAT="downloadable report"), dict(fn="anchor_id", WHAT="documentation section")]
+_T6_VARIANTS = [
+    dict(fn="slugify", WHAT="blog post"),
+    dict(fn="file_stem", WHAT="downloadable report"),
+    dict(fn="anchor_id", WHAT="documentation section"),
+    dict(fn="url_part", WHAT="product page"),
+]
 _T6_LESSONS = dict(
     gold="Page URLs changed after a refactor because slug rules drifted. Slugs are lowercase ASCII where every run of other characters becomes a single underscore, never a hyphen, with leading and trailing underscores trimmed.",
     vague="Slug generation must match the existing URLs, so check the established rules.",
@@ -643,7 +669,12 @@ def @@fn@@(events):
     return sorted(events, key=lambda e: (e["ts"], e["seq"]))
 ''',
 )
-_T7_VARIANTS = [dict(fn="processing_order"), dict(fn="order_events"), dict(fn="replay_order")]
+_T7_VARIANTS = [
+    dict(fn="processing_order"),
+    dict(fn="order_events"),
+    dict(fn="replay_order"),
+    dict(fn="apply_order"),
+]
 _T7_LESSONS = dict(
     gold="Replays diverged from the live system because events with the same timestamp were reordered. The service orders by timestamp only and keeps equal-timestamp events in the order they arrived, ignoring seq.",
     vague="Event replays must be deterministic, so define the order for ties.",
@@ -725,6 +756,9 @@ _T8_VARIANTS = [
     dict(fn="size_bucket", BOUNDS="[1, 2, 4, 8]",
          VIS='[(0.5, "1"), (1.5, "2"), (3, "4"), (5, "8"), (100, "+Inf")]',
          HID='[(1, "2"), (2, "4"), (4, "8"), (8, "+Inf"), (8.0001, "+Inf"), (3, "4")]'),
+    dict(fn="duration_bucket", BOUNDS="[5, 25, 125]",
+         VIS='[(1, "5"), (10, "25"), (60, "125"), (1000, "+Inf"), (-2, "5")]',
+         HID='[(5, "25"), (25, "125"), (125, "+Inf"), (125.5, "+Inf"), (5.0, "25"), (4.999, "5"), (5.001, "25")]'),
 ]
 _T8_LESSONS = dict(
     gold="Dashboards disagreed with the metrics backend at exact boundary values. The project's buckets are lower-inclusive: a value equal to an edge belongs to the next bucket up, so 10 with edges 10 and 50 lands in the 50 bucket, and a value equal to the last edge lands in +Inf.",

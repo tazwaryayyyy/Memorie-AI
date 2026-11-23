@@ -109,3 +109,60 @@ def summarize_quality(lessons_by_key: Mapping[str, str], scores: Mapping[str, Op
         }
         for kind, vals in kinds.items()
     }
+
+
+def pooled_quality(scores: Mapping[str, Optional[dict]], tau: float) -> dict:
+    """Label-blind pooled statistics over every scored lesson (all kinds together)."""
+    vals = sorted(v["importance_base"] for k, v in scores.items() if v is not None and k.startswith("lesson:"))
+    if not vals:
+        return {"n": 0}
+
+    def nearest_rank(p: float) -> float:
+        import math
+        return vals[max(1, math.ceil(p * len(vals))) - 1]
+
+    return {
+        "n": len(vals), "min": vals[0], "p10": nearest_rank(0.10), "median": nearest_rank(0.50),
+        "p90": nearest_rank(0.90), "max": vals[-1], "tau": tau, "admitted_at_tau": sum(v >= tau for v in vals),
+    }
+
+
+def relevance_separation(
+    memoire_factory: Callable[[], Any],
+    lessons: Mapping[str, "tuple[str, str]"],
+    specs: Mapping[str, "tuple[str, str]"],
+) -> dict:
+    """How well does plain cosine separate a task's own-family lessons from other families' lessons?
+
+    `lessons` maps key -> (family, text); `specs` maps task id -> (family, text). Uses only family
+    membership, never correctness (gold/wrong/poison all count as own-family), so a floor derived
+    from it cannot leak which lesson is right. If the pooled gap is positive the suggested floor is
+    its midpoint; otherwise there is no clean floor and the answer is None.
+    """
+    memoire = memoire_factory()
+    key_by_id: Dict[int, str] = {}
+    for key, (_, text) in lessons.items():
+        for row_id in memoire.remember_ids(text):
+            key_by_id[row_id] = key
+    total = len(key_by_id)
+    rows: List[dict] = []
+    for task_id, (family, text) in specs.items():
+        cos: Dict[str, float] = {}
+        for mem in memoire.recall_plain(text, top_k=max(total, 1)):
+            key = key_by_id.get(mem.id)
+            if key is not None:
+                cos[key] = max(cos.get(key, 0.0), float(mem.score))
+        own = [c for k, c in cos.items() if lessons[k][0] == family]
+        other = [c for k, c in cos.items() if lessons[k][0] != family]
+        if own and other:
+            rows.append({"task": task_id, "family": family, "own_min": round(min(own), 4),
+                         "own_mean": round(sum(own) / len(own), 4), "other_max": round(max(other), 4)})
+    if not rows:
+        return {"rows": [], "own_min": None, "other_max": None, "gap": None, "separable": False, "suggested_floor": None}
+    own_min = min(r["own_min"] for r in rows)
+    other_max = max(r["other_max"] for r in rows)
+    gap = round(own_min - other_max, 4)
+    return {
+        "rows": rows, "own_min": own_min, "other_max": other_max, "gap": gap, "separable": gap > 0,
+        "suggested_floor": round((own_min + other_max) / 2, 3) if gap > 0 else None,
+    }

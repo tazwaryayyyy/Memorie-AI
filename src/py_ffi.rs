@@ -148,8 +148,11 @@ impl PyMemoire {
         admission = None,
         contradiction = None,
         trial_cap = None,
-        quality_gate_threshold = None
+        quality_gate_threshold = None,
+        trial_min_cos = None,
+        verified_min_cos = None
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         db_path: &str,
         namespace: &str,
@@ -157,6 +160,8 @@ impl PyMemoire {
         contradiction: Option<&str>,
         trial_cap: Option<usize>,
         quality_gate_threshold: Option<f32>,
+        trial_min_cos: Option<f32>,
+        verified_min_cos: Option<f32>,
     ) -> PyResult<Self> {
         // Validate options before the (expensive) store/embedder is built.
         let mut config = ScoringConfig::default();
@@ -184,6 +189,23 @@ impl PyMemoire {
                 )));
             }
             config.quality_gate_threshold = threshold;
+        }
+        for (name, value, slot) in [
+            ("trial_min_cos", trial_min_cos, &mut config.trial_min_cos),
+            (
+                "verified_min_cos",
+                verified_min_cos,
+                &mut config.verified_min_cos,
+            ),
+        ] {
+            if let Some(floor) = value {
+                if !(0.0..=1.0).contains(&floor) {
+                    return Err(MemoireError::new_err(format!(
+                        "{name} must be a number in [0.0, 1.0], got {floor}"
+                    )));
+                }
+                *slot = floor;
+            }
         }
         // Opening can panic (e.g. ONNX Runtime / model initialisation), and
         // there is no lock to protect yet, so catch it here too.

@@ -90,3 +90,45 @@ def test_four_sessions_are_the_minimum_to_observe_both_mechanisms_after_a_sessio
             m.penalize(["P"])
         m.reinforce("G")
     assert poison_offered == [True, True, False]      # P is suppressed in the 4th session only
+
+
+# ---- verified relevance floor (src/quality.rs ScoringConfig::verified_min_cos) --------------------
+
+def test_without_a_floor_an_unrelated_verified_row_takes_the_only_slot_at_k_equals_one():
+    m = EngineModel({"T": 0.9, "U": 0.0}, trial_cap=1, k=1)
+    m.add("T"); m.add("U"); m.reinforce("U")
+    assert m.recall() == ["U"]
+
+
+def test_a_verified_floor_gives_the_only_slot_back_to_the_relevant_trial_row():
+    m = EngineModel({"T": 0.9, "U": 0.0}, trial_cap=1, k=1, verified_min_cos=0.3)
+    m.add("T"); m.add("U"); m.reinforce("U")
+    assert m.recall() == ["T"]
+
+
+def test_at_the_eval_settings_k3_cap1_unrelated_verified_rows_add_noise_not_displacement():
+    sims = {"T": 0.9, "U1": 0.05, "U2": 0.04}
+    open_ = EngineModel(sims, trial_cap=1, k=3)
+    floored = EngineModel(sims, trial_cap=1, k=3, verified_min_cos=0.3)
+    for m in (open_, floored):
+        for key in sims:
+            m.add(key)
+        m.reinforce("U1"); m.reinforce("U2")
+    assert "T" in open_.recall() and set(open_.recall()) == {"T", "U1", "U2"}   # noise fills the free slots
+    assert floored.recall() == ["T"]
+
+
+def test_a_floor_never_hides_a_relevant_verified_row():
+    m = EngineModel({"G": 0.6, "U": 0.05}, trial_cap=1, k=3, verified_min_cos=0.3)
+    m.add("G"); m.add("U"); m.reinforce("G"); m.reinforce("U")
+    assert m.recall() == ["G"]
+
+
+def test_a_trial_floor_keeps_unrelated_unverified_rows_out_of_the_trial_slot():
+    sims = {"T": 0.9, "U": 0.05}
+    open_ = EngineModel(sims, trial_cap=2, k=3)
+    floored = EngineModel(sims, trial_cap=2, k=3, trial_min_cos=0.3)
+    for m in (open_, floored):
+        m.add("T"); m.add("U")
+    assert set(open_.recall()) == {"T", "U"}
+    assert floored.recall() == ["T"]

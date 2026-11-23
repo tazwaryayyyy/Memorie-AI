@@ -103,6 +103,7 @@ _D1_VARIANTS = [
     dict(fn="event_time", WHAT="feed event"),
     dict(fn="invoice_stamp", WHAT="billing invoice"),
     dict(fn="audit_time", WHAT="audit-log entry"),
+    dict(fn="session_stamp", WHAT="session token"),
 ]
 _D1_LESSONS = dict(
     gold="Downstream consumers of our API rejected timestamps that carried a numeric UTC offset. The service writes UTC with a literal Z designator, for example 2024-03-10T08:30:00.123Z, and never spells it as an offset.",
@@ -247,6 +248,7 @@ _D2_VARIANTS = [
     dict(fn="transfer", WHAT="of funds"),
     dict(fn="move_credits", WHAT="of credits"),
     dict(fn="rebalance", WHAT="of quota units"),
+    dict(fn="settle", WHAT="of ledger entries"),
 ]
 _D2_LESSONS = dict(
     gold="A transfer deadlocked when two threads took the same two account locks in opposite orders. The service's rule is a single global order: lock the lower account id first and the higher id second, regardless of which argument is the source.",
@@ -334,6 +336,8 @@ _D3_VARIANTS = [
          HID='[("5.00", "2.5", "0.12"), ("1.00", "2.5", "0.02"), ("21.00", "2.5", "0.52"), ("3.00", "2.5", "0.08"), ("19.99", "7.25", "1.45")]'),
     dict(fn="platform_cut", WHAT="platform commission",
          HID='[("1.25", "10", "0.12"), ("0.25", "10", "0.02"), ("5.25", "10", "0.52"), ("0.75", "10", "0.08"), ("19.99", "7.25", "1.45")]'),
+    dict(fn="handling_fee", WHAT="handling fee",
+         HID='[("1.00", "12.5", "0.12"), ("0.20", "12.5", "0.02"), ("4.20", "12.5", "0.52"), ("0.60", "12.5", "0.08"), ("19.99", "7.25", "1.45")]'),
 ]
 _D3_LESSONS = dict(
     gold="Fees disagreed with the ledger by a cent on exact half-cent amounts. The ledger rounds a tie to the nearest even cent (banker's rounding), so 0.125 becomes 0.12 and 0.135 becomes 0.14. Compute in Decimal and quantize with that mode.",
@@ -413,6 +417,7 @@ _D4_VARIANTS = [
     dict(fn="session_key", WHAT="login session"),
     dict(fn="profile_key", WHAT="user profile"),
     dict(fn="quota_key", WHAT="rate-quota counter"),
+    dict(fn="token_key", WHAT="API token"),
 ]
 _D4_LESSONS = dict(
     gold="Other services missed our cache entries because tenant ids arrive in different cases. Keys are tenant:kind:id where only the tenant is lowercased; kind and id are used exactly as given.",
@@ -549,6 +554,7 @@ _D5_VARIANTS = [
     dict(fn="status_for", DUP="DuplicateError", RL="RateLimited"),
     dict(fn="http_status", DUP="AlreadyExists", RL="TooManyRequests"),
     dict(fn="code_for_error", DUP="Conflict", RL="Throttled"),
+    dict(fn="error_status", DUP="Exists", RL="Limited"),
 ]
 _D5_LESSONS = dict(
     gold="Clients treated rejected input as malformed syntax. The service answers 422 for ValueError, including subclasses such as JSONDecodeError, and keeps the contract statuses for every other class.",

@@ -16,7 +16,7 @@ def test_dry_run_needs_no_key_and_makes_no_calls(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     assert main(BASE + [str(tmp_path / "o.jsonl"), "--dry-run", "--arms", "A"]) == 0
     out = capsys.readouterr().out
-    assert "planned calls: 15" in out and not (tmp_path / "o.jsonl").exists()
+    assert "planned calls: 20" in out and not (tmp_path / "o.jsonl").exists()
 
 
 def test_floating_latest_model_is_rejected(tmp_path, capsys):
@@ -151,6 +151,9 @@ def test_diagnose_prints_and_writes_quality_scores_for_every_dev_lesson(tmp_path
     assert all(data[k]["quality"]["importance_base"] is not None for k in lesson_keys)
     assert not any("quality" in data[k] for k in data if k.startswith("spec:"))
     assert set(data["_quality_summary"]) == {"gold", "vague", "wrong", "poison"}
+    assert data["_quality_pooled"]["n"] == 20 and "p10" in data["_quality_pooled"]
+    assert "_relevance_separation" in data
+    assert "pooled over all 20 lessons" in text and "relevance separation" in text
 
 
 def test_run_records_carry_the_quality_score_of_retrieved_lessons(tmp_path, monkeypatch):
@@ -182,3 +185,39 @@ def test_summarize_detail_shows_visible_hidden_status_and_failing_tests(tmp_path
     assert "http_status/s1 seed=0 FAIL vis=ok hid=FAIL" in out
     assert "wire_timestamp/s1 seed=0 PASS vis=ok hid=ok" in out
     assert "failed=['test_bad_input_status'" in out or "failed=[" in out
+
+
+# ---- step 8c-4: retrieval floors, admission and store scope flags ----------------------------
+
+def test_retrieval_flags_reach_the_memoire_constructor_and_the_records(tmp_path, monkeypatch):
+    from eval.tests.fakes import FakeMemoire
+    _capture_client(monkeypatch)
+    seen = []
+    monkeypatch.setattr("eval.lesson_store.make_memoire", lambda **kw: (seen.append(kw), FakeMemoire())[1])
+    out = str(tmp_path / "f.jsonl")
+    argv = BASE + [out, "--arms", "C0", "--families", "wire_timestamp", "--verified-min-cos", "0.3",
+                   "--trial-min-cos", "0.2", "--store-scope", "family", "--admission", "quality_gate",
+                   "--quality-gate-threshold", "0.1", "--trial-cap", "2"]
+    assert main(argv) == 0
+    assert seen and seen[0] == {"contradiction": "off", "trial_cap": 2, "admission": "quality_gate",
+                                "quality_gate_threshold": 0.1, "trial_min_cos": 0.2, "verified_min_cos": 0.3}
+    rec = json.loads(open(out).readline())
+    assert (rec["verified_min_cos"], rec["trial_min_cos"], rec["store_scope"], rec["admission"]) == (0.3, 0.2, "family", "quality_gate")
+
+
+def test_defaults_leave_engine_defaults_untouched_and_run_four_sessions(tmp_path, monkeypatch):
+    from eval.tests.fakes import FakeMemoire
+    _capture_client(monkeypatch)
+    seen = []
+    monkeypatch.setattr("eval.lesson_store.make_memoire", lambda **kw: (seen.append(kw), FakeMemoire())[1])
+    out = str(tmp_path / "d.jsonl")
+    assert main(BASE + [out, "--arms", "C0", "--families", "wire_timestamp"]) == 0
+    assert seen[0]["verified_min_cos"] is None and seen[0]["trial_min_cos"] is None and seen[0]["admission"] == "admit_all"
+    assert [json.loads(l)["session"] for l in open(out)] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("flag", ["--verified-min-cos", "--trial-min-cos", "--quality-gate-threshold"])
+@pytest.mark.parametrize("bad", ["1.5", "-0.1"])
+def test_out_of_range_floors_are_rejected_by_the_parser(flag, bad):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(BASE + ["x", flag, bad])

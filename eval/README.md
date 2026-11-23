@@ -16,7 +16,7 @@ have been run on the held-out split.
 Retrieval query = the task spec. Notes are shown identically in B/C0/C1 (no `MemoryPolicy`
 gating yet). `contradiction` defaults to `off` so the frozen bank is not rewritten.
 
-## Task suite (single-choice convention families, Step 8c-3)
+## Task suite (single-choice convention families, Steps 8c-3/8c-4)
 Each family asks for ordinary, generally-correct code and leaves exactly ONE choice open, a
 genuine 2-3 way engineering decision (`eval/tasks/design.py` lists the dimension, the options and
 which is gold). The spec fixes everything else and says the team's choice "is not documented in
@@ -56,21 +56,45 @@ wrongly required both locks to be taken before an error check). Now one choice p
 - Every non-gold option is implemented (`naive` + `alternates`) and must pass visible and fail hidden,
   which is what "visible tests are neutral across options" means here.
 - Arm A is bounded by guessing, not model skill, so the [0.15, 0.45] target is a screen. With 5 families
-  x 3 near-identical sessions, results arrive in steps of 0.2: expect 0, 3 or 6 passes per family pair.
+  x 4 near-identical sessions, results arrive in steps of 0.2 (all four sessions of a family usually agree).
 - Gold lessons contain the answer, so B/C0/C1 mostly test retrieval plus trust under conflict. This is
   not evidence about general bug avoidance. Process isolation only: candidate code runs as your OS user.
 
-### How many sessions does feedback need? (from src/store.rs, src/quality.rs)
-A row with any feedback is *verified*: it bypasses `trial_cap` and has **no similarity floor**; it is
-hidden when `2f > 3s + 2` (two failures with no success) and reaches `follow` when `3s >= 8 + 7f`
-(three successes). `eval/tests/test_poison_timeline.py` encodes the timelines; the native test checks
-them against the real engine.
-- Poison ingested before session 2 gets f=1 after s2 and f=2 after s3: it is hidden only for a
-  4th session, so **a 3-session family cannot show poison suppression**. It stays on offer at s3 as a
-  verified `hint`, and a once-failed row keeps its slot while untried rows are capped.
-- Poison present from session 1 is hidden before s3. A `wrong` lesson used and failed in s1 and s2 likewise.
-- Gold is `trial` at s1, `hint` at s2 and s3, and `follow` only at a 4th session.
-- Verified rows from earlier families can fill the verified slots at later families' s1.
+### Sessions: 4 per family (Step 8c-4)
+A row with any feedback is *verified*: it bypasses `trial_cap` and is hidden when `2f > 3s + 2` (two
+failures with no success); it reaches `follow` when `3s >= 8 + 7f` (three successes). Three sessions
+could not show either mechanism inside an episode, so every family now has `s1..s4`
+(dev 5 x 4 = 20 tasks, test 8 x 4 = 32; `s4` re-skins the same choice). With the poison ingested
+before `s2`: offered as a `trial` at s2, as a verified `hint` at s3 (f=1), hidden at s4 (f=2 after
+s3). Gold is `trial` at s1, `hint` at s2 and s3, `follow` at s4. `test_poison_timeline.py` (rules
+mirror) and `test_four_sessions.py` (the real run loop) pin this; the native tests check the engine.
+
+### Cross-family leakage and the relevance floors (src/quality.rs `ScoringConfig`)
+Before 8c-4 only `trial_min_cos` existed (default 0.0, not reachable from Python) and verified rows had
+no floor. In a store shared by several families this leaks in two ways, both reproduced offline in
+`test_four_sessions.py`: (1) a verified row from another family is offered whatever its similarity;
+(2) once a family's own unverified lessons are used up, `trial_min_cos = 0` hands the trial slot to an
+unrelated family's lesson, and feedback then lands on lessons before their own first session.
+At the eval settings (`top_k=3, trial_cap=1`) this is prompt noise and misattributed feedback, not
+displacement of the relevant trial row; displacement happens at `top_k=1` or a larger `trial_cap`.
+- New `verified_min_cos` (default 0.0 = previous behaviour); `trial_min_cos` is now exposed to Python too.
+  Neither applies to `include_hidden=True`. Flags: `--verified-min-cos`, `--trial-min-cos`.
+- `--store-scope family` (a fresh store per family) is the isolation control; default `shared`.
+- Label-blind floor rule: `diagnose` prints the lowest own-family and highest other-family cosine over
+  all task specs and lessons (family membership only, never correctness). If the gap is positive, the
+  floor is its midpoint, derived on dev and applied unchanged to test; if not, there is no clean floor
+  and `--store-scope family` is the only clean control.
+
+### C1 and the quality gate: pre-registered rule
+All memory arms (B, C0, C1) ingest with `--admission admit_all`; no tau_q is tuned, because the
+hypothesis is outcome-attributed trust, not an ingest gate. On the dev bank every lesson scores below
+0.30 (engine default tau_q = 0.50 would hide all 20: the cold-start deadlock). The scores also track how
+the bank was written, not whether a lesson is right: mean importance is gold 0.178 > vague 0.157 > wrong
+0.126 > poison 0.108, and the two lowest-scoring lessons are a `wrong` (0.019) and a `poison` (0.025).
+So any threshold, even a label-blind pooled percentile such as p10, hides only bad lessons and would hand
+whichever arm uses the gate a win from authoring style. Do not run a gate arm on this bank; if one is
+run anyway, apply the same tau_q to B, C0 and C1, and report `shadowed_keys` (recorded per run) by kind
+as a confound, not a result.
 
 ## Checkpointing
 `--out file.jsonl` is append-only; key = `(arm, family, session, seed)`. Re-running the same command
@@ -96,5 +120,7 @@ thinking models can count reasoning tokens against it.
 =8 times with exponential backoff and jitter), so leave headroom: a 15-call pilot needs about 40.
 `diagnose` also writes each lesson's ingest `importance_base` (quality score) for tau_q selection; the
 gate sees text features only, so do not fit tau_q to separate gold from wrong.
+
+`diagnose` also prints the label-blind relevance separation (own-family vs other-family cosine).
 
 Exit codes: 0 ok, 2 usage/config, 3 LLM/fingerprint error, 4 `--max-calls` reached (resumable).

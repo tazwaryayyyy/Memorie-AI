@@ -102,6 +102,8 @@ class Memoire:
         contradiction: Optional[str] = None,
         trial_cap: Optional[int] = None,
         quality_gate_threshold: Optional[float] = None,
+        trial_min_cos: Optional[float] = None,
+        verified_min_cos: Optional[float] = None,
     ) -> None:
         """
         Open or create a Memoire database at `db_path` scoped to `namespace`.
@@ -123,6 +125,12 @@ class Memoire:
                 below it the chunk is stored hidden as ``shadow``. Values outside
                 [0.0, 1.0] (and NaN) raise ``MemoireError``. Ignored under ``admission="admit_all"``. Calibrate it on a
                 dev split, not on the data you report results on.
+            trial_min_cos: Minimum cosine similarity for an *unverified* memory to be offered
+                (default 0.0: no floor). Values outside [0.0, 1.0] (and NaN) raise ``MemoireError``.
+            verified_min_cos: Minimum cosine similarity for a *verified* memory (one with any
+                feedback) to be offered (default 0.0: no floor, so an unrelated row that once
+                earned feedback can still surface for a new topic). Same validation. Neither
+                floor applies to ``include_hidden=True``. Calibrate on a dev split.
 
         Raises:
             MemoireError: if the library fails to initialise.
@@ -142,6 +150,10 @@ class Memoire:
                 options["trial_cap"] = trial_cap
             if quality_gate_threshold is not None:
                 options["quality_gate_threshold"] = float(quality_gate_threshold)
+            if trial_min_cos is not None:
+                options["trial_min_cos"] = float(trial_min_cos)
+            if verified_min_cos is not None:
+                options["verified_min_cos"] = float(verified_min_cos)
             self._impl = _NativeMemoire(db_path, namespace, **options)
         except Exception as e:
             raise MemoireError(f"Failed to initialize Memoire: {e}") from e

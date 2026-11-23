@@ -80,3 +80,36 @@ def test_summarize_quality_counts_admissions_per_kind_and_tau():
     assert summary["gold"]["admitted"]["0.50"] == 1 and summary["gold"]["admitted"]["0.40"] == 2
     assert summary["wrong"]["n"] == 1 and summary["wrong"]["admitted"]["0.50"] == 1
     assert set(summary["gold"]["admitted"]) == {f"{t:.2f}" for t in TAU_GRID}
+
+
+# ---- step 8c-4: pooled quality and relevance separation --------------------------------------
+
+from eval.diagnostics import pooled_quality, relevance_separation  # noqa: E402
+
+
+def test_pooled_quality_is_label_blind_and_counts_admissions():
+    scores = {f"lesson:f:{k}": {"importance_base": v} for k, v in
+              [("gold", 0.10), ("vague", 0.20), ("wrong", 0.30), ("poison", 0.40)]}
+    scores["spec:f/s1"] = {"importance_base": 0.99}      # specs are ignored
+    pooled = pooled_quality(scores, 0.25)
+    assert pooled["n"] == 4 and pooled["min"] == 0.10 and pooled["max"] == 0.40
+    assert pooled["admitted_at_tau"] == 2 and pooled["p10"] == 0.10 and pooled["median"] == 0.20
+    assert pooled_quality({}, 0.5) == {"n": 0}
+
+
+def test_relevance_separation_reports_the_family_gap_and_a_midpoint_floor():
+    lessons = {"lesson:a:gold": ("a", "alpha text"), "lesson:b:gold": ("b", "beta text")}
+    specs = {"spec:a/s1": ("a", "alpha spec"), "spec:b/s1": ("b", "beta spec")}
+    scratch = FakeScratch({("alpha spec", "alpha text"): 0.6, ("alpha spec", "beta text"): 0.2,
+                           ("beta spec", "beta text"): 0.5, ("beta spec", "alpha text"): 0.3})
+    sep = relevance_separation(lambda: scratch, lessons, specs)
+    assert (sep["own_min"], sep["other_max"], sep["gap"]) == (0.5, 0.3, 0.2)
+    assert sep["separable"] and sep["suggested_floor"] == 0.4
+
+
+def test_relevance_separation_says_so_when_there_is_no_clean_floor():
+    lessons = {"lesson:a:gold": ("a", "alpha text"), "lesson:b:gold": ("b", "beta text")}
+    specs = {"spec:a/s1": ("a", "alpha spec")}
+    scratch = FakeScratch({("alpha spec", "alpha text"): 0.3, ("alpha spec", "beta text"): 0.4})
+    sep = relevance_separation(lambda: scratch, lessons, specs)
+    assert not sep["separable"] and sep["suggested_floor"] is None and sep["gap"] == pytest.approx(-0.1)

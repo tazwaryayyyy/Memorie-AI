@@ -21,7 +21,7 @@ BANNED = ("bcrypt", "password", "parameterized", "payment", "sanitiz", "database
 def test_split_shape():
     assert len(DEV) == 5 and len(TEST) >= 8
     for fam in ALL_FAMILIES:
-        assert [t.session for t in fam.tasks] == [1, 2, 3]
+        assert [t.session for t in fam.tasks] == [1, 2, 3, 4]
         assert {t.split for t in fam.tasks} == {fam.split}
     assert not {f.name for f in DEV} & {f.name for f in TEST}
 

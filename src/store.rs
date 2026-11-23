@@ -391,8 +391,9 @@ struct Scored {
 
 /// Apply the bounded-trial exposure rule to score-sorted candidates.
 ///
-/// Evidence-bearing memories compete on score. Unverified ones (eligible when
-/// `sim >= trial_min_cos`) get at most `trial_cap` slots, so feedback can reach them
+/// Evidence-bearing memories compete on score once they clear `verified_min_cos` (default
+/// 0.0: no floor). Unverified ones (eligible when `sim >= trial_min_cos`) get at most
+/// `trial_cap` slots, so feedback can reach them
 /// without untested text crowding out verified memories. With no verified candidates
 /// the cap alone bounds exposure; with `k == 1` and a verified candidate the verified
 /// one always wins. Output is sorted by score, descending.
@@ -400,6 +401,7 @@ fn select_with_trial_cap(items: Vec<Scored>, k: usize, cfg: &ScoringConfig) -> V
     let (mut verified, mut trial): (Vec<Scored>, Vec<Scored>) =
         items.into_iter().partition(|item| !item.unverified);
     trial.retain(|item| item.sim >= cfg.trial_min_cos);
+    verified.retain(|item| item.sim >= cfg.verified_min_cos);
 
     let max_trial = cfg.trial_cap.min(k);
     let n_trial = if verified.is_empty() {
@@ -3003,6 +3005,68 @@ mod tests {
         let results = store.search(&[1.0, 0.0], 3, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "related");
+    }
+
+    #[test]
+    fn verified_min_cos_drops_unrelated_verified_rows_but_keeps_related_ones() {
+        let store = Store::in_memory_with_config(ScoringConfig {
+            verified_min_cos: 0.3,
+            ..ScoringConfig::default()
+        })
+        .unwrap();
+        store.insert("trial", &[1.0, 0.0, 0.0]).unwrap();
+        store
+            .insert_with_quality(
+                "unrelated verified",
+                &[0.0, 1.0, 0.0],
+                &live_meta("unrelated verified", 3),
+            )
+            .unwrap();
+        store
+            .insert_with_quality(
+                "related verified",
+                &[0.8, 0.6, 0.0],
+                &live_meta("related verified", 3),
+            )
+            .unwrap();
+
+        let results = store.search(&[1.0, 0.0, 0.0], 3, false).unwrap();
+        assert!(results.iter().any(|m| m.content == "related verified"));
+        assert!(results.iter().any(|m| m.content == "trial"));
+        assert!(
+            !results.iter().any(|m| m.content == "unrelated verified"),
+            "a verified row below the floor is not offered"
+        );
+        // The hidden-rows view is an operator view: no floor, no cap.
+        assert_eq!(store.search(&[1.0, 0.0, 0.0], 3, true).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn verified_below_the_floor_does_not_take_the_only_slot() {
+        // Default floor 0.0: with k == 1 an unrelated verified row beats the relevant trial row.
+        let open = Store::in_memory().unwrap();
+        // Floor above the unrelated row's cosine: the relevant trial row gets the slot.
+        let floored = Store::in_memory_with_config(ScoringConfig {
+            verified_min_cos: 0.3,
+            ..ScoringConfig::default()
+        })
+        .unwrap();
+        for store in [&open, &floored] {
+            store.insert("trial", &[1.0, 0.0, 0.0]).unwrap();
+            store
+                .insert_with_quality(
+                    "unrelated verified",
+                    &[0.0, 1.0, 0.0],
+                    &live_meta("unrelated verified", 3),
+                )
+                .unwrap();
+        }
+        let one = open.search(&[1.0, 0.0, 0.0], 1, false).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].content, "unrelated verified");
+        let one = floored.search(&[1.0, 0.0, 0.0], 1, false).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].content, "trial");
     }
 
     #[test]
