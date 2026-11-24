@@ -8,9 +8,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import HARNESS_VERSION
-from .arms import apply_feedback, has_feedback, replay_feedback, retrieve, uses_memory
+from .arms import (apply_feedback, effective_prompt_policy, has_feedback, prompt_notes, replay_feedback, retrieve,
+                   uses_memory)
 from .lesson_store import LessonStore
-from .prompt import build_messages, parse_response, prompt_template_hash_input
+from .prompt import PROMPT_POLICIES, build_messages, parse_response, prompt_template_hash_input
 from .sandbox import grade
 from .tasks.base import Family, Task, canonical_hash, families_hash
 
@@ -43,6 +44,11 @@ class RunSettings:
     trial_min_cos: Optional[float] = None
     verified_min_cos: Optional[float] = None
     store_scope: str = "shared"  # "shared": one store for the whole split; "family": a fresh store per family
+    prompt_policy: str = "plain"  # "tagged": engine outcome tags on C0/C1 notes only (prompt.tag_for)
+
+    def __post_init__(self) -> None:
+        if self.prompt_policy not in PROMPT_POLICIES:
+            raise ValueError(f"unknown prompt_policy {self.prompt_policy!r}; expected one of {PROMPT_POLICIES}")
 
     def fingerprint(self, families: Sequence[Family]) -> str:
         hashes = families_hash(families)
@@ -52,7 +58,7 @@ class RunSettings:
                 "settings": self.__dict__,
                 "tasks": hashes["tasks"],
                 "lessons": hashes["lessons"],
-                "prompt": canonical_hash(prompt_template_hash_input()),
+                "prompt": canonical_hash(prompt_template_hash_input(self.prompt_policy)),
             }
         )
 
@@ -185,7 +191,8 @@ def run_sequence(
                 raise BudgetExhausted(f"--max-calls {max_calls} reached; rerun the same command to resume")
 
             shown = retrieve(arm, store, task, settings.top_k)
-            messages = build_messages(task, [r.text for r in shown] if uses_memory(arm) else None)
+            policy = effective_prompt_policy(arm, settings.prompt_policy)
+            messages = build_messages(task, prompt_notes(arm, shown, settings.prompt_policy), policy)
             response = llm.complete(messages, seed=seed)
             parsed = parse_response(response.text, task, len(shown), uses_memory(arm))
 
@@ -219,6 +226,7 @@ def run_sequence(
                 "trial_min_cos": settings.trial_min_cos,
                 "verified_min_cos": settings.verified_min_cos,
                 "store_scope": settings.store_scope,
+                "prompt_policy": policy,
                 "shadowed_keys": sorted(store.shadowed) if store is not None else [],
                 "top_k": settings.top_k,
                 "trial_cap": settings.trial_cap,
@@ -230,7 +238,7 @@ def run_sequence(
                 "used_keys": [shown[i - 1].key for i in parsed.used_indices],
                 "retrieved": [
                     {
-                        "key": r.key, "kind": r.kind, "id": r.id, "score": r.score, "trust": r.trust,
+                        "key": r.key, "kind": r.kind, "id": r.id, "score": r.score, "cos": r.cos, "trust": r.trust,
                         "exposure": r.exposure, "state": r.state,
                         "exemplar_cos": (diag.get(f"lesson:{r.key}") or {}).get("max_cos"),
                         "quality_score": ((diag.get(f"lesson:{r.key}") or {}).get("quality") or {}).get("importance_base"),

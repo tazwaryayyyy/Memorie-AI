@@ -62,7 +62,9 @@ def test_arm_b_is_plain_cosine_and_side_effect_free(tmp_path):
 def test_arm_c0_uses_recall_and_never_writes_feedback_even_when_notes_are_declared(tmp_path):
     _, fake, _, results = run(ARM_C0, tmp_path, choose=lambda t: "naive", declare=lambda n: [1, 2])
     names = {c[0] for c in fake.calls}
-    assert names <= {"remember_ids", "recall"}, names
+    # recall_plain is the read-only raw-cosine diagnostic (LessonStore._plain_cosines); it writes nothing.
+    assert names <= {"remember_ids", "recall", "recall_plain"}, names
+    assert fake.writes_after_ingest() == []
     assert all(r["feedback_events"] == [] for r in results.ordered)
     assert results.ordered[0]["used_keys"]  # declarations are still recorded
 

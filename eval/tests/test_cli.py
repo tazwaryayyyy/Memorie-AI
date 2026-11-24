@@ -221,3 +221,16 @@ def test_defaults_leave_engine_defaults_untouched_and_run_four_sessions(tmp_path
 def test_out_of_range_floors_are_rejected_by_the_parser(flag, bad):
     with pytest.raises(SystemExit):
         build_parser().parse_args(BASE + ["x", flag, bad])
+
+
+def test_prompt_policy_flag_reaches_the_records_and_defaults_to_plain(tmp_path, monkeypatch):
+    _capture_client(monkeypatch)
+    monkeypatch.setattr("eval.lesson_store.make_memoire", lambda **kw: FakeMemoire())
+    for policy, arm, expected in (("tagged", "C0", "tagged"), ("tagged", "B", "plain"), (None, "C1", "plain")):
+        out = str(tmp_path / f"{policy}-{arm}.jsonl")
+        argv = BASE + [out, "--arms", arm, "--families", "wire_timestamp"] + (["--prompt-policy", policy] if policy else [])
+        assert main(argv) == 0
+        recs = [json.loads(line) for line in open(out)]
+        assert recs and {r["prompt_policy"] for r in recs} == {expected}, (policy, arm)
+    with pytest.raises(SystemExit):
+        main(BASE + [str(tmp_path / "bad.jsonl"), "--arms", "C0", "--prompt-policy", "fancy"])

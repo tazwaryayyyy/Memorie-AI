@@ -2802,7 +2802,7 @@ mod tests {
     #[test]
     fn test_ranking_improves_after_penalizing_bad_memory() {
         let store = Store::in_memory().unwrap();
-        // Same embedding so cosine sim is equal â€” ranking separates via effective_weight
+        // Same embedding so cosine sim is equal: ranking separates via `trust` (s=3,f=3 -> 0.50 vs s=3,f=0 -> 0.71)
         let mut bad_meta = QualityMeta::default_active("float is fine for money");
         bad_meta.importance_base = 0.7;
         bad_meta.confidence = 0.7;
@@ -2819,7 +2819,7 @@ mod tests {
             .insert_with_quality("decimal is correct for money", &[1.0, 0.0, 0.0], &good_meta)
             .unwrap();
 
-        // Apply 3 failures to the bad memory â€” rc: 3â†’2â†’1â†’0, conf/imp decay each round
+        // Apply 3 failures to the bad memory: only failure_count changes (rc/importance are left alone)
         for _ in 0..3 {
             store.penalize_if_used(&[bad_id], 1.0).unwrap();
         }
@@ -2829,6 +2829,67 @@ mod tests {
         assert_eq!(
             results[0].content, "decimal is correct for money",
             "good memory must outrank penalized bad memory after 3 failures"
+        );
+    }
+
+    /// Unit vector in the (x, y) plane whose cosine with the query `[1, 0]` is `cos`.
+    fn at_cosine(cos: f32) -> Vec<f32> {
+        vec![cos, (1.0 - cos * cos).sqrt()]
+    }
+
+    /// Pilot shape (eval `http_status` s4): the penalized row is a hair closer by raw cosine
+    /// (0.614 vs 0.612) but the other row has a recorded success. Ranking is
+    /// `0.75*cos + 0.20*trust + 0.05*recency`, so trust 0.60 vs 0.40 is worth +0.04 and must win.
+    /// This pins that `trust` (not the unused-for-ranking `effective_weight`) separates the two.
+    #[test]
+    fn test_verified_trust_outranks_slightly_closer_penalized_row() {
+        let store = Store::in_memory().unwrap();
+        let query = [1.0_f32, 0.0];
+        let gold = store.insert("gold lesson", &at_cosine(0.612)).unwrap();
+        let poison = store.insert("poison lesson", &at_cosine(0.614)).unwrap();
+        assert!(store.reinforce_declared(gold, Some("s1")).unwrap());
+        store.penalize_if_used(&[poison], 1.0).unwrap();
+
+        let results = store.search(&query, 2, false).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].id, gold,
+            "verified trust=0.60 must outrank penalized trust=0.40"
+        );
+        assert_eq!(results[1].id, poison);
+        // Beta(2,2) posterior: (2+1)/(4+1+0) = 0.6 and (2+0)/(4+0+1) = 0.4.
+        assert!(
+            (results[0].trust - 0.6).abs() < 1e-3,
+            "gold trust {}",
+            results[0].trust
+        );
+        assert!(
+            (results[1].trust - 0.4).abs() < 1e-3,
+            "poison trust {}",
+            results[1].trust
+        );
+        assert!(
+            results[0].score > results[1].score,
+            "output order must be descending score"
+        );
+    }
+
+    /// With identical cosine the order is decided by trust alone: a recorded success ranks
+    /// above a recorded failure.
+    #[test]
+    fn test_equal_cosine_orders_by_trust_success_then_failure() {
+        let store = uncapped();
+        let query = [1.0_f32, 0.0];
+        let emb = at_cosine(0.7);
+        let failed = store.insert("failed lesson", &emb).unwrap();
+        let worked = store.insert("worked lesson", &emb).unwrap();
+        assert!(store.reinforce_declared(worked, Some("s1")).unwrap());
+        store.penalize_if_used(&[failed], 1.0).unwrap();
+
+        let results = store.search(&query, 2, false).unwrap();
+        assert_eq!(
+            results.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![worked, failed]
         );
     }
 

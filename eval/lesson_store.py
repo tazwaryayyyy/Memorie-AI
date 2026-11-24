@@ -29,6 +29,7 @@ class Retrieved:
     trust: float
     exposure: str
     state: str
+    cos: Optional[float] = None  # raw cosine(query, lesson); `score` is the engine's BLENDED rank score
 
 
 def make_memoire(
@@ -112,11 +113,24 @@ class LessonStore:
             )
         return out
 
+    def _plain_cosines(self, query: str) -> Dict[int, float]:
+        """id -> raw cosine for every lesson, via the read-only `recall_plain` (no trust, no writes)."""
+        total = len(self._by_id)
+        return {m.id: float(m.score) for m in self._m.recall_plain(query, top_k=total)} if total else {}
+
     def recall(self, query: str, top_k: int) -> List[Retrieved]:
-        return self._wrap(self._m.recall(query, top_k=top_k))
+        rows = self._wrap(self._m.recall(query, top_k=top_k))
+        if rows:
+            cosines = self._plain_cosines(query)
+            for row in rows:
+                row.cos = cosines.get(row.id)
+        return rows
 
     def recall_plain(self, query: str, top_k: int) -> List[Retrieved]:
-        return self._wrap(self._m.recall_plain(query, top_k=top_k))
+        rows = self._wrap(self._m.recall_plain(query, top_k=top_k))
+        for row in rows:
+            row.cos = row.score  # plain recall's score IS the cosine
+        return rows
 
     def reinforce(self, key: str, session_id: str) -> bool:
         return bool(self._m.reinforce_declared(self._id_by_key[key], session_id))

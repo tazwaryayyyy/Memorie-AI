@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 from .arms import ALL_ARMS, ARM_A, normalize_arm, uses_memory
 from .diagnostics import (TAU_GRID, exemplar_cosines, pooled_quality, quality_scores, relevance_separation,
                           summarize_quality)
+from .prompt import POLICY_PLAIN, PROMPT_POLICIES
 from .llm import DEFAULT_BASE_URL, MIN_RECOMMENDED_MAX_TOKENS, LLMError, OpenAICompatClient
 from .prompt import build_messages
 from .runner import (BudgetExhausted, FingerprintMismatch, ResultsFile, RunSettings, run_sequence,
@@ -40,6 +41,7 @@ def _settings(args, families) -> RunSettings:
         contradiction=args.contradiction, max_tokens=args.max_tokens, send_api_seed=args.send_api_seed,
         admission=args.admission, quality_gate_threshold=args.quality_gate_threshold,
         trial_min_cos=args.trial_min_cos, verified_min_cos=args.verified_min_cos, store_scope=args.store_scope,
+        prompt_policy=args.prompt_policy,
     )
 
 
@@ -156,15 +158,26 @@ def _status(outcome: Optional[dict]) -> str:
     return "ok" if outcome.get("exit_code") == 0 else "FAIL"
 
 
+def _shown(record: dict) -> str:
+    """Compact view of what the engine offered: kind:exposure:trust:cos per note, in prompt order.
+    `cos` is the raw cosine; the engine's `score` also blends in trust, so compare cos, not score."""
+    parts = []
+    for r in record.get("retrieved") or []:
+        cos = r.get("cos")
+        parts.append(f"{r['key'].split(':')[-1]}:{r['exposure']}:{r['trust']:.2f}:" + ("?" if cos is None else f"{cos:.3f}"))
+    return ",".join(parts) or "-"
+
+
 def _print_detail(records: List[dict]) -> None:
-    print("per-run detail (visible/hidden; failing test names come from the last 4000 chars of output):")
+    print("per-run detail (visible/hidden; failing test names come from the last 4000 chars of output;\n"
+          "shown = kind:exposure:trust:raw_cos per note in prompt order):")
     for r in sorted(records, key=lambda r: (r["arm"], r["family"], r["session"], r["seed"])):
         g = r["grading"]
         failed = _failed_tests((g.get("hidden") or {}).get("output", ""))
         used = ",".join(r.get("used_keys") or []) or "-"
         print(f"  {r['arm']:16s} {r['family']}/s{r['session']} seed={r['seed']} "
               f"{'PASS' if r['passed'] else 'FAIL'} vis={_status(g.get('visible'))} hid={_status(g.get('hidden'))} "
-              f"finish={r.get('finish_reason')} failed={failed or '-'} used={used}")
+              f"finish={r.get('finish_reason')} failed={failed or '-'} used={used} shown={_shown(r)}")
 
 
 def cmd_summarize(args) -> int:
@@ -309,6 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--store-scope", choices=("shared", "family"), default="shared",
                    help="shared: one store for the whole split (cross-family feedback can spill over); "
                         "family: a fresh store per family")
+    r.add_argument("--prompt-policy", choices=PROMPT_POLICIES, default=POLICY_PLAIN,
+                   help="plain: notes are bare text (default). tagged: C0/C1 notes carry the engine's outcome tag "
+                        "([UNTESTED] / [TRUST x.xx: ...]); A and B are unaffected. Part of the run fingerprint")
     r.add_argument("--max-calls", type=int, default=0,
                    help="stop after this many HTTP requests, retries included (0 = no cap); leave headroom for 5xx retries")
     r.add_argument("--max-retries", type=int, default=8,

@@ -5,12 +5,16 @@ B  plain_vector      LessonStore.recall_plain: cosine top-k, no trust, no writes
 C0 memoire_static    LessonStore.recall (trust-ranked, trial-capped), never any feedback.
 C1 memoire_feedback  like C0, plus outcome-attributed feedback on DECLARED notes only:
                      task passed -> reinforce_declared; task failed -> penalize_if_used.
+
+`--prompt-policy tagged` adds engine-derived outcome tags to C0/C1 notes only (see prompt.tag_for);
+A has no notes and B stays plain because plain cosine retrieval has no trust to show.
 """
 from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
 from .lesson_store import FAILURE_SEVERITY, LessonStore, Retrieved
+from .prompt import POLICY_PLAIN, POLICY_TAGGED, Note
 from .tasks.base import Task
 
 ARM_A = "no_memory"
@@ -34,6 +38,21 @@ def uses_memory(arm: str) -> bool:
 
 def has_feedback(arm: str) -> bool:
     return arm == ARM_C1
+
+
+def effective_prompt_policy(arm: str, policy: str) -> str:
+    """The policy actually applied to this arm's prompt: tags exist only for the trust-ranked arms."""
+    return POLICY_TAGGED if policy == POLICY_TAGGED and arm in (ARM_C0, ARM_C1) else POLICY_PLAIN
+
+
+def prompt_notes(arm: str, shown: Sequence[Retrieved], policy: str):
+    """What build_messages receives: None for A, plain strings for B (and for plain policy), Note objects
+    (text + engine trust/exposure) for C0/C1 under the tagged policy."""
+    if not uses_memory(arm):
+        return None
+    if effective_prompt_policy(arm, policy) == POLICY_TAGGED:
+        return [Note(r.text, r.trust, r.exposure) for r in shown]
+    return [r.text for r in shown]
 
 
 def retrieve(arm: str, store: Optional[LessonStore], task: Task, top_k: int) -> List[Retrieved]:

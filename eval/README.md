@@ -13,8 +13,9 @@ have been run on the held-out split.
 | C0 | `memoire_static` | `recall` (trust-ranked, `trial_cap`) | none |
 | C1 | `memoire_feedback` | `recall` | declared notes only: pass -> `reinforce_declared`, fail -> `penalize_if_used` |
 
-Retrieval query = the task spec. Notes are shown identically in B/C0/C1 (no `MemoryPolicy`
-gating yet). `contradiction` defaults to `off` so the frozen bank is not rewritten.
+Retrieval query = the task spec. By default notes are shown identically in B/C0/C1 as bare text
+(`--prompt-policy plain`); `--prompt-policy tagged` adds engine outcome tags to C0/C1 only (Step 8c-5
+below). `contradiction` defaults to `off` so the frozen bank is not rewritten.
 
 ## Task suite (single-choice convention families, Steps 8c-3/8c-4)
 Each family asks for ordinary, generally-correct code and leaves exactly ONE choice open, a
@@ -95,6 +96,53 @@ So any threshold, even a label-blind pooled percentile such as p10, hides only b
 whichever arm uses the gate a win from authoring style. Do not run a gate arm on this bank; if one is
 run anyway, apply the same tau_q to B, C0 and C1, and report `shadowed_keys` (recorded per run) by kind
 as a confound, not a result.
+
+## Step 8c-5: ranking facts, prompt policy, and the pre-seeded bank
+
+### What ranks the notes (read before interpreting a `score=` in a log)
+`Store::search_filtered` (src/store.rs) sorts by `final_score = 0.75*cos + 0.20*trust + 0.05*recency`;
+`effective_weight` is output-only and plays no part. `trust = (2+s)/(4+s+f)`, so one success is 0.60, one
+failure 0.40, and the `score` printed in a record is already this blend, **not** the cosine. Consequences:
+- A `trust=0.40` row beats a `trust=0.60` row only if its raw cosine is higher by more than
+  `0.20*0.20/0.75 = 0.053` (recency is equal inside one run). The pilot logs `0.671/0.40` over `0.658/0.60`
+  and `0.614/0.40` over `0.612/0.60` therefore imply cosine gaps of about 0.07 and 0.06, not 0.002 (derived
+  by arithmetic from those logged scores, recency assumed equal). Nothing there shows the sort ignoring trust;
+  it shows trust being a weak term: one outcome moves the score by only 0.02, less than ordinary cosine
+  spread between paraphrased lessons. Whether that weight should be larger is an open design question, to be
+  settled by an ablation, not by tuning on the dev pilot.
+- Records now carry `cos` (raw cosine, from the read-only `recall_plain`) next to `score`, and
+  `summarize --detail` prints `shown=kind:exposure:trust:cos` per note in prompt order, so this can be read
+  off a run instead of inferred. Runs recorded before this change have no `cos` (`?`).
+- `RecallAttribution.rank_score` (src/lib.rs `recall_explained`) is a display composite that does not drive
+  ordering; it is not touched here (public field, MCP-visible; separate step).
+
+### `--prompt-policy tagged`
+C0/C1 notes are prefixed with a tag derived **only** from the engine's `(exposure, trust)`: `[UNTESTED]`
+(no outcome recorded), `[TRUST 0.60: worked more often than it failed]`, `[TRUST 0.40: failed more often than
+it worked]`, `[TRUST 0.50: mixed record]` (`prompt.tag_for`; the wording is exact because `trust > 0.5` iff
+`s > f`). Tags never use lesson text or kind. It deliberately does not call `MemoryPolicy.evaluate`: its
+default bands put trust 0.40, 0.50 and 0.60 all in `hint`, which would hide the difference being tested. The
+word "verified" is avoided because one success is weak evidence. A and B are unaffected (B has no trust to show).
+- C0 never writes feedback, so under `tagged` every C0 note reads `[UNTESTED]`: C0-tagged is a **null control**
+  for the wrapper text itself, not a treatment.
+- The clean contrast is **C1-plain vs C1-tagged** on the same seeds (retrieval is identical, only rendering
+  differs). C0-plain vs C1-tagged would confound feedback-driven retrieval with presentation.
+- `prompt_policy` enters the run fingerprint, so use a new `--out` per policy; JSONL files recorded before this
+  step no longer resume (they still summarize).
+
+### Why the pre-seeded bank favours B at s1 (and what to run about it)
+The bank at s1 is gold + vague + wrong for the family (poison is ingested before s2, not at s1). With every
+row unverified, `select_with_trial_cap` returns at most `trial_cap=1` rows, so C0/C1 show **one** note at s1,
+the top-cosine one, which is gold only if gold happens to be nearest. B (`top_k=3`) shows the three nearest
+rows, i.e. the whole family bank (exact with `--store-scope family`; in a shared store it is the family bank
+whenever `diagnose` reports positive own/other cosine separation). B therefore always sees gold at s1 and
+C0/C1 only sometimes, which says nothing about trust. Check it with `summarize --detail` (`shown=` at s1).
+- Available now, no code: run C0/C1 with `--trial-cap 3` (exposure-matched to B at s1).
+- Not implemented, recommended next (needs an owner decision, since the harness supplies the lesson):
+  **S1** empty store, gold ingested only after the first failure; **S2** poison incumbent from the start,
+  gold ingested after the first failure. They test learning and poison recovery without a 3-note lottery, but
+  the oracle-written gold lesson must be labelled as such in any report. Keep the current bank as the
+  conflict-discrimination condition; do not replace it.
 
 ## Checkpointing
 `--out file.jsonl` is append-only; key = `(arm, family, session, seed)`. Re-running the same command
