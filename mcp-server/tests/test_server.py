@@ -25,15 +25,18 @@ class FakeMemory:
     trust: float = 0.8
     uncertainty: float = 0.1
     state: str = "active"
+    exposure: str = "trial"
     created_at: int = 1_700_000_000
 
 
 class FakeMemoire:
     instances = []
 
-    def __init__(self, db_path: str, namespace: str = "default") -> None:
+    def __init__(self, db_path: str, namespace: str = "default", **options) -> None:
         self.db_path = db_path
         self.namespace = namespace
+        self.options = options
+        self.recall_calls = []
         self.remembered = []
         self.reinforced = []
         self.penalized = []
@@ -44,19 +47,26 @@ class FakeMemoire:
         self.memories = [
             FakeMemory(1, "Always validate external inputs"),
             FakeMemory(2, "Low-confidence draft note",
-                       state="shadow", trust=0.2),
+                       state="shadow", trust=0.2, exposure="hidden"),
         ]
         FakeMemoire.instances.append(self)
 
-    def remember(self, content: str) -> int:
+    def _visible(self, include_hidden: bool):
+        # Mirrors the engine: hidden rows only come back when asked for.
+        return [m for m in self.memories
+                if include_hidden or m.exposure != "hidden"]
+
+    def remember_ids(self, content: str):
         self.remembered.append(content)
-        return 1
+        return [101]
 
-    def recall(self, query: str, top_k: int = 5):
-        return self.memories[:top_k]
+    def recall(self, query: str, top_k: int = 5, include_hidden: bool = False):
+        self.recall_calls.append((top_k, include_hidden))
+        return self._visible(include_hidden)[:top_k]
 
-    def reinforce_if_used(self, memory_id: int, agent_output: str, task_succeeded: bool) -> bool:
-        self.reinforced.append((memory_id, agent_output, task_succeeded))
+    def reinforce_if_used(self, memory_id: int, agent_output: str, task_succeeded: bool,
+                          session_id=None) -> bool:
+        self.reinforced.append((memory_id, agent_output, task_succeeded, session_id))
         return task_succeeded
 
     def penalize_if_used(self, memory_ids, failure_severity: float = 1.0):
@@ -85,12 +95,13 @@ class FakeMemoire:
         self.imported.append((snapshot, preserve_trust))
         return len(snapshot["memories"])
 
-    def recall_explained(self, query: str, top_k: int = 5):
+    def recall_explained(self, query: str, top_k: int = 5, include_hidden: bool = False):
+        self.recall_calls.append((top_k, include_hidden))
         return [
             SimpleNamespace(memory=m, semantic_score=m.score, trust=m.trust,
                             uncertainty=m.uncertainty, effective_weight=0.5,
                             rank_score=m.score, reasons=["fake"])
-            for m in self.memories[:top_k]
+            for m in self._visible(include_hidden)[:top_k]
         ]
 
 
@@ -107,6 +118,11 @@ def workspace_tmp():
 @pytest.fixture(autouse=True)
 def isolated_server(monkeypatch, workspace_tmp):
     monkeypatch.setattr(server, "Memoire", FakeMemoire)
+    # The engine owns the thresholds; tests must not need the native extension.
+    monkeypatch.setattr(
+        server, "policy_thresholds",
+        lambda strict=False: (0.80, 0.50) if strict else (0.70, 0.40))
+    monkeypatch.delenv("MEMOIRE_TRIAL_CAP", raising=False)
     monkeypatch.chdir(workspace_tmp)
     monkeypatch.delenv("MEMOIRE_DB_PATH", raising=False)
     monkeypatch.delenv("MEMOIRE_DB", raising=False)
@@ -167,19 +183,22 @@ def test_remember_returns_structured_success():
     response = server.memoire_remember(
         "Fixed pagination bug", SimpleNamespace())
 
-    assert response == {"ok": True, "error": None, "chunks_stored": 1}
+    assert response == {"ok": True, "error": None,
+                        "chunks_stored": 1, "memory_ids": [101]}
     assert FakeMemoire.instances[0].remembered == ["Fixed pagination bug"]
 
 
-def test_recall_filters_shadow_by_default():
+def test_recall_hides_hidden_rows_by_default_via_the_engine():
     response = server.memoire_recall(
         "input validation", SimpleNamespace(), top_k=5)
 
     assert response["ok"] is True
     assert [item["id"] for item in response["memories"]] == [1]
+    assert FakeMemoire.instances[0].recall_calls == [(5, False)]
 
 
 def test_recall_can_include_shadow():
+    # include_shadow maps onto the engine's include_hidden switch.
     response = server.memoire_recall(
         "input validation",
         SimpleNamespace(),
@@ -189,6 +208,18 @@ def test_recall_can_include_shadow():
 
     assert response["ok"] is True
     assert [item["id"] for item in response["memories"]] == [1, 2]
+    assert FakeMemoire.instances[0].recall_calls == [(5, True)]
+
+
+def test_recall_surfaces_exposure_and_a_status_derived_from_it():
+    response = server.memoire_recall(
+        "q", SimpleNamespace(), top_k=5, include_shadow=True)
+
+    by_id = {item["id"]: item for item in response["memories"]}
+    assert by_id[1]["exposure"] == "trial"
+    assert "Unverified" in by_id[1]["status"]
+    assert by_id[2]["exposure"] == "hidden"
+    assert by_id[2]["status"].startswith("WARNING")
 
 
 def test_invalid_inputs_do_not_initialize_native_handle():
@@ -210,8 +241,8 @@ def test_batch_feedback_success_reinforces_each_memory():
     assert response["ok"] is True
     assert response["reinforced"] == 2
     assert FakeMemoire.instances[0].reinforced == [
-        (1, "validated inputs", True),
-        (2, "validated inputs", True),
+        (1, "validated inputs", True, server.SESSION_ID),
+        (2, "validated inputs", True, server.SESSION_ID),
     ]
 
 
@@ -248,29 +279,11 @@ def test_db_path_uses_root_uri_when_workspace_folders_not_file_uri(workspace_tmp
         str(root / "memoire.db"))
 
 
-def test_recall_overfetches_so_shadow_rows_do_not_starve_results(monkeypatch):
-    seen = []
-
-    class ShadowFirst(FakeMemoire):
-        def __init__(self, *a, **k):
-            super().__init__(*a, **k)
-            self.memories = [
-                FakeMemory(1, "s1", state="shadow"),
-                FakeMemory(2, "s2", state="shadow"),
-                FakeMemory(3, "a1"),
-                FakeMemory(4, "a2"),
-            ]
-
-        def recall(self, query, top_k=5):
-            seen.append(top_k)
-            return self.memories[:top_k]
-
-    monkeypatch.setattr(server, "Memoire", ShadowFirst)
-
+def test_recall_passes_top_k_through_without_overfetching(monkeypatch):
     response = server.memoire_recall("q", SimpleNamespace(), top_k=1)
 
-    assert [m["id"] for m in response["memories"]] == [3]
-    assert seen == [3]
+    assert [m["id"] for m in response["memories"]] == [1]
+    assert FakeMemoire.instances[0].recall_calls == [(1, False)]
 
 
 def test_recall_returns_at_most_top_k_after_filtering():
@@ -286,13 +299,15 @@ def test_recall_status_does_not_claim_trust_for_active_memories():
     assert "Trusted" not in response["memories"][0]["status"]
 
 
-def test_recall_explained_gates_shadow_by_default():
+def test_recall_explained_hides_hidden_rows_by_default_via_the_engine():
     hidden = server.memoire_recall_explained("q", SimpleNamespace())
     shown = server.memoire_recall_explained(
         "q", SimpleNamespace(), include_shadow=True)
 
     assert [a["memory"]["id"] for a in hidden["attributions"]] == [1]
     assert [a["memory"]["id"] for a in shown["attributions"]] == [1, 2]
+    assert shown["attributions"][1]["memory"]["exposure"] == "hidden"
+    assert FakeMemoire.instances[0].recall_calls == [(5, False), (5, True)]
 
 
 @pytest.mark.parametrize("severity", [float("nan"), float("inf"), -0.1, 1.1])
@@ -544,3 +559,146 @@ def test_admin_tools_are_not_listed_unless_enabled():
     assert "memoire_clear" in enabled and "memoire_import" in enabled
     assert set(enabled) - set(default) == {"memoire_clear", "memoire_import"}
     assert "memoire_export" in default and "memoire_forget" in default
+
+
+# ---- Step 8b-3: session id, trial cap, engine-owned thresholds ----
+
+def test_reinforce_passes_the_per_process_session_id():
+    response = server.memoire_reinforce(
+        1, "validated inputs", True, SimpleNamespace())
+
+    assert response["ok"] is True
+    assert FakeMemoire.instances[0].reinforced == [
+        (1, "validated inputs", True, server.SESSION_ID)]
+
+
+def test_session_id_is_stable_within_a_process_and_namespaced():
+    assert server.SESSION_ID.startswith(f"mcp-{os.getpid()}-")
+    assert len(server.SESSION_ID) > len(f"mcp-{os.getpid()}-")
+    first = server.SESSION_ID
+    server.memoire_reinforce(1, "out", True, SimpleNamespace())
+    assert server.SESSION_ID == first
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, None), ("", None), ("   ", None), ("0", 0), ("1", 1), (" 4 ", 4)])
+def test_trial_cap_from_env_accepts_valid_values(monkeypatch, raw, expected):
+    if raw is not None:
+        monkeypatch.setenv("MEMOIRE_TRIAL_CAP", raw)
+
+    assert server.trial_cap_from_env() == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "abc", "1.5", "two"])
+def test_trial_cap_from_env_rejects_invalid_values(monkeypatch, raw):
+    monkeypatch.setenv("MEMOIRE_TRIAL_CAP", raw)
+
+    with pytest.raises(ValueError, match="MEMOIRE_TRIAL_CAP"):
+        server.trial_cap_from_env()
+
+
+def test_trial_cap_env_reaches_the_engine_handle(monkeypatch):
+    monkeypatch.setenv("MEMOIRE_TRIAL_CAP", "3")
+
+    server.memoire_recall("q", SimpleNamespace())
+
+    assert FakeMemoire.instances[0].options == {"trial_cap": 3}
+
+
+def test_engine_default_trial_cap_is_not_overridden_when_unset():
+    server.memoire_recall("q", SimpleNamespace())
+
+    assert FakeMemoire.instances[0].options == {}
+
+
+def test_invalid_trial_cap_is_a_tool_error_not_a_crash(monkeypatch):
+    monkeypatch.setenv("MEMOIRE_TRIAL_CAP", "oops")
+
+    response = server.memoire_recall("q", SimpleNamespace())
+
+    assert response["ok"] is False
+    assert "MEMOIRE_TRIAL_CAP" in response["error"]["message"]
+
+
+def test_main_refuses_to_start_with_an_invalid_trial_cap(monkeypatch):
+    monkeypatch.setenv("MEMOIRE_TRIAL_CAP", "-5")
+    monkeypatch.setattr(server.mcp, "run", lambda **kw: pytest.fail("must not run"))
+
+    with pytest.raises(SystemExit) as exc:
+        server.main()
+
+    assert exc.value.code == 2
+
+
+def test_status_reports_session_id_and_trial_cap(monkeypatch):
+    monkeypatch.setenv("MEMOIRE_TRIAL_CAP", "2")
+
+    response = server.memoire_status(SimpleNamespace())
+
+    assert response["ok"] is True
+    assert response["session_id"] == server.SESSION_ID
+    assert response["trial_cap"] == 2
+
+
+def test_identify_gaps_defaults_to_the_engine_hint_threshold(monkeypatch):
+    # 0.35 is below the old hardcoded 0.45 but above the engine threshold (0.33 here),
+    # so only a threshold that really comes from policy_thresholds() lets it pass.
+    monkeypatch.setattr(server, "policy_thresholds", lambda strict=False: (0.9, 0.33))
+
+    class Trusts(FakeMemoire):
+        def recall(self, query, top_k=5, include_hidden=False):
+            trust = 0.30 if "unknown" in query else 0.35
+            return [FakeMemory(1, "m", trust=trust)]
+
+    monkeypatch.setattr(server, "Memoire", Trusts)
+
+    response = server.memoire_identify_gaps(
+        ["known topic", "unknown topic"], SimpleNamespace())
+
+    assert response["min_trust"] == 0.33
+    assert [g["query"] for g in response["gaps"]] == ["unknown topic"]
+    assert response["gaps"][0]["reason"] == "low_trust"
+
+
+def test_identify_gaps_explicit_min_trust_overrides_the_engine_default():
+    response = server.memoire_identify_gaps(
+        ["q"], SimpleNamespace(), min_trust=0.95)
+
+    assert response["min_trust"] == 0.95
+    assert [g["query"] for g in response["gaps"]] == ["q"]
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan")])
+def test_identify_gaps_rejects_out_of_range_min_trust(bad):
+    response = server.memoire_identify_gaps(["q"], SimpleNamespace(), min_trust=bad)
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_argument"
+    assert FakeMemoire.instances == []
+
+
+def test_namespace_health_uses_the_engine_hint_threshold(monkeypatch):
+    monkeypatch.setattr(server, "policy_thresholds", lambda strict=False: (0.9, 0.33))
+
+    class Trusts(FakeMemoire):
+        def recall(self, query, top_k=5, include_hidden=False):
+            return [FakeMemory(1, "m", trust=0.35)]
+
+    monkeypatch.setattr(server, "Memoire", Trusts)
+
+    response = server.memoire_namespace_health(SimpleNamespace(), probes=["a", "b"])
+
+    health = response["health"]
+    assert health["trust_threshold"] == 0.33
+    assert health["coverage"] == 1.0
+
+
+def test_thresholds_error_surfaces_as_a_tool_error(monkeypatch):
+    def boom(strict=False):
+        raise RuntimeError("native missing")
+
+    monkeypatch.setattr(server, "policy_thresholds", boom)
+
+    response = server.memoire_namespace_health(SimpleNamespace(), probes=["a"])
+
+    assert response["ok"] is False

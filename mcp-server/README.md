@@ -1,5 +1,7 @@
 # memoire-mcp
 
+<!-- mcp-name: io.github.tazwaryayyyy/memoire-mcp -->
+
 MCP stdio server for Memoire. Python package: `memoire_mcp`. Console script:
 `memoire-mcp` (also `python -m memoire_mcp`).
 
@@ -36,21 +38,83 @@ is already cached.
 
 ## MCP client configuration
 
-Point the client at the virtualenv's console script (or `python -m memoire_mcp`):
+Nothing is published to PyPI yet, so every command below points at the console script of a
+virtualenv you built from a source checkout (see above). Replace the `/ABSOLUTE/PATH/...`
+placeholders; on Windows use `...\.venv\Scripts\memoire-mcp.exe` and a path such as
+`C:\Users\you\.memoire\memoire.db`.
+
+Set `FASTEMBED_CACHE_DIR` to **one shared directory** in every client. Without it (and without
+`HF_HOME`), the embedding model (about 23 MB) is downloaded into `./.fastembed_cache` relative to
+the server's working directory, i.e. once per project. The first tool call that needs the
+embedder downloads the model and can exceed a client's tool timeout; make one throwaway tool
+call right after setup to warm the cache before relying on it.
+
+### Claude Code
+
+Options must come before the server name, and `--` separates them from the command. Keep
+`--transport stdio` between `--env` and the name: if the name directly follows `--env`, the CLI
+reads it as another `KEY=VALUE` pair.
+
+```bash
+claude mcp add --scope user \
+  --env MEMOIRE_DB_PATH=/ABSOLUTE/PATH/TO/memoire.db \
+  --env FASTEMBED_CACHE_DIR=/ABSOLUTE/PATH/TO/.fastembed_cache \
+  --transport stdio memoire \
+  -- /ABSOLUTE/PATH/TO/.venv/bin/memoire-mcp
+```
+
+`--scope user` makes the server available in every project and keeps its configuration out of
+the repository (`--scope project` would write `.mcp.json` into it). Check with
+`claude mcp list`.
+
+### Cursor
+
+Put this in `~/.cursor/mcp.json` (all projects) or `<project>/.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "memoire": {
       "command": "/ABSOLUTE/PATH/TO/.venv/bin/memoire-mcp",
-      "env": { "MEMOIRE_DB_PATH": "/ABSOLUTE/PATH/TO/memoire.db" }
+      "env": {
+        "MEMOIRE_DB_PATH": "/ABSOLUTE/PATH/TO/memoire.db",
+        "FASTEMBED_CACHE_DIR": "/ABSOLUTE/PATH/TO/.fastembed_cache"
+      }
     }
   }
 }
 ```
 
-(Windows: `...\.venv\Scripts\memoire-mcp.exe`.) The old
-`python /path/to/mcp-server/server.py` invocation no longer exists.
+### Any other stdio client
+
+```json
+{
+  "mcpServers": {
+    "memoire": {
+      "command": "/ABSOLUTE/PATH/TO/.venv/bin/memoire-mcp",
+      "env": {
+        "MEMOIRE_DB_PATH": "/ABSOLUTE/PATH/TO/memoire.db",
+        "FASTEMBED_CACHE_DIR": "/ABSOLUTE/PATH/TO/.fastembed_cache"
+      }
+    }
+  }
+}
+```
+
+The old `python /path/to/mcp-server/server.py` invocation no longer exists. Once
+`memoire-mcp` is published, running it through `uvx` should also work; that has not been tested
+because nothing is published.
+
+### `MEMOIRE_TRIAL_CAP`
+
+Optional (non-negative integer; an invalid value stops the server with exit code `2`). A recall
+returns at most this many *unverified* memories (ones with no recorded feedback); the default is
+`1`. With a fresh database every memory is unverified, so by default a recall returns one
+result. Raising it makes recalls return more results before any feedback exists. It changes how
+many results are offered, **not** how good they are: the only pre-registered evaluation run so far
+did not show an accuracy benefit for the default or for any other setting (the `trial_cap=3`
+numbers in it are exploratory and not inferential; see "Evidence so far" in the repository
+README). Choose a value for how many results you want to see, not for an expected accuracy gain.
 
 ## Database location
 
@@ -82,8 +146,13 @@ freshly remembered one. At most 1000 memories per call. `memoire_forget` is not 
 
 ## Tool notes
 
-- `memoire_recall` and `memoire_recall_explained` exclude `shadow` memories unless
-  `include_shadow=true`.
+- `memoire_recall` and `memoire_recall_explained` return live memories only unless
+  `include_shadow=true`, which is passed to the engine as `include_hidden` (hidden rows
+  included, trial cap skipped). Each memory has an `exposure` label.
+- `MEMOIRE_TRIAL_CAP` overrides the engine's `trial_cap` (default `1`: with no feedback a
+  recall returns at most one result). Non-integer or negative values stop the server.
+- Feedback tools send one session id per server process (`memoire_status` shows it).
+- `memoire_identify_gaps` `min_trust` defaults to the engine HINT threshold (0.40).
 - `memoire_export` returns `{"ok": true, "error": null, "snapshot": {...}}`; pass the
   `snapshot` value to `memoire_import`.
 

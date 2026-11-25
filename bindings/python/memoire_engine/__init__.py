@@ -17,7 +17,14 @@ Usage:
             print(f"[{r.score:.3f}] {r.content}")
 """
 
-from .client import Memoire, Memory, MemoireError, MemoryPolicy, PolicyDecision
+from .client import (
+    Memoire,
+    Memory,
+    MemoireError,
+    MemoryPolicy,
+    PolicyDecision,
+    policy_thresholds,
+)
 
 __all__ = [
     "Memoire",
@@ -25,6 +32,7 @@ __all__ = [
     "MemoireError",
     "MemoryPolicy",
     "PolicyDecision",
+    "policy_thresholds",
     # Framework adapters (opt-in — requires langchain-core or llama-index-core)
     # from memoire_engine.adapters import MemoireRetriever, MemoireIndex
 ]

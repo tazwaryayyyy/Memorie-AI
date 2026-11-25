@@ -128,7 +128,9 @@ in-range trust. Use opt-in only for snapshots you exported yourself.
   `DELETE FROM memories ...`. Memoire does not set `PRAGMA secure_delete`, and no code in
   `src/` calls `VACUUM` or `wal_checkpoint`. Deleted content, and embedding blobs, can
   therefore remain in free pages of the database file and in the WAL until overwritten.
-  Contradiction resolution does not delete: the losing memory is **archived** and kept.
+  Contradiction resolution is not an immediate delete: a loser judged by the lexical
+  heuristic is **quarantined** and kept; a loser judged by an ONNX NLI model is **archived**,
+  and maintenance pruning later deletes archived rows (after seven days).
   If you must remove data from disk, stop all Memoire processes and then, for example,
   run `PRAGMA wal_checkpoint(TRUNCATE); VACUUM;` with the `sqlite3` CLI, or export the
   wanted namespace and import it into a fresh file. Backups, filesystem snapshots and SSD

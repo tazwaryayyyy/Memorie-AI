@@ -45,7 +45,41 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow builds Linux, macOS, and Windows native-library zip artifacts and attaches them to the GitHub Release.
+Before tagging, exercise the whole pipeline without a tag: GitHub -> Actions -> Release -> "Run
+workflow" on the release branch. It builds and smoke-tests everything and creates no release.
+
+On a `v*` tag, `.github/workflows/release.yml`:
+
+1. fails unless the tag equals `v` + the version in `Cargo.toml` and both `pyproject.toml` files
+   (`scripts/check_release_metadata.py`, which also checks `mcp-server/server.json`);
+2. builds native-library zips (Linux, macOS, Windows), `memoire-engine` wheels (Linux x86_64
+   `manylinux_2_28`, macOS arm64, Windows x86_64; abi3, so one wheel per platform covers Python
+   >= 3.10) and the `memoire-mcp` sdist and wheel;
+3. inspects the wheels (`scripts/inspect_wheel.py`: size under 90 MB, `LICENSE` and
+   `THIRD_PARTY_NOTICES.md` present, no generic top-level modules, registry marker in the
+   `memoire-mcp` metadata);
+4. installs the built wheels into fresh virtualenvs on all three platforms, with only
+   `scripts/` checked out, and runs `scripts/smoke_installed.py` (real embedding, recall,
+   MCP health);
+5. creates a **draft** GitHub Release with the artifacts and `SHA256SUMS.txt`.
+
+It publishes nothing to PyPI, crates.io or the MCP Registry.
+
+## Publishing (manual, only with the owner's explicit go-ahead)
+
+Order matters because each later step checks the earlier one:
+
+1. `memoire-engine` to PyPI (the `memoire-mcp` wheel depends on `memoire-engine>=0.1.0,<0.2.0`).
+2. `memoire-mcp` to PyPI. Its README must contain `mcp-name: io.github.tazwaryayyyy/memoire-mcp`.
+3. MCP Registry: from `mcp-server/`, `mcp-publisher validate`, then `mcp-publisher login github`
+   and `mcp-publisher publish`. The registry only accepts a `server.json` whose package version is
+   already on PyPI.
+4. `memoire-engine` to crates.io (`cargo publish --dry-run --locked` first).
+
+Re-check on PyPI and crates.io that the names are still unregistered immediately before step 1.
+Wheel platforms: Linux x86_64, macOS arm64, Windows x86_64 only. There is no sdist for
+`memoire-engine`, so other platforms cannot install it from PyPI; the `memoire-mcp` install fails
+there too.
 
 ## Technical User Install
 
@@ -66,7 +100,7 @@ python -c "import importlib.util as u; assert u.find_spec('server') is None and 
 
 ## Model Download And Offline Use
 
-The first real `remember()` or `recall()` call initializes FastEmbed and may download `all-MiniLM-L6-v2` into the Hugging Face cache. `memoire_health` only checks that the native extension imports; it does not download the model.
+The first real `remember()` or `recall()` call initializes FastEmbed and may download `all-MiniLM-L6-v2` (about 23 MB) into the model cache: `$HF_HOME` if set, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache` relative to the working directory. Set `FASTEMBED_CACHE_DIR` to share one cache. `memoire_health` only checks that the native extension imports; it does not download the model.
 
 For offline machines:
 

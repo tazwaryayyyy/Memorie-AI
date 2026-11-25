@@ -1,0 +1,267 @@
+"""Run loop: schedule, per-arm isolation, JSONL checkpoint/resume with C1 feedback replay."""
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from . import HARNESS_VERSION
+from .arms import (apply_feedback, effective_prompt_policy, has_feedback, prompt_notes, replay_feedback, retrieve,
+                   uses_memory)
+from .lesson_store import LessonStore
+from .prompt import PROMPT_POLICIES, build_messages, parse_response, prompt_template_hash_input
+from .sandbox import grade
+from .tasks.base import Family, Task, canonical_hash, families_hash
+
+RunKey = Tuple[str, str, int, int]  # (arm, family, session, seed)
+
+
+class BudgetExhausted(RuntimeError):
+    pass
+
+
+class FingerprintMismatch(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class RunSettings:
+    split: str
+    families: Tuple[str, ...]
+    sessions: Tuple[int, ...]
+    model: str
+    base_url: str
+    temperature: float
+    top_k: int
+    trial_cap: int
+    contradiction: str
+    max_tokens: int
+    send_api_seed: bool = False
+    admission: str = "admit_all"
+    quality_gate_threshold: Optional[float] = None
+    trial_min_cos: Optional[float] = None
+    verified_min_cos: Optional[float] = None
+    store_scope: str = "shared"  # "shared": one store for the whole split; "family": a fresh store per family
+    prompt_policy: str = "plain"  # "tagged": engine outcome tags on C0/C1 notes only (prompt.tag_for)
+    no_poison: bool = False  # True: the family's poison lesson is never ingested (poison-harm counterfactual)
+
+    def __post_init__(self) -> None:
+        if self.prompt_policy not in PROMPT_POLICIES:
+            raise ValueError(f"unknown prompt_policy {self.prompt_policy!r}; expected one of {PROMPT_POLICIES}")
+
+    def fingerprint_settings(self) -> Dict[str, Any]:
+        """Settings that enter the run fingerprint. `no_poison` is left out while False so fingerprints (and
+        resumable JSONL files) written before the flag existed stay valid; True always changes the fingerprint."""
+        return {k: v for k, v in self.__dict__.items() if not (k == "no_poison" and v is False)}
+
+    def fingerprint(self, families: Sequence[Family]) -> str:
+        hashes = families_hash(families)
+        return canonical_hash(
+            {
+                "harness": HARNESS_VERSION,
+                "settings": self.fingerprint_settings(),
+                "tasks": hashes["tasks"],
+                "lessons": hashes["lessons"],
+                "prompt": canonical_hash(prompt_template_hash_input(self.prompt_policy)),
+            }
+        )
+
+
+def select_families(all_families: Sequence[Family], names: Optional[Sequence[str]]) -> List[Family]:
+    if not names:
+        return list(all_families)
+    known = {f.name: f for f in all_families}
+    missing = [n for n in names if n not in known]
+    if missing:
+        raise ValueError(f"unknown families {missing}; known: {sorted(known)}")
+    return [known[n] for n in names]
+
+
+class ResultsFile:
+    """Append-only JSONL. A torn trailing line (crash mid-write) is dropped and truncated."""
+
+    def __init__(self, path: str, fingerprint: str) -> None:
+        self.path, self.fingerprint = path, fingerprint
+        self._records: Dict[RunKey, dict] = {}
+        self.ordered: List[dict] = []
+        if os.path.exists(path):
+            self._load()
+
+    def _load(self) -> None:
+        with open(self.path, "rb") as fh:
+            raw = fh.read()
+        keep, offset = 0, 0
+        lines = raw.split(b"\n")
+        for i, line in enumerate(lines):
+            is_last = i == len(lines) - 1
+            end = offset + len(line) + (0 if is_last else 1)
+            if line.strip():
+                try:
+                    record = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    if all(not rest.strip() for rest in lines[i + 1:]):
+                        break  # torn tail
+                    raise ValueError(f"{self.path}: corrupt record on line {i + 1}") from None
+                if is_last and not raw.endswith(b"\n"):
+                    break  # complete JSON but unterminated: treat as torn to stay line-aligned
+                self._ingest(record)
+            keep = end
+            offset = end
+        if keep != len(raw):
+            with open(self.path, "r+b") as fh:
+                fh.truncate(keep)
+
+    def _ingest(self, record: dict) -> None:
+        if record.get("fingerprint") != self.fingerprint:
+            raise FingerprintMismatch(
+                f"{self.path} was written with different settings/tasks/lessons/prompt "
+                f"(fingerprint {str(record.get('fingerprint'))[:12]} != {self.fingerprint[:12]}). "
+                "Use a new --out file."
+            )
+        key = (record["arm"], record["family"], record["session"], record["seed"])
+        if key not in self._records:
+            self._records[key] = record
+            self.ordered.append(record)
+
+    def has(self, key: RunKey) -> bool:
+        return key in self._records
+
+    def get(self, key: RunKey) -> Optional[dict]:
+        return self._records.get(key)
+
+    def append(self, record: dict) -> None:
+        record["fingerprint"] = self.fingerprint
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        with open(self.path, "ab") as fh:
+            fh.write(line.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        self._ingest(record)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def run_sequence(
+    *,
+    settings: RunSettings,
+    arm: str,
+    seed: int,
+    families: Sequence[Family],
+    llm: Any,
+    results: ResultsFile,
+    store_factory: Callable[[], Any],
+    diag: Optional[Mapping[str, dict]] = None,
+    max_calls: int = 0,
+    log: Callable[[str], None] = print,
+) -> Dict[str, int]:
+    """One (arm, seed) pass over the schedule. Fresh store per call; completed runs are skipped
+    (and, for C1, their recorded feedback is replayed so the store matches an uninterrupted run)."""
+    diag = diag or {}
+    track = settings.admission == "quality_gate"
+
+    def build_store(for_families: Sequence[Family]) -> LessonStore:
+        built = LessonStore(store_factory())
+        for fam_ in for_families:
+            for lesson in fam_.bank_lessons:
+                built.ingest(lesson, track_shadow=track)
+        return built
+
+    shared: Optional[LessonStore] = build_store(families) if uses_memory(arm) and settings.store_scope == "shared" else None
+    stats = {"ran": 0, "skipped": 0, "passed": 0}
+
+    for fam in families:
+        store: Optional[LessonStore] = shared
+        if uses_memory(arm) and settings.store_scope == "family":
+            store = build_store([fam])
+        for task in fam.tasks:
+            if task.session not in settings.sessions:
+                continue
+            if store is not None and task.session == fam.poison_session and not settings.no_poison:
+                store.ingest(fam.poison, track_shadow=track)
+            key: RunKey = (arm, fam.name, task.session, seed)
+            session_id = f"{fam.name}-s{task.session}-seed{seed}"
+
+            done = results.get(key)
+            if done is not None:
+                if has_feedback(arm):
+                    assert store is not None
+                    replay_feedback(store, done.get("feedback_events", []), session_id)
+                stats["skipped"] += 1
+                continue
+            if max_calls and getattr(llm, "total_requests", 0) >= max_calls:
+                raise BudgetExhausted(f"--max-calls {max_calls} reached; rerun the same command to resume")
+
+            shown = retrieve(arm, store, task, settings.top_k)
+            policy = effective_prompt_policy(arm, settings.prompt_policy)
+            messages = build_messages(task, prompt_notes(arm, shown, settings.prompt_policy), policy)
+            response = llm.complete(messages, seed=seed)
+            parsed = parse_response(response.text, task, len(shown), uses_memory(arm))
+
+            if parsed.code is None:
+                grading: dict = {"passed": False, "visible": None, "hidden": None, "reason": "no_code_block"}
+                events: List[dict] = []
+                feedback_note = "skipped: no code block (format failure is not evidence about the notes)"
+            else:
+                grading = grade(task, parsed.code).to_json()
+                used = parsed.used_indices
+                events = apply_feedback(arm, store, shown, used, grading["passed"], session_id)
+                feedback_note = None
+            passed = bool(grading["passed"])
+            stats["ran"] += 1
+            stats["passed"] += int(passed)
+
+            record = {
+                "schema": 1,
+                "ts": _now(),
+                "arm": arm,
+                "family": fam.name,
+                "session": task.session,
+                "seed": seed,
+                "split": settings.split,
+                "model": settings.model,
+                "model_returned": response.model_returned,
+                "temperature": settings.temperature,
+                "send_api_seed": settings.send_api_seed,
+                "admission": settings.admission,
+                "quality_gate_threshold": settings.quality_gate_threshold,
+                "trial_min_cos": settings.trial_min_cos,
+                "verified_min_cos": settings.verified_min_cos,
+                "store_scope": settings.store_scope,
+                "prompt_policy": policy,
+                "no_poison": settings.no_poison,
+                "shadowed_keys": sorted(store.shadowed) if store is not None else [],
+                "top_k": settings.top_k,
+                "trial_cap": settings.trial_cap,
+                "contradiction": settings.contradiction,
+                "prompt": messages,
+                "response": response.text,
+                "finish_reason": response.finish_reason,
+                "parsed": parsed.to_json(),
+                "used_keys": [shown[i - 1].key for i in parsed.used_indices],
+                "retrieved": [
+                    {
+                        "key": r.key, "kind": r.kind, "id": r.id, "score": r.score, "cos": r.cos, "trust": r.trust,
+                        "exposure": r.exposure, "state": r.state,
+                        "exemplar_cos": (diag.get(f"lesson:{r.key}") or {}).get("max_cos"),
+                        "quality_score": ((diag.get(f"lesson:{r.key}") or {}).get("quality") or {}).get("importance_base"),
+                    }
+                    for r in shown
+                ],
+                "spec_exemplar_cos": (diag.get(f"spec:{task.task_id}") or {}).get("max_cos"),
+                "grading": grading,
+                "passed": passed,
+                "feedback_events": events,
+                "feedback_note": feedback_note,
+                "usage": {"prompt_tokens": response.prompt_tokens, "completion_tokens": response.completion_tokens},
+                "latency_s": round(response.latency_s, 3),
+                "attempts": response.attempts,
+            }
+            results.append(record)
+            log(f"[{arm} seed={seed}] {task.task_id}: {'PASS' if passed else 'FAIL'}"
+                f" (tokens in/out {response.prompt_tokens}/{response.completion_tokens}, {response.latency_s:.1f}s)")
+    return stats

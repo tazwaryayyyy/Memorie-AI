@@ -12,6 +12,171 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ---
 
 ## [Unreleased]
+### Added (Step 9a: release engineering; nothing published)
+- **CI** (`.github/workflows/ci.yml`): runs on `fix/p0-stabilization` pushes as well as `main`; adds
+  `bindings/python/tests` (Python 3.10 and 3.13), offline `eval/tests`, the `wasm32` compile check,
+  dashboard `tsc` and `npm test`, `cargo package --locked`, and a release-metadata consistency job;
+  the model cache now caches `FASTEMBED_CACHE_DIR` (the old `~/.cache/huggingface` path was not the
+  directory fastembed uses). Concurrency groups cancel superseded runs.
+- **Release workflow** (`.github/workflows/release.yml`): builds `memoire-engine` wheels (Linux
+  x86_64 `manylinux_2_28`, macOS arm64, Windows x86_64) and the `memoire-mcp` sdist and wheel,
+  inspects them (size, license files, no generic top-level modules, registry marker), installs the
+  built wheels in clean virtualenvs without the source tree, and drafts a GitHub Release. It also
+  runs on manual dispatch (no release is created). It never uploads to PyPI, crates.io or the MCP
+  Registry. Token scope is `contents: read` except in the release job.
+- `mcp-server/server.json` (MCP Registry manifest for `io.github.tazwaryayyyy/memoire-mcp`), the
+  `mcp-name` ownership marker in `mcp-server/README.md`, and Claude Code and Cursor setup blocks
+  with `FASTEMBED_CACHE_DIR` and `MEMOIRE_TRIAL_CAP` notes (no accuracy claim).
+- `THIRD_PARTY_NOTICES.md` (draft summary, not a full inventory), license copies inside the Python
+  packages, `repository` / `homepage` and the notices file in `Cargo.toml`.
+- `scripts/check_release_metadata.py`, `scripts/inspect_wheel.py`, `scripts/smoke_installed.py`.
+- Not changed: `src/`, engine behaviour or defaults, bindings code, `eval/` and the frozen Step 8d
+  files. These workflow and packaging changes have not been executed in GitHub Actions.
+
+### Added (Steps 8c-8d: real-LLM evaluation harness, pre-registration, first held-out result)
+- **`eval/` real-LLM harness** (hermetic, resumable JSONL; arms A no memory, B plain vector, C0 static Memoire,
+  C1 Memoire with outcome feedback; `dev` and `test` splits). Step 8c-5 and 8d-1 additions: `--prompt-policy tagged`
+  (engine-derived outcome tags on C0/C1 notes, `eval/prompt.py::tag_for`); raw cosine `cos` next to the blended `score` in
+  records and `shown=` in `summarize --detail`; `--no-poison` (poison-harm counterfactual; not valid for Arm A; part of the run
+  fingerprint only when set); `analyze` subcommand and `eval/analysis.py` (family-paired contrasts, one pre-registered primary
+  inference, integrity checks, dev seed-count `--preflight`); `eval/power_sim.py` (planning aid).
+- **`ScoringConfig::verified_min_cos`** (default `0.0`, no floor, previous behaviour): a verified row (any feedback) must reach
+  this cosine to be offered by `Store::search`; not applied when hidden rows are requested. Python:
+  `Memoire(..., trial_min_cos=, verified_min_cos=)`, validated in `[0, 1]` (NaN raises `MemoireError`).
+- **Tests**: `Store::search` ranking regression tests (`test_verified_trust_outranks_slightly_closer_penalized_row`,
+  `test_equal_cosine_orders_by_trust_success_then_failure`); stale comments in
+  `test_ranking_improves_after_penalizing_bad_memory` corrected. Ranking is
+  `0.75*cos + 0.20*trust + 0.05*recency`; `effective_weight` is output-only.
+
+### Documentation (Step 8d-2)
+- **`eval/PREREGISTRATION_8d.md`** (frozen at tag `prereg-8d`, commit `10e0f8fb55e1066bc2a5ba4e9fe04599a4356006`) and
+  **`eval/BENCHMARK_METHODOLOGY.md`**: first held-out result. The pre-registered gate was **not passed** (plain vector 13/32 vs no
+  memory 12/32), so the primary endpoint (`C1` at `trial_cap=1` vs plain vector, 11/32 vs 13/32) yields no inference. **No
+  accuracy-improvement claim is made.** Secondary findings are exploratory and uncorrected: poison harm on plain vector, a
+  first-session bottleneck at `trial_cap=1`, and a larger feedback effect at `trial_cap=3`; none justifies changing a default.
+- `README.md`: new "Evidence so far" section; Known Limitation 2 no longer says no real-LLM benchmark has been run.
+- Not changed: `src/`, bindings, MCP server (Steps 8d-1 and 8d-2).
+
+### Changed (Step 8b-3: SDK / MCP alignment and 8b-2 cleanups; breaking, pre-publish)
+- **`should_supersede(incoming_gravity, existing_gravity, incoming_is_newer)`**: the winner of
+  a contradiction is the side with more feedback evidence (`compute_gravity_radius`); ties go
+  to the newer memory. The old `importance > 0.50 + 0.40 * gravity` rule made every newcomer
+  lose under centroid-only importance, hiding corrections in favour of the lesson they
+  correct. `resolve_contradictions_for_id` now reads both sides' feedback counts.
+- **`ContradictionMode::Legacy`** quarantines the loser (recoverable with `unquarantine`)
+  instead of setting `archived = 1`. Only an installed ONNX NLI verdict archives.
+- **Lexicon matching ignores surrounding punctuation** (`"disabled."`, `"(never"`) and folds
+  the typographic apostrophe, in `detect_polarity` / `negation_asymmetry` (new
+  `lexicon_text`; `normalize_text`, which feeds fingerprints, is unchanged).
+- **`ScoringConfig::quality_gate_threshold`** (default `0.50`, `DEFAULT_QUALITY_GATE_THRESHOLD`);
+  `decide_store(score, dup, threshold)` and `build_quality_meta(.., quality_gate_threshold)` take
+  it. Python: `Memoire(..., quality_gate_threshold=)` (outside [0, 1] or NaN raises `MemoireError`).
+- **Policy thresholds live in Rust**: `quality::{FOLLOW,HINT,STRICT_FOLLOW,STRICT_HINT}_THRESHOLD`,
+  exported by the native module and read by `MemoryPolicy` and the MCP server via
+  `memoire_engine.policy_thresholds(strict=False)`. `MemoryPolicy` compares with `1e-6` slack
+  (float32 `0.70` is below `0.70`).
+- **`search_within_days` applies the age filter before the trial cap** (`Store::search_filtered`).
+  Before, one stale-but-nearest unverified row could take the single trial slot and be filtered
+  out afterwards, returning nothing, and filtered-out rows had `last_used_at` bumped.
+- **Python SDK**: `recall_mmr`, `recall(.., include_hidden=)`, `recall_explained(.., include_hidden=)`;
+  Rust `Memoire::recall_explained_with_options`.
+- **MCP server**: removed the Python shadow filter and 3x over-fetch (the engine hides hidden
+  rows); `include_shadow` maps to `include_hidden`; results carry `exposure`; `memoire_remember`
+  returns `memory_ids`; feedback tools pass a per-process `session_id`; `MEMOIRE_TRIAL_CAP`;
+  `memoire_identify_gaps` `min_trust` defaults to the engine HINT threshold (`0.40`, was `0.45`)
+  and `memoire_namespace_health` reports `trust_threshold`.
+
+### Known gaps (Step 8b-3)
+- `trial_cap = 1` means a no-feedback recall (including `recall_mmr`, `recall_reranked`,
+  `search_within_days`, and every script under `examples/`) returns at most one result.
+- The one-vote-per-session check compares only with the most recent reinforcing session.
+- `DefaultOracle::verify_weak` still hardcodes `0.50`; it is independent of
+  `quality_gate_threshold`.
+
+### Changed (Step 8b-2: weights, contradiction verdicts, shadow corroboration; breaking, pre-publish)
+- **`ScoringWeights::default()`**: `novelty` and `evidence` weigh `0.0`; the three semantic
+  centroid weights are renormalised to `3/7`, `5/14`, `3/14` (original 0.30 : 0.25 : 0.15
+  ratio, sum 1). Both features are still computed and stored. `confidence` is now
+  `0.50 + 0.20 * actionability` (the `0.30 * evidence` term is gone), so attacker-controlled
+  keywords can no longer raise importance or confidence. Scores are on a different scale:
+  with `AdmissionMode::QualityGate`, the unchanged `>= 0.50` bar now hides most realistic
+  lessons until it is calibrated.
+- **Prototype leakage**: the `"Always use Decimal for financial calculations never use
+  float"` reusability exemplar in `Memoire::compute_prototypes` is replaced by a
+  domain-neutral rule about closing connections and file handles.
+- **Lexical contradiction gate** (`NliChecker::lexical_label`): `Contradiction` now needs
+  opposing polarity AND `negation_asymmetry >= 1`; opposing polarity alone is `Neutral`.
+  `detect_polarity` and `negation_asymmetry` share one lexicon (`NEGATIVE_TERMS`; asymmetry
+  also counts `not` / `no`), fixing `"disabled"`, `"removed"`, `"stopped"`, `"reverted"`,
+  `"vulnerable"` and `"do not"` counting for polarity but not for asymmetry.
+- **Contradiction losers**: a verdict from the lexical fallback now `quarantines` the loser
+  (hidden, never deleted, recoverable with `unquarantine`); a verdict from an installed ONNX
+  model still archives it. The `Legacy` polarity gate still archives. `count()` therefore no
+  longer drops after a lexical contradiction.
+- **Shadow corroboration** (`AdmissionMode::QualityGate`): a chunk that restates a hidden
+  `shadow` row (cosine >= 0.92, no contradiction, different `remember` call) promotes it to
+  `trial` instead of inserting a duplicate; `remember` returns the promoted id. No
+  reinforcement is recorded.
+
+### Added
+- `NliChecker::check_with_source` and `NliSource`; `Store::corroborate_shadow`,
+  `store::NEAR_DUPLICATE_COSINE`.
+- Tests: weights/confidence, lexicon alignment, lexical gate (TLS case), verdict source,
+  authoritative-archive vs lexical-quarantine, corroboration (similarity, independence,
+  state, contradiction), `tests/lifecycle.rs` corroboration scenarios, and oracle tests that
+  prove keyword evidence cannot buy a pass.
+
+### Known gaps (not addressed here)
+- (Fixed in 8b-3) Whitespace-delimited tokens missed a lexicon term followed by punctuation.
+- (Fixed in 8b-3) `should_supersede` compared ingest importance with `0.50 + 0.40 * gravity`, so
+  the existing memory almost always won.
+- Remaining exemplars still touch payments, hashing, parameterized queries and input
+  validation.
+
+### Changed (Step 8b-1: trust, lifecycle, feedback integrity; breaking, pre-publish)
+- **Trust is a Beta posterior** `(2 + s) / (4 + s + f)` over `reinforcement_count` /
+  `failure_count`, independent of ingest scores; `uncertainty = 4 / (4 + s + f)`. Removed
+  `compute_trust`, the `trust_ema` blend and `ScoringConfig::{ema_new_weight, rc_saturation,
+  cold_start_weight}`. Decay now regresses toward 0.5 using days since last *feedback*.
+- **Ranking** is `0.75 * cosine + 0.20 * trust + 0.05 * recency`.
+- **States**: `trial` and `active` are live; `shadow`, `probationary`, `quarantined` are
+  hidden. `trial -> active` at `3s >= 8 + 7f`; live `-> quarantined` at `2f > 3s + 2`.
+  `Store::search(.., include_hidden)` (renamed from `include_shadow`; default now excludes
+  `shadow`) skips hidden rows before the top-k cosine cut, so they cannot crowd out live ones.
+- **Bounded trial exposure**: a default recall returns at most `ScoringConfig::trial_cap`
+  (default 1) unverified rows; `trial_min_cos` (default 0.0) is an optional relevance floor.
+  With no feedback history this limits a default recall to one result.
+- **`ScoringConfig`**: `admission: AdmissionMode::{AdmitAll (default), QualityGate}`,
+  `contradiction_mode: ContradictionMode::{Off, Legacy, Nli (default)}` replacing
+  `use_nli_contradiction`, `containment_threshold` replacing `jaccard_threshold`.
+- **Feedback integrity**: `reinforce_if_used` / `penalize_if_used` run in immediate
+  transactions; one vote per (memory, session id); `penalize_if_used` no longer decrements
+  `reinforcement_count` or rewrites `importance_base` / `confidence`, skips quarantined rows
+  and returns database errors instead of skipping the row. `failure_severity` now only gates
+  (`> 0` counts one failure).
+- **Attribution**: asymmetric containment of the memory's distinctive tokens replaces
+  whole-output symmetric Jaccard, so long outputs are not penalised.
+- `sample_namespace` samples `trial`/`active` rows; export excludes `quarantined` rows;
+  `PreserveBounded` import re-derives state from the imported counts.
+- Database `user_version` 2 -> 3 (`migrations/v3.sql`): live states re-derived from counts
+  (approximate for databases written by earlier engines).
+
+### Added
+- `Memoire::{reinforce_declared, unquarantine, promote_shadow, recall_plain}` and the
+  `Store` equivalents; `Memory::exposure`; Python `Memoire(admission=, contradiction=,
+  trial_cap=)`, `reinforce_declared`, `unquarantine`, `promote_shadow`, `recall_plain`;
+  `memoire-cli unquarantine <ID>`.
+- `tests/lifecycle.rs` and in-crate tests for the state machine, trial cap, quarantine,
+  migration, concurrency and plain recall (deterministic; no LLM).
+
+### Fixed
+- `Cargo.toml` `include` now ships `/migrations/**`; `include_str!("../migrations/v2.sql")`
+  failed from a packaged crate.
+
+### Not changed yet (Step 8b-3)
+- MCP/SDK thresholds, `exposure` in MCP output, session ids in MCP, `MEMOIRE_TRIAL_CAP`.
+
+### Documentation (earlier in Unreleased)
 
 ### Changed (breaking, pre-release)
 - Python import package renamed `memoire` -> `memoire_engine` (distribution name `memoire-engine`,
@@ -117,9 +282,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   server descriptions.
 
 ### Known issues (open at this point)
-- Cold-start `shadow` deadlock: unreinforced lessons that ingest below the `0.50` quality
-  threshold are stored `shadow`, have no promotion path, score below `MemoryPolicy`'s HINT
-  threshold and are hidden by the MCP server, so they cannot earn reinforcement. Step 8.
+- Cold-start `shadow` deadlock: addressed in Step 8b-1 above (unmeasured with real agents).
 - No real-LLM evaluation of the trust hypothesis exists yet. Step 8.
 
 ### Planned

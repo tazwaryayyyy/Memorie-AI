@@ -78,8 +78,8 @@ Vec<Vec<f32>>  (one 384-dim vector per chunk)
     ▼
 Store::insert_with_quality(chunk_text, embedding, scoring_config)
     │   Serialises f32 slice to LE bytes (BLOB column)
-    │   Computes quality score (actionability, novelty, evidence, …)
-    │   Sets initial trust_ema = quality_score × cold_start_weight
+    |   Computes quality features (actionability, consequence, reusability scored; novelty, evidence recorded only)
+    |   Trust starts at the neutral prior 0.5 (not derived from the quality score)
     │   Sets last_used_at = now()
     │   Writes to memories table in WAL-mode SQLite (CHECK constraints enforced)
     │
@@ -104,13 +104,13 @@ Store::search(query_vec, top_k)
     │   Path selected by store size vs. hnsw_threshold (default 500):
     │     < threshold → linear cosine scan (exact, O(n))
     │     ≥ threshold → HNSW ANN index (approximate, O(log n))
-    │   Rank by score = 0.75·cosine + 0.20·effective_weight + 0.05·recency_bonus
-    │   (trust is computed per hit and returned, but is NOT part of this ranking;
-    │    recall_explained uses its own rank score)
-    │   Rows: store_state IN ('active','shadow') and archived = 0;
-    │   include_shadow=true additionally admits 'probationary' rows
-    │   Trust per hit: compute_trust(...) × (0.6 + 0.4·cosine), blended with stored
-    │   trust_ema, then decayed: trust × exp(−decay_rate × days_since_last_used)
+    |   Rank by score = 0.75*cosine + 0.20*trust + 0.05*recency_bonus
+    |   Rows: store_state IN ('active','trial') and archived = 0;
+    |   include_hidden=true additionally admits 'shadow', 'probationary', 'quarantined'
+    |   and skips the trial cap. Hidden ids are excluded from the top-k*2 cosine
+    |   candidate set so they cannot crowd out live rows.
+    |   Trust per hit: (2+s)/(4+s+f), regressed toward 0.5 by days since last feedback
+    |   Unverified rows (s+f == 0) are capped at trial_cap per recall
     │   Clamp trust to [0.0, 1.0]
     │   UPDATE last_used_at = now() for all returned IDs
     │   Truncate to top_k
@@ -203,30 +203,50 @@ Total ≈ **2 KB per chunk** on average. A database with 10,000 chunks ≈ **20 
 
 ## Trust Model
 
-### Cold-start
-
-New memories receive a nonzero initial trust seeded from their quality score:
+### Trust is a Beta posterior over attributed feedback
 
 ```
-initial trust_ema = quality_score × cold_start_weight
+trust       = (2 + s) / (4 + s + f)       s = reinforcement_count, f = failure_count
+uncertainty = 4 / (4 + s + f)
 ```
 
-Default `cold_start_weight: 0.5`. Set to `0.0` to restore zero-trust-at-birth behavior. This ensures a freshly stored, high-quality memory is immediately visible to recall without needing prior reinforcement.
+A prior of four pseudo-observations at 0.5. Trust does not depend on any ingest-time
+score, so every admitted memory starts at exactly `0.5`. These constants are heuristic
+defaults, not validated. The legacy `trust_ema`, `confidence`-weighted and
+`cold_start_weight` machinery is gone; the `trust_ema` column is kept only for
+snapshot compatibility and is no longer updated.
 
 ### Time decay
 
-On every recall, each returned memory has its effective trust decayed by time since last use:
+Displayed trust regresses toward the prior as feedback evidence ages:
 
 ```
-effective_trust = stored_trust_ema × exp(−decay_rate × days_since_last_used)
+trust_t = 0.5 + (trust - 0.5) * exp(-decay_rate * days_since_last_feedback)
 ```
 
-Default `decay_rate: 0.01` → half-life ≈ 69 days. Set to `0.0` to disable decay entirely.
-After decaying, `last_used_at` is reset to now, restarting the decay clock.
+Default `decay_rate: 0.01` (half-life about 69 days); `0.0` disables it. The clock is
+`last_accessed_at`, which only feedback (and insert) writes, so merely being recalled
+does not keep a memory fresh. Recall still records `last_used_at`.
 
-### EMA update (reinforce / penalize)
+### States and exposure
 
-On reinforcement/penalty events, `trust_ema` is updated with an exponential moving average, weighted by `reinforcement_count`. This is unchanged from the original design.
+`store_state`: `trial` and `active` are live; `shadow`, `probationary` and `quarantined`
+are hidden from default recall. Transitions use integer rules on `(s, f)` and are written
+in the same immediate transaction as the feedback update:
+
+| Transition | Rule |
+|---|---|
+| `trial -> active` | `3s >= 8 + 7f` (trust >= 0.70) |
+| live `-> quarantined` | `2f > 3s + 2` (trust < 0.40) |
+| `shadow` / `probationary -> live` | `Store::promote_shadow` (not yet called by ingest) |
+| `quarantined -> live` | operator `unquarantine`, which clears `failure_count` |
+
+Default recall returns at most `ScoringConfig::trial_cap` (default 1) unverified
+(`s + f == 0`) rows; with no feedback history that bounds a default recall to one result.
+Each result carries `exposure`: `follow`, `hint`, `trial`, `hidden` or `plain`.
+Migration `user_version` 2 -> 3 (`migrations/v3.sql`) re-derives live states from the
+stored counts; legacy penalties decremented `reinforcement_count`, so that backfill is
+approximate.
 
 ---
 
@@ -429,21 +449,21 @@ The MCP server instance cache key is `(db_path, namespace)` — different namesp
 
 ## NLI Contradiction Detection (P3.3)
 
-`resolve_contradictions_for_id` (`src/store.rs`) is called after every `remember()` for each new chunk. When `ScoringConfig::use_nli_contradiction` is `true` (default), candidates are compared with `NliChecker` (`src/quality.rs`) against existing `active`/`shadow`, non-archived rows in the same namespace.
+`resolve_contradictions_for_id` (`src/store.rs`) is called after every `remember()` for each new chunk. When `ScoringConfig::contradiction_mode` is `Nli` (default), candidates are compared with `NliChecker` (`src/quality.rs`) against existing `trial`/`active`/`shadow`, non-archived rows in the same namespace.
 
 ### Step 1 — Cosine gate
 Pairs with cosine similarity below `nli_cosine_threshold` (default 0.80) are treated as different topics and skipped.
 
 ### Step 2 — Classification
 - **ONNX NLI model supplied** (`Memoire::with_nli_model(path)` → `OnnxNliChecker`, labels read from the model's `config.json` `id2label`): its label is **authoritative**.
-- **No ONNX model, or ONNX inference returned an error**: lexical fallback (`NliChecker::lexical_label`). `detect_polarity()` classifies each text as `Affirmative`, `Negative` or `Neutral` with a small keyword lexicon; only `Affirmative↔Negative` pairs can be labelled `Contradiction`. `negation_asymmetry(a, b)` is computed as a secondary signal, but both of its branches (score ≥ 1 and the conservative fallback) currently return `Contradiction`, so it does not change the outcome.
+- **No ONNX model, or ONNX inference returned an error**: lexical fallback (`NliChecker::lexical_label`). `detect_polarity()` classifies each text as `Affirmative`, `Negative` or `Neutral` with a small keyword lexicon; only `Affirmative`/`Negative` pairs can be labelled `Contradiction`, and only when `negation_asymmetry(a, b)` is at least 1, i.e. some negation term appears in exactly one of the texts. Opposing polarity without that asymmetry is `Neutral`. Polarity and asymmetry share one negation lexicon (`NEGATIVE_TERMS`, plus `not` / `no` for asymmetry only). Matching is on whitespace-delimited tokens, so a term followed by punctuation is not matched.
 
 Known gap: `resolve_contradictions_for_id` returns early when the **new** memory's polarity is `Neutral`, so an ONNX model never sees such pairs. There is no automated test that runs a real MNLI model.
 
 ### Resolution
-`quality::should_supersede(incoming_importance, existing_gravity)`: the incoming memory wins only if `importance_base > 0.50 + 0.40 × gravity`, where gravity comes from `compute_gravity_radius` (existing `trust_ema`, `reinforcement_count`, age). The loser is archived (`archived = 1`, `superseded_by` set to the winner's id), removed from the in-memory embedding cache and logged; its row is kept, not deleted. If the incoming memory loses, it is the one archived.
+`quality::should_supersede(incoming_gravity, existing_gravity, incoming_is_newer)`: the side with the larger `compute_gravity_radius` (posterior trust, `reinforcement_count`, age) wins, and a tie goes to the newer memory. Ingest importance plays no part: it is a weighted centroid cosine that rarely exceeds 0.5, so the earlier rule (`importance_base > 0.50 + 0.40 x gravity`) made every newcomer lose, even against an incumbent with no evidence. The loser is hidden in one of two ways, chosen by `NliChecker::check_with_source`: a verdict from an installed ONNX model (`NliSource::Onnx`) **archives** it (`archived = 1`, `superseded_by` set to the winner's id, removed from the in-memory embedding cache; maintenance deletes archived rows after seven days); a verdict from the lexical fallback (`NliSource::Lexical`) or from the `Legacy` polarity gate only **quarantines** it (`store_state = 'quarantined'`, cache entry marked hidden, still stored, recoverable with `unquarantine`), so no heuristic path destroys a memory.
 
-Setting `use_nli_contradiction: false` disables this step entirely.
+`ScoringConfig::contradiction_mode` selects `Nli` (default), `Legacy` (cosine + stored polarity only) or `Off` (this step is skipped entirely).
 
 ---
 
@@ -501,7 +521,7 @@ Memoire includes an asynchronous background maintenance scheduler that cleans up
 ## Prototype Recomputation (Component 7)
 
 - **Purpose**: Over time, as embedding models evolve or are fine-tuned, the original scoring prototype centroids can drift.
-- **Action**: `recompute_prototypes()` re-embeds the 15 fixed prototype sentences (covering consequence, actionability, and reusability dimensions) using the current embedder. This updates the centroids stored in `self.prototypes` in-place, keeping quality scoring aligned with the latest embedding space.
+- **Action**: `recompute_prototypes()` re-embeds the 15 fixed prototype sentences (covering consequence, actionability, and reusability dimensions) using the current embedder. This updates the centroids stored in `self.prototypes` in-place, keeping quality scoring aligned with the latest embedding space. The exemplar list deliberately avoids benchmark-task rules (the former "Always use Decimal ..." exemplar was replaced); some exemplars still touch payments, hashing, parameterized queries and input validation, so any evaluation task in those domains should report its cosine to the exemplars.
 
 ---
 
@@ -511,7 +531,7 @@ Memoire includes an asynchronous background maintenance scheduler that cleans up
 - **Fields**:
   - `memory`: The retrieved memory chunk.
   - `semantic_score`: Cosine similarity of the query and memory.
-  - `trust`: Decayed Trust EMA score.
+  - `trust`: Decayed Beta-posterior trust.
   - `uncertainty`: The memory's uncertainty rating.
   - `effective_weight`: Final weighted scoring used for search ranking.
   - `rank_score`: Ensemble score combining `0.65 * score + 0.25 * trust + 0.10 * effective_weight`.

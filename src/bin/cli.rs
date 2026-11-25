@@ -32,6 +32,8 @@ COMMANDS:
              [--json]             Output raw JSON
              [--min-score F]      Only return results above score threshold
     forget   <ID>                 Delete memory by id
+    unquarantine <ID>             Return a quarantined memory to service
+                                  (clears its recorded failures)
     count                         Print total stored memory chunks
     clear    [--confirm]          Erase ALL memories in the namespace (requires --confirm)
     export   [--output FILE]      Export namespace snapshot to JSON (stdout or file)
@@ -73,6 +75,9 @@ enum Command {
         min_score: f32,
     },
     Forget {
+        id: i64,
+    },
+    Unquarantine {
         id: i64,
     },
     Count,
@@ -195,6 +200,14 @@ fn parse_args_from(raw: Vec<String>) -> Result<Args, String> {
                 .and_then(|s| s.parse().ok())
                 .ok_or("forget requires an integer memory id")?;
             Command::Forget { id }
+        }
+
+        "unquarantine" => {
+            let id: i64 = raw
+                .get(i)
+                .and_then(|s| s.parse().ok())
+                .ok_or("unquarantine requires an integer memory id")?;
+            Command::Unquarantine { id }
         }
 
         "count" => Command::Count,
@@ -340,6 +353,15 @@ fn run() -> anyhow::Result<()> {
                 println!("✓ deleted memory id={id}");
             } else {
                 eprintln!("✗ no memory found with id={id}");
+                process::exit(1);
+            }
+        }
+
+        Command::Unquarantine { id } => {
+            if m.unquarantine(id)? {
+                println!("✓ unquarantined memory id={id}");
+            } else {
+                eprintln!("✗ no quarantined memory found with id={id}");
                 process::exit(1);
             }
         }
@@ -523,6 +545,18 @@ mod tests {
             .err()
             .expect("must be rejected");
         assert!(e.contains("--namespace"), "{e}");
+    }
+
+    #[test]
+    fn unquarantine_parses_an_id() {
+        let a = parse(&["unquarantine", "42"]).unwrap();
+        assert!(matches!(a.command, Command::Unquarantine { id: 42 }));
+    }
+
+    #[test]
+    fn unquarantine_requires_an_integer_id() {
+        assert!(parse(&["unquarantine"]).is_err());
+        assert!(parse(&["unquarantine", "abc"]).is_err());
     }
 
     #[test]

@@ -1,17 +1,52 @@
 name: Release
 
+# Pushing a v* tag builds everything, smoke-tests the built wheels in clean environments, and
+# creates a DRAFT GitHub Release. Nothing is uploaded to PyPI, crates.io or the MCP Registry:
+# registry publishing is a deliberate manual step (docs/RELEASE.md).
+#
+# "Run workflow" (workflow_dispatch) on a branch performs the same builds and smoke tests but
+# creates no release, so the pipeline can be exercised before a tag is pushed.
+
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The tag on tag runs; "dev-<sha>" on manual dispatch. (A branch name such as
+  # fix/p0-stabilization contains "/", which is invalid in artifact names and zip paths.)
+  RELEASE_LABEL: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
 
 jobs:
+  metadata:
+    name: Version and metadata consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            python scripts/check_release_metadata.py --tag "$GITHUB_REF_NAME"
+          else
+            python scripts/check_release_metadata.py
+          fi
+
   native-artifacts:
     name: Native artifact (${{ matrix.os }})
+    needs: metadata
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       matrix:
         include:
@@ -40,15 +75,174 @@ jobs:
           Copy-Item "target/release/${{ matrix.lib }}" "dist/package/${{ matrix.lib }}"
           Copy-Item "README.md" "dist/package/README.md"
           Copy-Item "LICENSE" "dist/package/LICENSE"
+          Copy-Item "THIRD_PARTY_NOTICES.md" "dist/package/THIRD_PARTY_NOTICES.md"
           Copy-Item "include/memoire.h" "dist/package/memoire.h"
           Copy-Item "docs/RELEASE.md" "dist/package/RELEASE.md"
-          Compress-Archive -Path dist/package/* -DestinationPath "dist/${{ matrix.artifact }}-${{ github.ref_name }}.zip" -Force
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/${{ matrix.artifact }}-${{ env.RELEASE_LABEL }}.zip" -Force
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}-${{ github.ref_name }}
+          name: ${{ matrix.artifact }}-${{ env.RELEASE_LABEL }}
           path: dist/*.zip
+
+  engine-wheels:
+    name: memoire-engine wheel (${{ matrix.target }})
+    needs: metadata
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: linux-x86_64, manylinux: "2_28" }
+          - { os: macos-latest, target: macos-arm64, manylinux: "off" }
+          - { os: windows-latest, target: windows-x86_64, manylinux: "off" }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Needed for the host-side tools below. The wheel is abi3 (cp310-abi3), so one build per
+      # platform serves Python >= 3.10.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: macOS runner must be arm64
+        if: runner.os == 'macOS'
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: build
+          args: --release --out dist
+          manylinux: ${{ matrix.manylinux }}
+          # ort-sys / native-tls need OpenSSL headers at build time on Linux. Harmless if the
+          # image already has them.
+          before-script-linux: |
+            if command -v yum >/dev/null 2>&1; then yum install -y openssl-devel; fi
+
+      - name: auditwheel report (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install auditwheel
+          auditwheel show bindings/python/dist/*.whl
+
+      - name: Inspect wheel (size, notices, no generic top-level modules)
+        shell: bash
+        run: >
+          python scripts/inspect_wheel.py "bindings/python/dist/*.whl"
+          --max-mb 90 --require LICENSE --require THIRD_PARTY_NOTICES.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-engine-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
+
+  mcp-dist:
+    name: memoire-mcp sdist + wheel
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        working-directory: mcp-server
+        run: |
+          python -m pip install build twine
+          python -m build --outdir dist
+          python -m twine check --strict dist/*
+
+      - name: Inspect (license, registry ownership marker)
+        run: >
+          python scripts/inspect_wheel.py "mcp-server/dist/*.whl"
+          --require LICENSE
+          --metadata-contains "mcp-name: io.github.tazwaryayyyy/memoire-mcp"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-mcp
+          path: mcp-server/dist/*
+
+  smoke-wheels:
+    name: Clean-room install (${{ matrix.target }}, py${{ matrix.python-version }})
+    needs: [engine-wheels, mcp-dist]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: linux-x86_64, python-version: "3.10" }
+          - { os: ubuntu-latest, target: linux-x86_64, python-version: "3.13" }
+          - { os: macos-latest, target: macos-arm64, python-version: "3.10" }
+          - { os: macos-latest, target: macos-arm64, python-version: "3.13" }
+          - { os: windows-latest, target: windows-x86_64, python-version: "3.10" }
+          - { os: windows-latest, target: windows-x86_64, python-version: "3.13" }
+    steps:
+      # Only the helper script is checked out (sparse). The package sources are never on disk,
+      # so a green run proves the *wheels* work, not the source tree.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-engine-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-mcp
+          path: ${{ runner.temp }}/dist
+
+      - name: Install the built wheels into a fresh venv and smoke-test
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          SMOKE_SCRIPT: ${{ github.workspace }}/scripts/smoke_installed.py
+        run: |
+          python -m venv venv
+          if [ -f venv/Scripts/activate ]; then . venv/Scripts/activate; else . venv/bin/activate; fi
+          python -m pip install --upgrade pip
+          # Third-party dependency from the index; the two Memoire wheels come only from dist/
+          # (--no-index), so an unrelated PyPI project can never be substituted.
+          python -m pip install "mcp[cli]==1.27.1"
+          python -m pip install --no-index --no-deps --find-links dist memoire-engine memoire-mcp
+          python -m pip check
+          export FASTEMBED_CACHE_DIR="$RUNNER_TEMP/fastembed_cache"
+          python "$SMOKE_SCRIPT"
+
+  github-release:
+    name: Draft GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [native-artifacts, engine-wheels, mcp-dist, smoke-wheels]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          draft: true
+          files: dist/*
