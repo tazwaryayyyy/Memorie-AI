@@ -144,6 +144,20 @@ C0/C1 only sometimes, which says nothing about trust. Check it with `summarize -
   the oracle-written gold lesson must be labelled as such in any report. Keep the current bank as the
   conflict-discrimination condition; do not replace it.
 
+## Step 8d: pre-registered held-out run and analysis
+
+Plan, decision rule, budget and freeze procedure: `eval/PREREGISTRATION_8d.md`. Report skeleton: `eval/BENCHMARK_METHODOLOGY.md`.
+- `--no-poison` (memory arms only; rejected for A): the family's poison lesson is never ingested. Pre-registered for B only, as the
+  poison-harm counterfactual. B and B-nopoison hold identical stores at s1, so their s1 prompts must be byte-identical; `analyze`
+  checks that. It is part of the run fingerprint only when set, so older result files keep resuming.
+- `python -m eval.run_eval analyze --split {dev,test} --results FILES... [--out report.json]` reads results files only (no model calls).
+  Conditions are read from the records (arm, `trial_cap`, `prompt_policy`, `no_poison`), compared paired by family, and exactly one
+  contrast (C1-t1 vs B over s1-s4) gets an inference (exact two-sided sign-flip). Everything else is descriptive by construction.
+  Exit code 1 means an integrity check failed; 2 means unreadable or duplicated input.
+- `analyze --preflight --split dev --results FILES...` applies the seed-count rule to dev reruns of B and C1-tagged at seeds 0 and 1
+  (pooled flips <= 1 of 40 -> one seed on test, else two).
+- `python -m eval.power_sim` prints the planning table quoted in the pre-registration (assumptions are in the file; it is not an analysis).
+
 ## Checkpointing
 `--out file.jsonl` is append-only; key = `(arm, family, session, seed)`. Re-running the same command
 skips recorded runs; for C1 their feedback is replayed into a fresh store first. A torn last line is

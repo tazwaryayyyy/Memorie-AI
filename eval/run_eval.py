@@ -1,4 +1,4 @@
-"""CLI:  python -m eval.run_eval {run,summarize,diagnose} ...   (see eval/README.md)"""
+"""CLI:  python -m eval.run_eval {run,summarize,diagnose,analyze} ...   (see eval/README.md)"""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +9,7 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Optional
 
+from .analysis import cmd_analyze
 from .arms import ALL_ARMS, ARM_A, normalize_arm, uses_memory
 from .diagnostics import (TAU_GRID, exemplar_cosines, pooled_quality, quality_scores, relevance_separation,
                           summarize_quality)
@@ -41,7 +42,7 @@ def _settings(args, families) -> RunSettings:
         contradiction=args.contradiction, max_tokens=args.max_tokens, send_api_seed=args.send_api_seed,
         admission=args.admission, quality_gate_threshold=args.quality_gate_threshold,
         trial_min_cos=args.trial_min_cos, verified_min_cos=args.verified_min_cos, store_scope=args.store_scope,
-        prompt_policy=args.prompt_policy,
+        prompt_policy=args.prompt_policy, no_poison=args.no_poison,
     )
 
 
@@ -61,6 +62,9 @@ def cmd_run(args) -> int:
         families = select_families(load_split(args.split), _csv(args.families))
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.no_poison and any(not uses_memory(a) for a in arms):
+        print("error: --no-poison needs a memory store; Arm A has none (drop A from --arms)", file=sys.stderr)
         return 2
     seeds = [int(s) for s in _csv(args.seeds)]
     settings = _settings(args, families)
@@ -196,7 +200,8 @@ def cmd_summarize(args) -> int:
         no_code = sum(1 for r in recs if not r["parsed"]["code_found"])
         out_tok = sum((r["usage"]["completion_tokens"] or 0) for r in recs)
         cut = sum(1 for r in recs if r.get("finish_reason") == "length")
-        print(f"\n{arm}: {k}/{n} passed ({k / n:.2f}); no-code-block: {no_code}; "
+        tag = " [no-poison]" if all(r.get("no_poison") for r in recs) else ""
+        print(f"\n{arm}{tag}: {k}/{n} passed ({k / n:.2f}); no-code-block: {no_code}; "
               f"truncated (finish_reason=length): {cut}; completion tokens: {out_tok}")
         fam: Dict[str, List[bool]] = defaultdict(list)
         for r in sorted(recs, key=lambda r: (r["family"], r["session"])):
@@ -325,6 +330,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--prompt-policy", choices=PROMPT_POLICIES, default=POLICY_PLAIN,
                    help="plain: notes are bare text (default). tagged: C0/C1 notes carry the engine's outcome tag "
                         "([UNTESTED] / [TRUST x.xx: ...]); A and B are unaffected. Part of the run fingerprint")
+    r.add_argument("--no-poison", action="store_true",
+                   help="never ingest each family's poison lesson (poison-harm counterfactual; pre-registered for B "
+                        "only). Part of the run fingerprint when set; not valid with Arm A")
     r.add_argument("--max-calls", type=int, default=0,
                    help="stop after this many HTTP requests, retries included (0 = no cap); leave headroom for 5xx retries")
     r.add_argument("--max-retries", type=int, default=8,
@@ -342,6 +350,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--results", required=True)
     s.add_argument("--detail", action="store_true", help="per-run visible/hidden status and failing test names")
     s.set_defaults(func=cmd_summarize)
+
+    a = sub.add_parser("analyze", help="pre-registered Step 8d analysis (family-paired; one primary contrast); "
+                                       "reads results files only, makes no model calls")
+    a.add_argument("--split", choices=("dev", "test"), required=True)
+    a.add_argument("--results", nargs="+", required=True, help="one or more JSONL files; conditions are read from records")
+    a.add_argument("--out", help="write the full report as JSON")
+    a.add_argument("--preflight", action="store_true",
+                   help="seed-count decision from dev reruns of exactly B and C1-tagged at seeds 0 and 1")
+    a.set_defaults(func=cmd_analyze)
 
     d = sub.add_parser("diagnose", help="exemplar-cosine table for lessons and task specs (needs native build)")
     d.add_argument("--split", choices=("dev", "test"), required=True)

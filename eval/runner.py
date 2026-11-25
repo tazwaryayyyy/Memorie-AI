@@ -45,17 +45,23 @@ class RunSettings:
     verified_min_cos: Optional[float] = None
     store_scope: str = "shared"  # "shared": one store for the whole split; "family": a fresh store per family
     prompt_policy: str = "plain"  # "tagged": engine outcome tags on C0/C1 notes only (prompt.tag_for)
+    no_poison: bool = False  # True: the family's poison lesson is never ingested (poison-harm counterfactual)
 
     def __post_init__(self) -> None:
         if self.prompt_policy not in PROMPT_POLICIES:
             raise ValueError(f"unknown prompt_policy {self.prompt_policy!r}; expected one of {PROMPT_POLICIES}")
+
+    def fingerprint_settings(self) -> Dict[str, Any]:
+        """Settings that enter the run fingerprint. `no_poison` is left out while False so fingerprints (and
+        resumable JSONL files) written before the flag existed stay valid; True always changes the fingerprint."""
+        return {k: v for k, v in self.__dict__.items() if not (k == "no_poison" and v is False)}
 
     def fingerprint(self, families: Sequence[Family]) -> str:
         hashes = families_hash(families)
         return canonical_hash(
             {
                 "harness": HARNESS_VERSION,
-                "settings": self.__dict__,
+                "settings": self.fingerprint_settings(),
                 "tasks": hashes["tasks"],
                 "lessons": hashes["lessons"],
                 "prompt": canonical_hash(prompt_template_hash_input(self.prompt_policy)),
@@ -175,7 +181,7 @@ def run_sequence(
         for task in fam.tasks:
             if task.session not in settings.sessions:
                 continue
-            if store is not None and task.session == fam.poison_session:
+            if store is not None and task.session == fam.poison_session and not settings.no_poison:
                 store.ingest(fam.poison, track_shadow=track)
             key: RunKey = (arm, fam.name, task.session, seed)
             session_id = f"{fam.name}-s{task.session}-seed{seed}"
@@ -227,6 +233,7 @@ def run_sequence(
                 "verified_min_cos": settings.verified_min_cos,
                 "store_scope": settings.store_scope,
                 "prompt_policy": policy,
+                "no_poison": settings.no_poison,
                 "shadowed_keys": sorted(store.shadowed) if store is not None else [],
                 "top_k": settings.top_k,
                 "trial_cap": settings.trial_cap,
