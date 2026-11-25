@@ -12,6 +12,27 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ---
 
 ## [Unreleased]
+### Added (Step 9a: release engineering; nothing published)
+- **CI** (`.github/workflows/ci.yml`): runs on `fix/p0-stabilization` pushes as well as `main`; adds
+  `bindings/python/tests` (Python 3.10 and 3.13), offline `eval/tests`, the `wasm32` compile check,
+  dashboard `tsc` and `npm test`, `cargo package --locked`, and a release-metadata consistency job;
+  the model cache now caches `FASTEMBED_CACHE_DIR` (the old `~/.cache/huggingface` path was not the
+  directory fastembed uses). Concurrency groups cancel superseded runs.
+- **Release workflow** (`.github/workflows/release.yml`): builds `memoire-engine` wheels (Linux
+  x86_64 `manylinux_2_28`, macOS arm64, Windows x86_64) and the `memoire-mcp` sdist and wheel,
+  inspects them (size, license files, no generic top-level modules, registry marker), installs the
+  built wheels in clean virtualenvs without the source tree, and drafts a GitHub Release. It also
+  runs on manual dispatch (no release is created). It never uploads to PyPI, crates.io or the MCP
+  Registry. Token scope is `contents: read` except in the release job.
+- `mcp-server/server.json` (MCP Registry manifest for `io.github.tazwaryayyyy/memoire-mcp`), the
+  `mcp-name` ownership marker in `mcp-server/README.md`, and Claude Code and Cursor setup blocks
+  with `FASTEMBED_CACHE_DIR` and `MEMOIRE_TRIAL_CAP` notes (no accuracy claim).
+- `THIRD_PARTY_NOTICES.md` (draft summary, not a full inventory), license copies inside the Python
+  packages, `repository` / `homepage` and the notices file in `Cargo.toml`.
+- `scripts/check_release_metadata.py`, `scripts/inspect_wheel.py`, `scripts/smoke_installed.py`.
+- Not changed: `src/`, engine behaviour or defaults, bindings code, `eval/` and the frozen Step 8d
+  files. These workflow and packaging changes have not been executed in GitHub Actions.
+
 ### Added (Steps 8c-8d: real-LLM evaluation harness, pre-registration, first held-out result)
 - **`eval/` real-LLM harness** (hermetic, resumable JSONL; arms A no memory, B plain vector, C0 static Memoire,
   C1 Memoire with outcome feedback; `dev` and `test` splits). Step 8c-5 and 8d-1 additions: `--prompt-policy tagged`

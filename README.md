@@ -377,7 +377,9 @@ Client configuration (any MCP stdio client; point at the virtualenv's script):
 }
 ```
 
-(Windows: `...\.venv\Scripts\memoire-mcp.exe`.) Setting `FASTEMBED_CACHE_DIR` (or `HF_HOME`)
+(Windows: `...\.venv\Scripts\memoire-mcp.exe`.) Copy-paste setup for Claude Code
+(`claude mcp add ...`) and Cursor (`mcp.json`) is in [mcp-server/README.md](mcp-server/README.md).
+Setting `FASTEMBED_CACHE_DIR` (or `HF_HOME`)
 avoids a per-workspace model download; the first tool call that needs the embedder may
 take long enough to hit a client tool timeout while the model downloads.
 
@@ -496,9 +498,11 @@ condition), one seed, conflicting lessons plus one deliberately wrong "poison" l
    constants. They are configurable, not validated or calibrated.
 4. **Not offline on cold start** (model download), and the default cache directory is
    relative to the working directory (see [Model cache](#model-cache-and-offline-use)).
-5. **Not published.** No registry package exists yet; there are no prebuilt wheels or
-   binaries. Linux `manylinux` compatibility of the ONNX Runtime wheels, macOS x86_64 and
-   musl targets are untested.
+5. **Not published.** No registry package exists yet. `release.yml` is set up to build wheels
+   for Linux x86_64 (`manylinux_2_28`), macOS arm64 and Windows x86_64, but that pipeline has
+   not been run to completion; `manylinux` compatibility of the statically linked ONNX Runtime
+   is unverified. macOS x86_64, Linux aarch64 and musl have no wheel and no tested build path.
+   `THIRD_PARTY_NOTICES.md` is a draft summary, not a complete license inventory.
 6. **Python wrapper gap** (`recall_reranked`) and per-query `Memoire` construction in
    `memoire_engine.adapters` (reloads the embedder on each retrieval).
 7. Other known debt: `resolve_contradictions_for_id` skips new memories whose polarity is
@@ -520,20 +524,32 @@ cargo check --target wasm32-unknown-unknown --no-default-features --features was
 (cd dashboard && npx tsc --noEmit && npm test)
 ```
 
-What GitHub Actions (`.github/workflows/ci.yml`) **actually runs**, on push and pull
-requests targeting `main` only:
+What GitHub Actions (`.github/workflows/ci.yml`) is **configured to run**, on pushes to
+`main` and `fix/p0-stabilization`, on pull requests targeting `main`, and on manual dispatch.
+This describes the workflow file, not a pass status; check the Actions tab for the latest run:
 
 - Rust, on ubuntu / macOS / windows: `cargo fmt --check`, `clippy -D warnings`,
   `cargo package --list`, debug and release builds, `cargo test --lib`,
   `cargo test --bins` (CLI and `memoire-server` tests), `cargo test --test
   integration_test`, `--test oracle --test import_security --test feedback_errors
   --test ort_smoke --test ffi_header_parity --test namespace_feedback`, and doc-tests.
+- Ubuntu: `cargo package --locked` (builds the packaged crate; uploads nothing) and a check
+  that the packaged file list contains the migrations, header, license and notices.
 - Ubuntu: release shared-library build plus exported-symbol check.
+- Ubuntu: `cargo check --target wasm32-unknown-unknown --no-default-features --features wasm`
+  (compile only).
+- Ubuntu, Python 3.10 and 3.13: `maturin develop --release`, `bindings/python/tests`, and (3.13
+  only) the offline `eval/tests`.
 - Ubuntu, Python 3.11: MCP server tests (`uv sync --locked --extra dev`, `pytest`).
-- Ubuntu, Python 3.11: clean-venv install smoke of `bindings/python` and `mcp-server`.
+- Ubuntu, Node 22: dashboard `tsc --noEmit` and `npm test`.
+- Ubuntu, Python 3.11: clean-venv install smoke of `bindings/python` and `mcp-server`
+  (from the source tree, not from built wheels).
+- Ubuntu: `scripts/check_release_metadata.py` (matching versions, `server.json`, license copies).
 
-CI does **not** currently run: the Python SDK test suite (`bindings/python/tests`), the
-`wasm32` check, the dashboard checks (`tsc`, `node --test`), or any benchmark. Do not read the passing badge as covering those.
+CI does **not** run any benchmark or LLM evaluation. The release workflow
+(`.github/workflows/release.yml`) additionally builds wheels and smoke-tests them in clean
+virtualenvs; see [docs/RELEASE.md](docs/RELEASE.md). Treat that pipeline as unproven until a
+manual dispatch has completed on all three platforms.
 
 ## More Detail
 

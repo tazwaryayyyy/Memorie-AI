@@ -2,18 +2,45 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/p0-stabilization]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_LOG: debug
+  # fastembed resolves its model cache as $HF_HOME, then $FASTEMBED_CACHE_DIR, then
+  # ./.fastembed_cache (cwd-relative). Pin it to one absolute directory so every job and every
+  # test binary shares the same cache, and cache exactly that directory.
+  FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
 
 jobs:
+  metadata:
+    name: Release metadata consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check versions, server.json, license copies
+        run: python scripts/check_release_metadata.py
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -38,8 +65,8 @@ jobs:
       - name: Cache fastembed model
         uses: actions/cache@v4
         with:
-          path: ~/.cache/huggingface
-          key: fastembed-all-minilm-l6-v2
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-all-minilm-l6-v2-${{ runner.os }}-v1
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -71,9 +98,40 @@ jobs:
       - name: Doc tests
         run: cargo test --doc
 
+  crate-package:
+    name: Crate package verification (no upload)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-package-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Packaged file list contains what the build needs
+        run: |
+          cargo package --locked --list > crate-files.txt
+          cat crate-files.txt
+          for f in Cargo.toml Cargo.lock README.md LICENSE THIRD_PARTY_NOTICES.md include/memoire.h migrations/v2.sql migrations/v3.sql; do
+            grep -qx "$f" crate-files.txt || { echo "::error::$f is not in the packaged crate"; exit 1; }
+          done
+
+      # Unpacks the .crate into target/package and builds it there, which is what catches
+      # include_str!() / include-list mistakes. It does not upload anything.
+      - name: Build the packaged crate
+        run: cargo package --locked
+
   build-library:
     name: Build shared library
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -86,9 +144,78 @@ jobs:
         run: |
           nm -D target/release/libmemoire.so | grep memoire_
 
+  wasm32:
+    name: wasm32 check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Check (compile only; quality::now_ts() is not expected to run on wasm32)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
+
+  python-sdk:
+    name: Python SDK tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pysdk-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-all-minilm-l6-v2-${{ runner.os }}-v1
+
+      - name: Build the extension into a fresh venv
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest "langchain-core>=0.3" "llama-index-core>=0.10"
+          cd bindings/python
+          maturin develop --release
+
+      - name: bindings/python/tests
+        run: |
+          . .venv/bin/activate
+          cd bindings/python
+          pytest
+
+      # Offline: the harness tests do not call an LLM. Needs no API key.
+      - name: eval/tests (offline)
+        if: matrix.python-version == '3.13'
+        run: |
+          . .venv/bin/activate
+          pytest eval/tests
+
   mcp-server:
     name: MCP server smoke tests
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -100,6 +227,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: astral-sh/setup-uv@v6
+
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FASTEMBED_CACHE_DIR }}
+          key: fastembed-all-minilm-l6-v2-${{ runner.os }}-v1
 
       - name: Install locked MCP environment
         working-directory: mcp-server
@@ -113,9 +246,33 @@ jobs:
         working-directory: mcp-server
         run: uv run pytest
 
+  dashboard:
+    name: Dashboard (tsc + node tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install (lockfile only)
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: npm test
+
   package-smoke:
     name: Clean package install smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

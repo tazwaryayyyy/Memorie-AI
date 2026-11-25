@@ -1,0 +1,52 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.tazwaryayyyy/memoire-mcp",
+  "title": "Memoire",
+  "description": "Local-first semantic memory for coding agents: SQLite + local embeddings, no hosted service.",
+  "repository": {
+    "url": "https://github.com/tazwaryayyyy/Memorie-AI",
+    "source": "github",
+    "subfolder": "mcp-server"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "memoire-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "MEMOIRE_DB_PATH",
+          "description": "Absolute path of the SQLite memory database. If unset the server uses <workspace>/.memoire_path or <workspace>/memoire.db.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "filepath"
+        },
+        {
+          "name": "FASTEMBED_CACHE_DIR",
+          "description": "Directory for the embedding model (about 23 MB, downloaded on first use). Set one shared directory to avoid a download per working directory.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "filepath"
+        },
+        {
+          "name": "MEMOIRE_TRIAL_CAP",
+          "description": "Maximum unverified (no-feedback) memories one recall returns. Non-negative integer; the engine default is 1.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number"
+        },
+        {
+          "name": "MEMOIRE_ENABLE_ADMIN_TOOLS",
+          "description": "Set to 1 to expose memoire_clear and memoire_import. Off by default; leave off unless you need them.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

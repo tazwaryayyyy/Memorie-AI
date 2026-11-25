@@ -7,6 +7,8 @@ edition = "2021"
 description = "A local-first, embeddable long-term memory engine for AI coding agents"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/tazwaryayyyy/Memorie-AI"
+homepage = "https://github.com/tazwaryayyyy/Memorie-AI"
 keywords = ["ai", "memory", "embeddings", "sqlite", "ffi"]
 categories = ["database", "science::ml"]
 include = [
@@ -17,6 +19,7 @@ include = [
     "/include/memoire.h",
     "/README.md",
     "/LICENSE",
+    "/THIRD_PARTY_NOTICES.md",
     "/Cargo.toml",
     "/Cargo.lock",
     "/build.rs",
