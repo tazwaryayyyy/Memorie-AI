@@ -12,6 +12,30 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ---
 
 ## [Unreleased]
+### Added (Steps 8c-8d: real-LLM evaluation harness, pre-registration, first held-out result)
+- **`eval/` real-LLM harness** (hermetic, resumable JSONL; arms A no memory, B plain vector, C0 static Memoire,
+  C1 Memoire with outcome feedback; `dev` and `test` splits). Step 8c-5 and 8d-1 additions: `--prompt-policy tagged`
+  (engine-derived outcome tags on C0/C1 notes, `eval/prompt.py::tag_for`); raw cosine `cos` next to the blended `score` in
+  records and `shown=` in `summarize --detail`; `--no-poison` (poison-harm counterfactual; not valid for Arm A; part of the run
+  fingerprint only when set); `analyze` subcommand and `eval/analysis.py` (family-paired contrasts, one pre-registered primary
+  inference, integrity checks, dev seed-count `--preflight`); `eval/power_sim.py` (planning aid).
+- **`ScoringConfig::verified_min_cos`** (default `0.0`, no floor, previous behaviour): a verified row (any feedback) must reach
+  this cosine to be offered by `Store::search`; not applied when hidden rows are requested. Python:
+  `Memoire(..., trial_min_cos=, verified_min_cos=)`, validated in `[0, 1]` (NaN raises `MemoireError`).
+- **Tests**: `Store::search` ranking regression tests (`test_verified_trust_outranks_slightly_closer_penalized_row`,
+  `test_equal_cosine_orders_by_trust_success_then_failure`); stale comments in
+  `test_ranking_improves_after_penalizing_bad_memory` corrected. Ranking is
+  `0.75*cos + 0.20*trust + 0.05*recency`; `effective_weight` is output-only.
+
+### Documentation (Step 8d-2)
+- **`eval/PREREGISTRATION_8d.md`** (frozen at tag `prereg-8d`, commit `10e0f8fb55e1066bc2a5ba4e9fe04599a4356006`) and
+  **`eval/BENCHMARK_METHODOLOGY.md`**: first held-out result. The pre-registered gate was **not passed** (plain vector 13/32 vs no
+  memory 12/32), so the primary endpoint (`C1` at `trial_cap=1` vs plain vector, 11/32 vs 13/32) yields no inference. **No
+  accuracy-improvement claim is made.** Secondary findings are exploratory and uncorrected: poison harm on plain vector, a
+  first-session bottleneck at `trial_cap=1`, and a larger feedback effect at `trial_cap=3`; none justifies changing a default.
+- `README.md`: new "Evidence so far" section; Known Limitation 2 no longer says no real-LLM benchmark has been run.
+- Not changed: `src/`, bindings, MCP server (Steps 8d-1 and 8d-2).
+
 ### Changed (Step 8b-3: SDK / MCP alignment and 8b-2 cleanups; breaking, pre-publish)
 - **`should_supersede(incoming_gravity, existing_gravity, incoming_is_newer)`**: the winner of
   a contradiction is the side with more feedback evidence (`compute_gravity_radius`); ties go

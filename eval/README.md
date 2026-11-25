@@ -146,7 +146,8 @@ C0/C1 only sometimes, which says nothing about trust. Check it with `summarize -
 
 ## Step 8d: pre-registered held-out run and analysis
 
-Plan, decision rule, budget and freeze procedure: `eval/PREREGISTRATION_8d.md`. Report skeleton: `eval/BENCHMARK_METHODOLOGY.md`.
+Plan, decision rule, budget and freeze procedure: `eval/PREREGISTRATION_8d.md`. Method, results and caveats of the held-out run:
+`eval/BENCHMARK_METHODOLOGY.md` (primary endpoint not met; no accuracy-improvement claim).
 - `--no-poison` (memory arms only; rejected for A): the family's poison lesson is never ingested. Pre-registered for B only, as the
   poison-harm counterfactual. B and B-nopoison hold identical stores at s1, so their s1 prompts must be byte-identical; `analyze`
   checks that. It is part of the run fingerprint only when set, so older result files keep resuming.

@@ -12,7 +12,9 @@
 > this one.
 >
 > The central idea (trust that rises or falls with task outcomes) is **not yet
-> empirically validated**. See [Known Limitations](#known-limitations).
+> empirically validated**. A pre-registered held-out run (Step 8d) did not show an
+> accuracy improvement: see [Evidence so far](#evidence-so-far) and
+> [Known Limitations](#known-limitations).
 
 Memoire stores short lessons from agent runs in a local SQLite file, retrieves them by
 embedding similarity, and keeps a per-memory trust value that you can move up or down
@@ -36,7 +38,10 @@ Task 2 starts -> recall("billing precision") -> trust-gated context for the agen
 Task 2 ends   -> reinforce_if_used(...) or penalize_if_used(...)
 ```
 
-Whether this loop improves a real coding agent has **not been measured**. As of Step
+Whether this loop improves a real coding agent was tested once (Step 8d: one model, 8
+held-out task families). The pre-registered primary comparison did not show an
+improvement, so **no accuracy-improvement claim is made** (see
+[Evidence so far](#evidence-so-far)). As of Step
 8b-1 a fresh lesson enters as an unverified `trial` memory and is offered in a bounded
 trial slot (see Trust and Policy and Known Limitations), verified by deterministic engine
 tests only.
@@ -427,6 +432,42 @@ curl -H "Content-Type: application/json" -H "Authorization: Bearer $MEMOIRE_API_
 (Omit the `Authorization` header if `MEMOIRE_API_TOKEN` is unset.) The `db` path must
 resolve inside `MEMOIRE_ALLOWED_PATHS` (default: the server's working directory).
 
+## Evidence so far
+
+One pre-registered, held-out comparison has been run (Step 8d; plan in
+[`eval/PREREGISTRATION_8d.md`](eval/PREREGISTRATION_8d.md), frozen at git tag `prereg-8d`;
+method, tables, hashes and caveats in
+[`eval/BENCHMARK_METHODOLOGY.md`](eval/BENCHMARK_METHODOLOGY.md)). Model
+`gemini-3.1-flash-lite`, temperature 0, 8 task families x 4 sessions (32 tasks per
+condition), one seed, conflicting lessons plus one deliberately wrong "poison" lesson.
+
+| Condition | Pass rate |
+|---|---|
+| no memory (`A`) | 12/32 (0.38) |
+| plain vector, top 3 (`B`) | 13/32 (0.41) |
+| plain vector, no poison ingested (`B-nopoison`) | 17/32 (0.53) |
+| Memoire static, `trial_cap` 1 (`C0-t1`) | 8/32 (0.25) |
+| Memoire with outcome feedback, `trial_cap` 1, the default (`C1-t1`) | 11/32 (0.34) |
+| Memoire static, `trial_cap` 3 (`C0-t3`) | 11/32 (0.34) |
+| Memoire with outcome feedback, `trial_cap` 3 (`C1-t3`) | 18/32 (0.56) |
+
+- **The primary endpoint was not met.** The pre-registered gate (plain-vector memory must
+  beat no memory by at least 0.15) failed: 13/32 vs 12/32. Under the pre-registration no
+  inference is drawn from the primary comparison; reported descriptively, `C1-t1` vs `B`
+  is -0.0625 (95% family-bootstrap interval [-0.250, +0.125], exact two-sided p = 0.75, which
+  is not an inference under the gate rule).
+- **No accuracy-improvement claim is made** for the default `trial_cap=1` or for any other
+  configuration. The dev pilot's gap between plain vector and no memory (14/20 vs 8/20, 5
+  families) did not replicate.
+- **Exploratory, uncorrected, one family drives several differences** (`retry_backoff`):
+  removing the poison lesson helped plain vector; `trial_cap=1` scored lowest in the first
+  two sessions (2/16 for both `C0` and `C1`); with exposure matched (`trial_cap=3`) outcome
+  feedback scored higher than static recall. These are hypotheses for a replication on new
+  families under a new pre-registration, not results. This run does not justify changing
+  the `trial_cap` default.
+- The comparison covers one model and lessons written by this project; the poison lesson
+  is wrong by design. With 8 families the statistical test has very little power.
+
 ## Known Limitations
 
 1. **Cold start (changed in Step 8b-1; effect on real agents unmeasured).** New lessons
@@ -439,11 +480,16 @@ resolve inside `MEMOIRE_ALLOWED_PATHS` (default: the server's working directory)
    `trial_cap` (or pass `trial_cap=` in Python) for no-feedback use. Hidden `shadow` rows
    (only under `AdmissionMode::QualityGate`) are promoted by `Store::promote_shadow`;
    ingest does not call it yet. This is verified by deterministic engine tests only, not
-   by any real-agent run.
-2. **No real-LLM evaluation.** `scripts/agent_behavior_benchmark.py` is a deterministic
-   synthetic smoke test (it prints `[SYNTHETIC SMOKE TEST, not an LLM benchmark]`), and
-   `examples/brutal_moment_demo.py` is a scripted demo. Neither is evidence that Memoire
-   improves a real coding agent. No such benchmark has been run or published.
+   by any real-agent run. On the Step 8d held-out run both `trial_cap=1` conditions scored
+   2/16 in sessions 1 and 2, the lowest of the seven conditions (exploratory; see
+   [Evidence so far](#evidence-so-far)).
+2. **Real-LLM evidence is one inconclusive-to-negative run.** `scripts/agent_behavior_benchmark.py`
+   is a deterministic synthetic smoke test (it prints `[SYNTHETIC SMOKE TEST, not an LLM
+   benchmark]`) and `examples/brutal_moment_demo.py` is a scripted demo; neither is evidence
+   that Memoire improves a real coding agent. The only real-LLM evaluation is the Step 8d
+   held-out run (one model, 8 families, one seed): its primary endpoint was not met and no
+   accuracy-improvement claim is made (see [Evidence so far](#evidence-so-far)). It has not
+   been replicated and does not cover other models or real-world lesson quality.
 3. **Heuristic scoring.** Quality scoring (three semantic centroid features; the `evidence`
    keyword and `novelty` features are stored but no longer scored), the trust formula, the
    policy thresholds and the lexical contradiction fallback are heuristics with hand-set
