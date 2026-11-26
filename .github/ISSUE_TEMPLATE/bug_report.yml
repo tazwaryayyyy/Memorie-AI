@@ -1,0 +1,36 @@
+name: Bug report
+description: Report an install, MCP, Python, or Rust issue
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Component / install method
+      options:
+        - memoire-mcp (uvx)
+        - memoire-mcp (pip)
+        - memoire-engine (PyPI wheel)
+        - memoire-engine (crates.io)
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: os_python
+    attributes:
+      label: OS, architecture, and Python/Rust version
+      placeholder: e.g. Ubuntu 24.04 x86_64, Python 3.12 (or Windows 11, macOS arm64)
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client (if applicable)
+      placeholder: e.g. Claude Code, Cursor, Claude Desktop, or none (Python/Rust SDK)
+  - type: textarea
+    id: details
+    attributes:
+      label: What happened & exact error output
+      description: Mention whether FASTEMBED_CACHE_DIR was set and whether this happened on the first cold call.
+    validations:
+      required: true
