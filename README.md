@@ -99,7 +99,6 @@ network access unless `ORT_LIB_LOCATION` is set.
 ```bash
 git clone https://github.com/tazwaryayyyy/Memorie-AI
 cd Memorie-AI
-git checkout fix/p0-stabilization   # until it is merged to main
 cargo build --release
 ```
 
@@ -174,7 +173,7 @@ memoire-cli --db agent.db --ns billing-agent import billing.json --preserve-trus
 
 ## Model Cache and Offline Use
 
-The default embedder (`all-MiniLM-L6-v2`, about 23 MB) is **downloaded from Hugging Face
+The default embedder (`all-MiniLM-L6-v2`, about 87 MiB, roughly 91 MB) is **downloaded from Hugging Face
 on first use**. Memoire is therefore **not offline on a cold start**; it needs no
 network once the model is cached.
 
@@ -502,7 +501,9 @@ condition), one seed, conflicting lessons plus one deliberately wrong "poison" l
    for Linux x86_64 (`manylinux_2_28`), macOS arm64 and Windows x86_64, but that pipeline has
    not been run to completion; `manylinux` compatibility of the statically linked ONNX Runtime
    is unverified. macOS x86_64, Linux aarch64 and musl have no wheel and no tested build path.
-   `THIRD_PARTY_NOTICES.md` is a draft summary, not a complete license inventory.
+   `THIRD_PARTY_NOTICES.md` inventories every locked Rust crate and names the non-crate
+   components, but does not reproduce license texts; ONNX Runtime's own third-party notices
+   are referenced, not bundled.
 6. **Python wrapper gap** (`recall_reranked`) and per-query `Memoire` construction in
    `memoire_engine.adapters` (reloads the embedder on each retrieval).
 7. Other known debt: `resolve_contradictions_for_id` skips new memories whose polarity is
@@ -544,7 +545,8 @@ This describes the workflow file, not a pass status; check the Actions tab for t
 - Ubuntu, Node 22: dashboard `tsc --noEmit` and `npm test`.
 - Ubuntu, Python 3.11: clean-venv install smoke of `bindings/python` and `mcp-server`
   (from the source tree, not from built wheels).
-- Ubuntu: `scripts/check_release_metadata.py` (matching versions, `server.json`, license copies).
+- Ubuntu: `scripts/check_release_metadata.py` (matching versions, `server.json`, license copies,
+  and that `THIRD_PARTY_NOTICES.md` lists exactly the packages in `Cargo.lock`).
 
 CI does **not** run any benchmark or LLM evaluation. The release workflow
 (`.github/workflows/release.yml`) additionally builds wheels and smoke-tests them in clean

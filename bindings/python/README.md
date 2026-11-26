@@ -26,7 +26,7 @@ with Memoire("agent.db") as m:
 ```
 
 The first real `remember()`/`recall()` downloads the embedding model (about
-23 MB) unless it is already in the Hugging Face cache.
+87 MiB) unless it is already in the Hugging Face cache.
 
 `import_namespace(snapshot)` ignores trust metadata in the snapshot by default.
 Pass `preserve_trust=True` only to restore a snapshot you exported yourself.

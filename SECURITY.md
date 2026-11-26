@@ -9,7 +9,7 @@ The project has **not** had an external security audit or penetration test, and
 ## Supported Versions
 
 No version has been released or published to any registry. Only the current tip of the
-development branch (`fix/p0-stabilization` until merged, then `main`) receives fixes.
+development branch (`main`) receives fixes.
 
 ## Reporting a Vulnerability
 

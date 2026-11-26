@@ -258,7 +258,7 @@ approximate.
 |---|---|
 | Dimensions | 384 |
 | Max tokens | 256 (word-piece) |
-| Model size | ~23 MB (ONNX format) |
+| Model size | ~87 MiB (ONNX format) |
 | Inference | CPU-only, ~50–100ms per batch on a laptop |
 | License | Apache 2.0 |
 
@@ -269,7 +269,7 @@ The chunker's default chunk size of 128 words (~180 word-piece tokens on average
 `fastembed` was chosen over raw `candle` or `ort` because:
 
 1. **Zero configuration** — model download, tokenisation, mean pooling, and L2 normalisation are all handled internally.
-2. **Prebuilt ONNX Runtime** — no system ONNX library is required; the `ort` crate downloads and statically links a prebuilt runtime at build time (needs network, or `ORT_LIB_LOCATION`). Do not enable `ort`'s `load-dynamic` or `copy-dylibs` features (see `CHANGELOG.md`). The embedding **model** is downloaded on first use (about 23 MB); cache directory precedence is `$HF_HOME`, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache` relative to the current working directory.
+2. **Prebuilt ONNX Runtime** — no system ONNX library is required; the `ort` crate downloads and statically links a prebuilt runtime at build time (needs network, or `ORT_LIB_LOCATION`). Do not enable `ort`'s `load-dynamic` or `copy-dylibs` features (see `CHANGELOG.md`). The embedding **model** is downloaded on first use (about 87 MiB); cache directory precedence is `$HF_HOME`, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache` relative to the current working directory.
 3. **Batch inference** — `embed(Vec<String>)` runs the full batch in a single ONNX call.
 4. **Active maintenance** — kept up-to-date with the latest fastembed/ONNX Runtime releases.
 
