@@ -145,6 +145,5 @@ runtime is on the loader path and, on Windows, can load an unrelated `System32\o
 
 ## Current Non-Goals
 
-- No PyPI wheels with bundled native libraries yet.
-- No crates.io release until the repository metadata and artifact policy are stable.
-- No automatic model vendoring inside GitHub release artifacts.
+- No PyPI sdist or prebuilt wheels beyond Linux `x86_64` (`manylinux_2_28`), macOS `arm64`, and Windows `x86_64`.
+- No automatic model vendoring inside GitHub release artifacts or PyPI wheels.

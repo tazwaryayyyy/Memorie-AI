@@ -5,11 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Build](https://github.com/tazwaryayyyy/Memorie-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/tazwaryayyyy/Memorie-AI/actions)
 
-> **Status: pre-release (`0.1.0`, alpha). Nothing is published yet.**
-> `memoire-engine` (crates.io and PyPI) and `memoire-mcp` (PyPI) are the intended
-> package names but are **not published**. Install from a source checkout only. The
-> unrelated PyPI project `memoire` is a different package; do not install it expecting
-> this one.
+> **Status: `0.1.0` (alpha) — published on [PyPI (`memoire-engine` / `memoire-mcp`)](https://pypi.org/project/memoire-mcp/), [crates.io (`memoire-engine`)](https://crates.io/crates/memoire-engine), and the [Official MCP Registry](https://registry.modelcontextprotocol.io/).**
+> Prebuilt Python wheels cover Linux `x86_64` (`manylinux_2_28`), macOS `arm64`, and
+> Windows `x86_64` only. The unrelated PyPI project `memoire` is a different package; do not
+> install it expecting this one.
 >
 > The central idea (trust that rises or falls with task outcomes) is **not yet
 > empirically validated**. A pre-registered held-out run (Step 8d) did not show an
@@ -77,9 +76,9 @@ tests only.
 
 | Component | Path | v0.1 status |
 |---|---|---|
-| Rust core (`memoire-engine`, lib name `memoire`) | `src/` | **Supported** (not published) |
-| Python SDK (`memoire-engine`, `import memoire_engine`) | `bindings/python/` | **Supported** (not published) |
-| MCP server (`memoire-mcp`, `python -m memoire_mcp`) | `mcp-server/` | **Supported** (not published) |
+| Rust core (`memoire-engine`, lib name `memoire`) | `src/` | **Supported** (`crates.io` `0.1.0`) |
+| Python SDK (`memoire-engine`, `import memoire_engine`) | `bindings/python/` | **Supported** (PyPI `0.1.0`: Linux `x86_64`, macOS `arm64`, Windows `x86_64`) |
+| MCP server (`memoire-mcp`, `python -m memoire_mcp`) | `mcp-server/` | **Supported** (PyPI `0.1.0` & Official MCP Registry) |
 | CLI (`memoire-cli`) | `src/bin/cli.rs` | Secondary: tested, built from source |
 | C FFI (`libmemoire`, `include/memoire.h`) | `src/ffi.rs` | Secondary: header/ABI parity is tested; the Node and Go wrappers on top of it are not maintained. See [docs/FFI_GUIDE.md](docs/FFI_GUIDE.md) |
 | HTTP server (`memoire-server`) | `src/bin/memoire_server.rs` | **Experimental, local-only** (loopback bind, no option to change it) |
@@ -87,6 +86,24 @@ tests only.
 | Node.js binding | `bindings/node/` | **Unmaintained / postponed** |
 | Go binding | `bindings/go/` | **Unmaintained / postponed** |
 | WASM | `--features wasm` | Only the pure-Rust `quality` module and chunker build; no store or embedder; `quality::now_ts()` uses `SystemTime::now()` and is expected to panic at runtime on `wasm32-unknown-unknown`. **Postponed.** |
+
+## Install
+
+```bash
+# MCP server (Python >= 3.10)
+uvx memoire-mcp
+# or: pip install memoire-mcp
+
+# Python SDK
+pip install memoire-engine    # import memoire_engine
+
+# Rust library (library module name in Rust is `memoire`)
+cargo add memoire-engine
+```
+
+Prebuilt PyPI wheels exist only for Linux `x86_64` (`manylinux_2_28`), macOS `arm64`, and
+Windows `x86_64` (there is no `memoire-engine` sdist on PyPI). Other platforms must build from
+source below.
 
 ## Build and Install (from source)
 
@@ -497,13 +514,14 @@ condition), one seed, conflicting lessons plus one deliberately wrong "poison" l
    constants. They are configurable, not validated or calibrated.
 4. **Not offline on cold start** (model download), and the default cache directory is
    relative to the working directory (see [Model cache](#model-cache-and-offline-use)).
-5. **Not published.** No registry package exists yet. `release.yml` is set up to build wheels
-   for Linux x86_64 (`manylinux_2_28`), macOS arm64 and Windows x86_64, but that pipeline has
-   not been run to completion; `manylinux` compatibility of the statically linked ONNX Runtime
-   is unverified. macOS x86_64, Linux aarch64 and musl have no wheel and no tested build path.
-   `THIRD_PARTY_NOTICES.md` inventories every locked Rust crate and names the non-crate
-   components, but does not reproduce license texts; ONNX Runtime's own third-party notices
-   are referenced, not bundled.
+5. **Limited wheel platforms & `0.1.0` metadata lag.** `0.1.0` wheels are built and
+   smoke-tested for Linux `x86_64` (`manylinux_2_28`), macOS `arm64`, and Windows `x86_64`
+   only. There is no PyPI sdist for `memoire-engine`, so macOS `x86_64`, Linux `aarch64`, and
+   musl have no wheel and must build from source (see [docs/RELEASE.md](docs/RELEASE.md)).
+   The `v0.1.0` PyPI wheels (`e69154d`) shipped the earlier draft notices and `~23 MB` text;
+   `main` and the `crates.io` `0.1.0` crate carry the full 381-crate `THIRD_PARTY_NOTICES.md`
+   inventory (summaries only, without full upstream license texts; ONNX Runtime notices are
+   linked, not bundled).
 6. **Python wrapper gap** (`recall_reranked`) and per-query `Memoire` construction in
    `memoire_engine.adapters` (reloads the embedder on each retrieval).
 7. Other known debt: `resolve_contradictions_for_id` skips new memories whose polarity is
@@ -550,8 +568,8 @@ This describes the workflow file, not a pass status; check the Actions tab for t
 
 CI does **not** run any benchmark or LLM evaluation. The release workflow
 (`.github/workflows/release.yml`) additionally builds wheels and smoke-tests them in clean
-virtualenvs; see [docs/RELEASE.md](docs/RELEASE.md). Treat that pipeline as unproven until a
-manual dispatch has completed on all three platforms.
+virtualenvs on Linux `x86_64`, macOS `arm64`, and Windows `x86_64`; see
+[docs/RELEASE.md](docs/RELEASE.md).
 
 ## More Detail
 
