@@ -5,13 +5,16 @@
          [--require THIRD_PARTY_NOTICES.md] [--metadata-contains "mcp-name: ..."]
 
 Globs are expanded here so the same command works in PowerShell. Fails when a size limit is
-exceeded, a --require name is absent from the archive, METADATA lacks a required string, or a
-generic top-level module (server, memoire, tests, ...) would be installed.
+exceeded, a --require name is absent from the archive, METADATA lacks a required string, a
+generic top-level module (server, memoire, tests, ...) would be installed, or a shared library
+bundled into the wheel (<pkg>.libs/) is not named in the wheel's own THIRD_PARTY_NOTICES.md.
 """
 from __future__ import annotations
 
 import argparse
 import glob
+import os
+import re
 import sys
 import zipfile
 from pathlib import PurePosixPath
@@ -34,7 +37,7 @@ def main() -> int:
         return 1
     bad = False
     for path in paths:
-        size_mb = __import__("os").path.getsize(path) / 1e6
+        size_mb = os.path.getsize(path) / 1e6
         print(f"\n== {path}  ({size_mb:.1f} MB)")
         if size_mb > args.max_mb:
             print(f"FAIL: larger than {args.max_mb} MB")
@@ -45,9 +48,26 @@ def main() -> int:
             for n in names:
                 if n.endswith(NATIVE):
                     print(f"  native: {n}  ({z.getinfo(n).file_size / 1e6:.1f} MB)")
-            libs = [t for t in tops if t.endswith(".libs")]
-            for t in libs:
-                print(f"  WARNING: bundled shared libraries in {t}/: list them in THIRD_PARTY_NOTICES.md")
+            # Libraries copied in by auditwheel / delocate / delvewheel (<pkg>.libs/, .dylibs/).
+            # Each must be named in the wheel's own THIRD_PARTY_NOTICES.md.
+            bundled = sorted(
+                n for n in names
+                if not n.endswith("/")
+                and any(part.endswith((".libs", ".dylibs")) for part in PurePosixPath(n).parts[:-1])
+            )
+            if bundled:
+                notice = next((n for n in names if PurePosixPath(n).name == "THIRD_PARTY_NOTICES.md"), None)
+                notice_text = z.read(notice).decode("utf-8", "replace") if notice else ""
+                for n in bundled:
+                    fname = PurePosixPath(n).name
+                    m = re.match(r"^(.+?)(?:-[0-9a-f]{8})?\.(?:so|dylib|dll)", fname)
+                    stem = m.group(1) if m else fname
+                    if stem in notice_text:
+                        print(f"  bundled lib: {n}  ({z.getinfo(n).file_size / 1e6:.1f} MB), named in notices")
+                    else:
+                        print(f"FAIL: bundled library {n} is not named in the wheel's "
+                              f"THIRD_PARTY_NOTICES.md (looked for {stem!r})")
+                        bad = True
             clash = tops & FORBIDDEN_TOP
             if clash:
                 print(f"FAIL: generic top-level package(s) would be installed: {sorted(clash)}")

@@ -23,6 +23,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MCP_NAME = "io.github.tazwaryayyyy/memoire-mcp"
+NOTICES_BEGIN = "<!-- BEGIN GENERATED INVENTORY"
+NOTICES_END = "<!-- END GENERATED INVENTORY -->"
 
 errors: list[str] = []
 
@@ -107,6 +109,29 @@ def main() -> int:
             fail(f"missing {a if not pa.is_file() else b}")
         elif pa.read_bytes().replace(b"\r\n", b"\n") != pb.read_bytes().replace(b"\r\n", b"\n"):
             fail(f"{b} differs from {a} (copy it again)")
+
+    # The third-party inventory must list exactly the registry packages locked in Cargo.lock.
+    lock_path, notices = ROOT / "Cargo.lock", ROOT / "THIRD_PARTY_NOTICES.md"
+    if not lock_path.is_file():
+        fail("Cargo.lock is missing")
+    elif notices.is_file():
+        ntext = notices.read_text(encoding="utf-8").replace("\r\n", "\n")
+        i, j = ntext.find(NOTICES_BEGIN), ntext.find(NOTICES_END)
+        if i < 0 or j < i:
+            fail("THIRD_PARTY_NOTICES.md lacks the generated-inventory markers")
+        else:
+            listed = set(re.findall(r"^- `([^`\s]+) ([^`\s]+)`$", ntext[i:j], re.M))
+            locked = {(p["name"], p["version"])
+                      for p in tomllib.loads(lock_path.read_text(encoding="utf-8"))["package"]
+                      if "source" in p}
+            for label, diff in (("in Cargo.lock but not in THIRD_PARTY_NOTICES.md", locked - listed),
+                                ("in THIRD_PARTY_NOTICES.md but not in Cargo.lock", listed - locked)):
+                if diff:
+                    shown = ", ".join(f"{n} {v}" for n, v in sorted(diff)[:8])
+                    fail(f"{len(diff)} package(s) {label}: {shown}"
+                         f"{' ...' if len(diff) > 8 else ''} "
+                         "(run: python scripts/generate_third_party_notices.py)")
+            print(f"notices inventory: {len(listed)} packages, Cargo.lock: {len(locked)}")
 
     if args.tag is not None and args.tag != f"v{version}":
         fail(f"tag {args.tag!r} != 'v{version}'")

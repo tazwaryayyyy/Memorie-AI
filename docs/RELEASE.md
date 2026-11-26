@@ -51,19 +51,29 @@ workflow" on the release branch. It builds and smoke-tests everything and create
 On a `v*` tag, `.github/workflows/release.yml`:
 
 1. fails unless the tag equals `v` + the version in `Cargo.toml` and both `pyproject.toml` files
-   (`scripts/check_release_metadata.py`, which also checks `mcp-server/server.json`);
+   (`scripts/check_release_metadata.py`, which also checks `mcp-server/server.json` and that the
+   `THIRD_PARTY_NOTICES.md` inventory matches `Cargo.lock`);
 2. builds native-library zips (Linux, macOS, Windows), `memoire-engine` wheels (Linux x86_64
    `manylinux_2_28`, macOS arm64, Windows x86_64; abi3, so one wheel per platform covers Python
    >= 3.10) and the `memoire-mcp` sdist and wheel;
 3. inspects the wheels (`scripts/inspect_wheel.py`: size under 90 MB, `LICENSE` and
-   `THIRD_PARTY_NOTICES.md` present, no generic top-level modules, registry marker in the
-   `memoire-mcp` metadata);
+   `THIRD_PARTY_NOTICES.md` present, no generic top-level modules, every library bundled by
+   `auditwheel` named in the wheel's own notices, registry marker in the `memoire-mcp`
+   metadata);
 4. installs the built wheels into fresh virtualenvs on all three platforms, with only
    `scripts/` checked out, and runs `scripts/smoke_installed.py` (real embedding, recall,
    MCP health);
 5. creates a **draft** GitHub Release with the artifacts and `SHA256SUMS.txt`.
 
 It publishes nothing to PyPI, crates.io or the MCP Registry.
+
+After any `Cargo.lock` change, regenerate the third-party inventory (needs `cargo`; it uses
+`--all-features` so the optional `pyo3` dependencies are included) and commit both copies:
+
+```bash
+python scripts/generate_third_party_notices.py          # rewrite
+python scripts/generate_third_party_notices.py --check  # exit 1 if stale (also verifies licenses)
+```
 
 ## Publishing (manual, only with the owner's explicit go-ahead)
 
@@ -100,7 +110,7 @@ python -c "import importlib.util as u; assert u.find_spec('server') is None and 
 
 ## Model Download And Offline Use
 
-The first real `remember()` or `recall()` call initializes FastEmbed and may download `all-MiniLM-L6-v2` (about 23 MB) into the model cache: `$HF_HOME` if set, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache` relative to the working directory. Set `FASTEMBED_CACHE_DIR` to share one cache. `memoire_health` only checks that the native extension imports; it does not download the model.
+The first real `remember()` or `recall()` call initializes FastEmbed and may download `all-MiniLM-L6-v2` (about 87 MiB: a 86.2 MiB `model.onnx` plus tokenizer and config files) into the model cache: `$HF_HOME` if set, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache` relative to the working directory. Set `FASTEMBED_CACHE_DIR` to share one cache. `memoire_health` only checks that the native extension imports; it does not download the model.
 
 For offline machines:
 

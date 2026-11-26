@@ -33,7 +33,7 @@ project `memoire` must never be installed in its place.
 If the server reports `native_library_unavailable`, run `maturin develop --release`
 inside `bindings/python` in the same virtualenv that runs the server.
 
-First use downloads the embedding model (about 23 MB, from Hugging Face) unless it
+First use downloads the embedding model (about 87 MiB, from Hugging Face) unless it
 is already cached.
 
 ## MCP client configuration
@@ -44,7 +44,7 @@ placeholders; on Windows use `...\.venv\Scripts\memoire-mcp.exe` and a path such
 `C:\Users\you\.memoire\memoire.db`.
 
 Set `FASTEMBED_CACHE_DIR` to **one shared directory** in every client. Without it (and without
-`HF_HOME`), the embedding model (about 23 MB) is downloaded into `./.fastembed_cache` relative to
+`HF_HOME`), the embedding model (about 87 MiB) is downloaded into `./.fastembed_cache` relative to
 the server's working directory, i.e. once per project. The first tool call that needs the
 embedder downloads the model and can exceed a client's tool timeout; make one throwaway tool
 call right after setup to warm the cache before relying on it.

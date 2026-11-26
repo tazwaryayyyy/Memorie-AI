@@ -27,7 +27,7 @@
         },
         {
           "name": "FASTEMBED_CACHE_DIR",
-          "description": "Directory for the embedding model (about 23 MB, downloaded on first use). Set one shared directory to avoid a download per working directory.",
+          "description": "Directory for the embedding model (about 87 MiB, downloaded on first use). Set one shared directory to avoid a download per working directory.",
           "isRequired": false,
           "isSecret": false,
           "format": "filepath"

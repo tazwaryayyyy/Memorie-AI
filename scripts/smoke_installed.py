@@ -4,7 +4,7 @@
 Run it inside a fresh virtualenv, from a directory that is NOT the repository checkout:
     python smoke_installed.py
 It exercises the native extension (statically linked ONNX Runtime) with a real embedding, so the
-first run downloads the ~23 MB model unless FASTEMBED_CACHE_DIR / HF_HOME already holds it.
+first run downloads the ~87 MiB model unless FASTEMBED_CACHE_DIR / HF_HOME already holds it.
 """
 from __future__ import annotations
 

@@ -149,7 +149,7 @@ import os, pathlib; \
 hf = pathlib.Path(os.environ.get('HF_HOME', pathlib.Path.home() / '.cache' / 'huggingface')); \
 models = list(hf.glob('hub/models--*MiniLM*')); \
 print('Model cache:', hf / 'hub'); \
-print('Found:', models[0].name if models else 'NOT CACHED — will download on first run (~23 MB)'); \
+print('Found:', models[0].name if models else 'NOT CACHED — will download on first run (~87 MiB)'); \
 "
 
 # ─── Install helpers ─────────────────────────────────────────────────────────

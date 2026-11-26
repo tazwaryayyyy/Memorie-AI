@@ -17,7 +17,7 @@ extern "C"
      * Open or create a Memoire database at `db_path` in the default namespace.
      * Pass ":memory:" for a non-persistent in-memory store.
      *
-     * First call downloads all-MiniLM-L6-v2 (~23 MB) if not cached.
+     * First call downloads all-MiniLM-L6-v2 (~87 MiB) if not cached.
      *
      * Returns: opaque handle (free with memoire_free), or NULL on error.
      */
