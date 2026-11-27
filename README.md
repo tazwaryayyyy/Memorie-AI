@@ -3,7 +3,7 @@
 > Local-first semantic memory engine and MCP server for AI coding agents.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Build](https://github.com/tazwaryayyyy/Memorie-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/tazwaryayyyy/Memorie-AI/actions)
+[![Build](https://github.com/tazwaryayyyy/memoire-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/tazwaryayyyy/memoire-ai/actions)
 
 > **Status: `0.1.0` (alpha) — published on [PyPI (`memoire-engine` / `memoire-mcp`)](https://pypi.org/project/memoire-mcp/), [crates.io (`memoire-engine`)](https://crates.io/crates/memoire-engine), and the [Official MCP Registry](https://registry.modelcontextprotocol.io/).**
 > Prebuilt Python wheels cover Linux `x86_64` (`manylinux_2_28`), macOS `arm64`, and
@@ -114,8 +114,8 @@ prebuilt ONNX Runtime (see [docs/RELEASE.md](docs/RELEASE.md)), so the **build**
 network access unless `ORT_LIB_LOCATION` is set.
 
 ```bash
-git clone https://github.com/tazwaryayyyy/Memorie-AI
-cd Memorie-AI
+git clone https://github.com/tazwaryayyyy/memoire-ai
+cd memoire-ai
 cargo build --release
 ```
 

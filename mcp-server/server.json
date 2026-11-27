@@ -4,7 +4,7 @@
   "title": "Memoire",
   "description": "Local-first semantic memory for coding agents: SQLite + local embeddings, no hosted service.",
   "repository": {
-    "url": "https://github.com/tazwaryayyyy/Memorie-AI",
+    "url": "https://github.com/tazwaryayyyy/memoire-ai",
     "source": "github",
     "subfolder": "mcp-server"
   },

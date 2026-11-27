@@ -94,8 +94,8 @@ there too.
 ## Technical User Install
 
 ```bash
-git clone https://github.com/tazwaryayyyy/Memorie-AI
-cd Memorie-AI
+git clone https://github.com/tazwaryayyyy/memoire-ai
+cd memoire-ai
 python -m venv .venv
 . .venv/bin/activate                  # Windows: .venv\Scripts\activate
 python -m pip install maturin

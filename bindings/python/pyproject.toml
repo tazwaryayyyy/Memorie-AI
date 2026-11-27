@@ -31,10 +31,10 @@ langchain = ["langchain-core>=0.3"]
 llama-index = ["llama-index-core>=0.10"]
 
 [project.urls]
-Homepage = "https://github.com/tazwaryayyyy/Memorie-AI"
-Repository = "https://github.com/tazwaryayyyy/Memorie-AI"
-Issues = "https://github.com/tazwaryayyyy/Memorie-AI/issues"
-Changelog = "https://github.com/tazwaryayyyy/Memorie-AI/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/tazwaryayyyy/memoire-ai"
+Repository = "https://github.com/tazwaryayyyy/memoire-ai"
+Issues = "https://github.com/tazwaryayyyy/memoire-ai/issues"
+Changelog = "https://github.com/tazwaryayyyy/memoire-ai/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 features = ["pyo3"]
