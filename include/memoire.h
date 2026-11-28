@@ -102,7 +102,12 @@ extern "C"
      *
      * `ids`:              pointer to an array of int64_t memory ids.
      * `ids_len`:          number of elements in `ids`.
-     * `failure_severity`: [0.0, 1.0] — 1.0 = direct failure, 0.5 = partial miss.
+     * `failure_severity`: a gate, not a weight. Any finite value > 0 records exactly
+     *                     one failure per memory; <= 0, NaN or infinity records none.
+     *                     Fractional scaling (for example 0.5 = partial miss) is not
+     *                     supported in 0.1.x: 0.5 counts the same as 1.0.
+     *
+     * Repeated ids within one call count once.
      *
      * Returns: heap-allocated null-terminated JSON string of PenaltyOutcome objects,
      *          or NULL on error.

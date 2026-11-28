@@ -40,6 +40,7 @@ class FakeMemoire:
         self.remembered = []
         self.reinforced = []
         self.penalized = []
+        self.penalize_kwargs = []
         self.forgotten = []
         self.resolved = []
         self.cleared = False
@@ -69,8 +70,12 @@ class FakeMemoire:
         self.reinforced.append((memory_id, agent_output, task_succeeded, session_id))
         return task_succeeded
 
-    def penalize_if_used(self, memory_ids, failure_severity: float = 1.0):
+    def penalize_if_used(self, memory_ids, failure_severity: float = 1.0, **kwargs):
+        # The engine accepts exactly one optional keyword: `event_id`.
+        if set(kwargs) - {"event_id"}:
+            raise TypeError(f"unexpected keyword arguments: {sorted(kwargs)}")
         self.penalized.append((list(memory_ids), failure_severity))
+        self.penalize_kwargs.append(dict(kwargs))
         return [{"id": memory_id, "trust_before": 0.5, "trust_after": 0.3} for memory_id in memory_ids]
 
     def resolve_contradictions(self, memory_id: int) -> bool:
@@ -317,6 +322,114 @@ def test_penalize_rejects_non_finite_or_out_of_range_severity(severity):
     assert response["ok"] is False
     assert response["error"]["code"] == "invalid_argument"
     assert FakeMemoire.instances == []
+
+
+def test_penalize_passes_event_id_only_when_one_is_given():
+    server.memoire_penalize([1], 1.0, SimpleNamespace())
+    server.memoire_penalize([1], 1.0, SimpleNamespace(), event_id="run-7:attempt-1")
+
+    assert FakeMemoire.instances[0].penalize_kwargs == [
+        {}, {"event_id": "run-7:attempt-1"}]
+    # The per-process reinforcement session id must never leak into penalties.
+    assert server.SESSION_ID not in str(FakeMemoire.instances[0].penalize_kwargs)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_penalize_treats_blank_event_id_as_absent(blank):
+    response = server.memoire_penalize([1], 1.0, SimpleNamespace(), event_id=blank)
+
+    assert response["ok"] is True
+    assert FakeMemoire.instances[0].penalize_kwargs == [{}]
+
+
+def test_penalize_strips_event_id_and_rejects_an_overlong_one():
+    server.memoire_penalize([1], 1.0, SimpleNamespace(), event_id="  run-7  ")
+    assert FakeMemoire.instances[0].penalize_kwargs == [{"event_id": "run-7"}]
+
+    FakeMemoire.instances.clear()
+    response = server.memoire_penalize(
+        [1], 1.0, SimpleNamespace(), event_id="x" * (server.MAX_EVENT_ID_LENGTH + 1))
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_argument"
+    assert FakeMemoire.instances == []
+
+
+def test_clean_event_id_normalises_absent_blank_and_padded_keys():
+    assert server.clean_event_id(None) is None
+    assert server.clean_event_id("  ") is None
+    assert server.clean_event_id(" a-b ") == "a-b"
+    assert server.clean_event_id("x" * server.MAX_EVENT_ID_LENGTH) == "x" * server.MAX_EVENT_ID_LENGTH
+    with pytest.raises(ValueError):
+        server.clean_event_id("x" * (server.MAX_EVENT_ID_LENGTH + 1))
+
+
+def test_penalize_collapses_repeated_ids_before_calling_the_engine():
+    response = server.memoire_penalize([1, 1, 2, 1], 1.0, SimpleNamespace())
+
+    assert response["ok"] is True
+    assert FakeMemoire.instances[0].penalized == [([1, 2], 1.0)]
+    assert [o["id"] for o in response["outcomes"]] == [1, 2]
+
+
+def test_batch_feedback_failure_dedupes_ids_and_forwards_event_id():
+    response = server.memoire_batch_feedback(
+        [1, 1, 2], task_succeeded=False, task_output="",
+        ctx=SimpleNamespace(), event_id="task-42")
+
+    assert response["ok"] is True
+    assert response["penalized"] == 2
+    assert response["requested"] == 2
+    assert FakeMemoire.instances[0].penalized == [([1, 2], 1.0)]
+    assert FakeMemoire.instances[0].penalize_kwargs == [{"event_id": "task-42"}]
+
+
+def test_batch_feedback_failure_without_event_id_sends_no_keyword():
+    server.memoire_batch_feedback(
+        [1], task_succeeded=False, task_output="", ctx=SimpleNamespace())
+
+    assert FakeMemoire.instances[0].penalize_kwargs == [{}]
+
+
+def test_batch_feedback_success_dedupes_ids_and_ignores_event_id():
+    response = server.memoire_batch_feedback(
+        [1, 2, 1], task_succeeded=True, task_output="validated inputs",
+        ctx=SimpleNamespace(), event_id="task-42")
+
+    assert response["ok"] is True
+    assert response["reinforced"] == 2
+    assert response["requested"] == 2
+    assert FakeMemoire.instances[0].reinforced == [
+        (1, "validated inputs", True, server.SESSION_ID),
+        (2, "validated inputs", True, server.SESSION_ID),
+    ]
+    assert FakeMemoire.instances[0].penalized == []
+
+
+def test_batch_feedback_rejects_an_overlong_event_id():
+    response = server.memoire_batch_feedback(
+        [1], task_succeeded=False, task_output="", ctx=SimpleNamespace(),
+        event_id="x" * (server.MAX_EVENT_ID_LENGTH + 1))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_argument"
+    assert FakeMemoire.instances == []
+
+
+def test_penalize_still_works_against_an_engine_without_event_id(monkeypatch):
+    # An engine build that predates `event_id` has no such keyword: omitting it must
+    # keep working, and asking for it must fail loudly rather than be dropped silently.
+    def legacy(self, memory_ids, failure_severity=1.0):
+        self.penalized.append((list(memory_ids), failure_severity))
+        return [{"id": i, "trust_before": 0.5, "trust_after": 0.3} for i in memory_ids]
+
+    monkeypatch.setattr(FakeMemoire, "penalize_if_used", legacy)
+
+    ok = server.memoire_penalize([1], 1.0, SimpleNamespace())
+    assert ok["ok"] is True
+
+    refused = server.memoire_penalize([1], 1.0, SimpleNamespace(), event_id="e1")
+    assert refused["ok"] is False
+    assert refused["error"]["code"] == "penalize_failed"
 
 
 def test_export_uses_standard_envelope_and_round_trips_into_import(monkeypatch):

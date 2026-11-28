@@ -163,7 +163,14 @@ freshly remembered one. At most 1000 memories per call. `memoire_forget` is not 
   included, trial cap skipped). Each memory has an `exposure` label.
 - `MEMOIRE_TRIAL_CAP` overrides the engine's `trial_cap` (default `1`: with no feedback a
   recall returns at most one result). Non-integer or negative values stop the server.
-- Feedback tools send one session id per server process (`memoire_status` shows it).
+- Reinforcement sends one session id per server process (`memoire_status` shows it), so a
+  memory can be reinforced at most once per server process.
+- Penalties are not tied to that session id. `memoire_penalize` and `memoire_batch_feedback`
+  take an optional `event_id` (at most 256 characters): pass one id per failed outcome and a
+  retry of that outcome is not counted twice. Without it every call counts, so a single
+  session can still quarantine a memory. `failure_severity` is a gate: any value above 0 is
+  one failure (fractional scaling is not supported in `0.1.x`). Repeated ids in one call
+  count once.
 - `memoire_identify_gaps` `min_trust` defaults to the engine HINT threshold (0.40).
 - `memoire_export` returns `{"ok": true, "error": null, "snapshot": {...}}`; pass the
   `snapshot` value to `memoire_import`.

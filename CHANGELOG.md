@@ -18,6 +18,48 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ---
 
 ## [Unreleased]
+### Fixed / Changed (Step 10, Batch 2: exposure vs decay, feedback idempotency)
+Behaviour changes relative to the published `0.1.0` (no version number is bumped here):
+- **`exposure` follows decayed trust.** The `follow` label was derived from the raw counts
+  (`3s >= 8 + 7f`) while `trust` and ranking used the time-decayed value, so a memory could be
+  labelled `follow` next to a `trust` below 0.70 (about 7 days after the last feedback for
+  `s = 3, f = 0`; 0.579 at 100 days) and `MemoryPolicy` disagreed with the label. `follow` now
+  means `trust + 1e-6 >= 0.70` on the returned trust, the same test `MemoryPolicy` applies.
+  Label strings are unchanged. `state` still reads the raw counts, so a decayed memory can be
+  `active` with `exposure = "hint"`. With no decay (`decay_rate = 0`, or no elapsed time) the
+  label equals the previous rule (checked exhaustively for `0 <= s, f < 60`). The frozen Step 8d evaluation is unaffected
+  (`eval/prompt.py` treats `hint` and `follow` identically and words its tag from `trust`).
+- **Reinforcement is durably one vote per memory per session id.** The guard compared only
+  the memory's *last* reinforcing session, so `s1, s2, s1` counted three votes; it now counts
+  two. `session_id = None` (or blank / whitespace-only, which is now treated as absent instead of
+  as a literal key) is still never deduplicated.
+- **`penalize_if_used`: repeated ids in one call count once** (`[id, id]` used to add two
+  failures). NaN and infinite `failure_severity` now record nothing, like `0`; NaN and `+inf`
+  used to count a failure.
+- **`failure_severity` documentation corrected.** It was documented as scaling how harshly a
+  memory is penalized (`0.5` = partial miss); the engine has always treated it as a gate (any
+  value `> 0` is exactly one failure). The docs in `src/lib.rs`, `src/ffi.rs`,
+  `include/memoire.h`, the Python client and the MCP tool now say so; fractional scaling is not
+  supported in `0.1.x`. Doc comments only: the C ABI and the header's declarations are unchanged.
+- **New optional `event_id` for penalties** (Rust `penalize_if_used_with_event`, Python
+  `penalize_if_used(..., event_id=None)`, MCP `memoire_penalize` / `memoire_batch_feedback`):
+  a non-blank `event_id` is counted at most once per memory. Absent or blank means no
+  cross-call deduplication, so one MCP session can still reach two failures and quarantine. It
+  is deliberately not named `session_id`, and the MCP never passes its per-process session id
+  as one. The C FFI and HTTP server are unchanged and have no `event_id`.
+- **Schema `user_version` 4** (`migrations/v4.sql`): new `feedback_events` table
+  (`UNIQUE (namespace, memory_id, kind, event_key)`, `ON DELETE CASCADE`). A v3 database is
+  migrated on open, and each memory's last reinforcing session is back-filled so the old guard
+  survives. Older vote history was never stored. A `0.1.0` binary opening a v4 database ignores
+  the table (it only checks `user_version < 3`), so it still works but does not record or honour
+  events.
+- MCP: `memoire_batch_feedback` and `memoire_penalize` drop repeated ids before calling the
+  engine, and a failed batch now also reports `requested`; `requested` counts unique ids.
+- Known, not changed: MCP reinforcement still uses one session id per server process, so a
+  memory can be reinforced at most once per process.
+- Not changed: version numbers (`0.1.0`), `pyo3` (`0.21.2`), `Cargo.lock`, MCP tool names, the
+  C ABI, and the frozen `eval/` files and reports.
+
 ### Changed (Step 10, Batch 1: post-`0.1.0` doc reconciliation and dependency floors)
 - Docs: removed claims that nothing is published or that the package names are unregistered from
   `README.md`, `docs/RELEASE.md`, `SECURITY.md`, `mcp-server/README.md`, `bindings/python/README.md`

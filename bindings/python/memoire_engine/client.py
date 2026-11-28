@@ -288,8 +288,10 @@ class Memoire:
         Reinforce a memory the agent *declared* it used, with no text-overlap gate.
 
         The caller asserts both the declaration and the task success. Returns False
-        for an unknown or quarantined id, or when ``session_id`` equals the memory's
-        last reinforcing session (one vote per memory per session).
+        for an unknown or quarantined id, or when this ``session_id`` has already
+        reinforced the memory (one vote per memory per session, even when other
+        sessions voted in between). ``None`` or a blank ``session_id`` is never
+        deduplicated.
         """
         self._check_open()
         try:
@@ -336,15 +338,28 @@ class Memoire:
         self,
         memory_ids: List[int],
         failure_severity: float = 1.0,
+        event_id: Optional[str] = None,
     ) -> List[dict]:
         """
         Penalize memories that contributed to a failed task outcome.
+
+        ``failure_severity`` is a gate, not a weight: any finite value ``> 0``
+        records exactly one failure per memory (``0.5`` counts the same as ``1.0``);
+        ``<= 0``, NaN or infinity records nothing. Fractional scaling is not
+        supported in 0.1.x. Repeated ids in ``memory_ids`` count once.
+
+        ``event_id`` makes the call idempotent: a given non-blank ``event_id``
+        penalizes a memory at most once, so a retry or duplicate delivery of the
+        same outcome is safe (already-penalized ids are omitted from the result).
+        With ``None`` (the default) or a blank string each call counts. Use one id
+        per failed outcome; never reuse a per-process or per-conversation id, or a
+        memory could never accumulate a second failure.
         """
         self._check_open()
         if not memory_ids:
             return []
         try:
-            res_str = self._impl.penalize_if_used(memory_ids, failure_severity)
+            res_str = self._impl.penalize_if_used(memory_ids, failure_severity, event_id)
             return json.loads(res_str)
         except Exception as e:
             raise MemoireError(f"penalize_if_used() failed: {e}") from e

@@ -213,8 +213,9 @@ ONNX file path yourself via `with_nli_model`).
 
 Each recalled `Memory` carries `score`, `trust`, `uncertainty`, `state` and `exposure`.
 States: `trial` and `active` are live; `shadow`, `probationary` and `quarantined` are
-hidden from default recall. `exposure` is `follow` (trust >= 0.70), `hint`, `trial`
-(no feedback yet), `hidden`, or `plain` (`recall_plain`).
+hidden from default recall. `exposure` is `follow` (the returned, time-decayed `trust` is
+>= 0.70, the same test `MemoryPolicy` applies), `hint`, `trial` (no feedback yet), `hidden`,
+or `plain` (`recall_plain`).
 
 - `score` (ranking) = `0.75 * cosine + 0.20 * trust + 0.05 * recency_bonus`.
 - `trust` is a Beta posterior over attributed feedback: `(2 + s) / (4 + s + f)` with
@@ -228,11 +229,25 @@ hidden from default recall. `exposure` is `follow` (trust >= 0.70), `hint`, `tri
   are excluded from default recall and from export, take no further feedback, and are
   restored by the operator with `unquarantine` (CLI: `memoire-cli unquarantine <ID>`),
   which clears their failure count.
+- `state` and `exposure` can legitimately differ: `state` is derived from the raw counts and
+  never decays, while `exposure` follows the decayed `trust`. Three successes and no failures
+  is `active` / `follow` when fresh, but with no new feedback its trust falls below 0.70 after
+  about 7 days at the default `decay_rate` and the memory is offered as `hint` (still
+  `active`) until it is reinforced again.
 - Feedback: `reinforce_if_used` requires text attribution (the memory's distinctive tokens
   contained in the output at `containment_threshold`, default 0.35, or cosine >= 0.75);
   `reinforce_declared` skips the text gate for callers that know which memories the agent
-  used. Both count one vote per memory per session id. `penalize_if_used` records one
-  failure per id and no longer rewrites `importance_base` or `confidence`.
+  used. Both count one vote per memory per session id, durably: a session that already
+  voted is refused even after other sessions voted in between, and a missing or blank
+  session id is never deduplicated. `penalize_if_used` records one failure per id (repeated
+  ids in one call count once) and no longer rewrites `importance_base` or `confidence`.
+  `failure_severity` is a gate, not a weight: any finite value > 0 is exactly one failure
+  (`0.5` counts the same as `1.0`) and `<= 0`, NaN or infinity records nothing; fractional
+  scaling is not supported in `0.1.x`. An optional `event_id` (Rust
+  `penalize_if_used_with_event`, Python `event_id=`, MCP `memoire_penalize` /
+  `memoire_batch_feedback`) makes a penalty idempotent per (memory, `event_id`): pass one id
+  per failed outcome so a retry does not count twice, and never a per-process or
+  per-conversation id. Without it every call counts.
 
 These constants (the prior strength, the thresholds, `trial_cap`) are hand-chosen defaults,
 not fitted or validated.

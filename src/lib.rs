@@ -593,9 +593,14 @@ impl Memoire {
 
     /// Penalize memories that contributed to a failed task outcome.
     ///
-    /// `failure_severity` âˆˆ [0.0, 1.0] â€” scales how harshly the memories are
-    /// penalized. Use 1.0 for a direct failure, 0.5 for a partial miss.
+    /// `failure_severity` is a gate, not a weight: any finite value `> 0` records
+    /// exactly one failure per memory, and `<= 0` (or NaN / infinite) records nothing.
+    /// Fractional scaling (for example `0.5` for a partial miss) is not supported in
+    /// `0.1.x`; `0.5` counts the same as `1.0`. Repeated ids within one call count once.
     /// Symmetric with `reinforce_if_used`. Returns the trust delta per memory.
+    ///
+    /// Each call counts. To make a retry safe, use
+    /// [`Self::penalize_if_used_with_event`] with a per-outcome `event_id`.
     pub fn penalize_if_used(
         &self,
         memory_ids: &[i64],
@@ -604,9 +609,25 @@ impl Memoire {
         self.store.penalize_if_used(memory_ids, failure_severity)
     }
 
+    /// [`Self::penalize_if_used`] with an optional idempotency key. A non-blank
+    /// `event_id` is counted at most once per memory (a replay of the same event is
+    /// skipped); `None` or a blank `event_id` means no cross-call deduplication. Use one
+    /// key per failed outcome, never a per-process or per-conversation id.
+    pub fn penalize_if_used_with_event(
+        &self,
+        memory_ids: &[i64],
+        failure_severity: f32,
+        event_id: Option<&str>,
+    ) -> Result<Vec<store::PenaltyOutcome>> {
+        self.store
+            .penalize_if_used_with_event(memory_ids, failure_severity, event_id)
+    }
+
     /// Reinforce a memory the agent explicitly declared it used, with no text gate. The
     /// caller asserts both the declaration and the task success. Same namespace,
-    /// quarantine and one-vote-per-session rules as `reinforce_if_used`.
+    /// quarantine and one-vote-per-session rules as `reinforce_if_used`: a given
+    /// non-blank `session_id` counts at most once per memory, even non-consecutively
+    /// (`s1`, `s2`, `s1` counts two votes). `None` or a blank id is never deduplicated.
     pub fn reinforce_declared(&self, memory_id: i64, session_id: Option<&str>) -> Result<bool> {
         let applied = self.store.reinforce_declared(memory_id, session_id)?;
         if applied {
