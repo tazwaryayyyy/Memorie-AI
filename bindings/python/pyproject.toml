@@ -3,7 +3,8 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-# PROVISIONAL distribution name (the import name is `memoire_engine`); see mcp-server/pyproject.toml.
+# Distribution name `memoire-engine` (published on PyPI); the import name is `memoire_engine`
+# because the unrelated PyPI project `memoire` ships its own top-level `memoire` package.
 name = "memoire-engine"
 version = "0.1.0"
 description = "Local-first semantic memory engine for AI coding agents"

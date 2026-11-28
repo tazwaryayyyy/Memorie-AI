@@ -211,9 +211,9 @@ it no longer matches `Cargo.lock`.
 - `pyo3-macros-backend 0.21.2`
 - `quote 1.0.45`
 - `r2d2 0.8.10`
-- `rand 0.10.1`
-- `rand 0.8.5`
-- `rand 0.9.2`
+- `rand 0.10.4`
+- `rand 0.8.8`
+- `rand 0.9.5`
 - `rand_chacha 0.3.1`
 - `rand_chacha 0.9.0`
 - `rand_core 0.10.1`
@@ -341,7 +341,7 @@ it no longer matches `Cargo.lock`.
 - `onig 6.5.1`
 - `onig_sys 69.9.1`
 - `oorandom 11.1.5`
-- `openssl-sys 0.9.112`
+- `openssl-sys 0.9.118`
 - `ordered-float 3.9.2`
 - `plotters 0.3.7`
 - `plotters-backend 0.3.7`
@@ -422,7 +422,7 @@ it no longer matches `Cargo.lock`.
 - `fastembed 5.13.2`
 - `hf-hub 0.4.3`
 - `lzma-rust2 0.15.7`
-- `openssl 0.10.76`
+- `openssl 0.10.82`
 - `safetensors 0.7.0`
 - `spm_precompiled 0.1.4`
 - `sync_wrapper 1.0.2`
@@ -455,7 +455,7 @@ it no longer matches `Cargo.lock`.
 ### ISC (3)
 
 - `hmac-sha256 1.1.14`
-- `rustls-webpki 0.103.11`
+- `rustls-webpki 0.103.17`
 - `untrusted 0.9.0`
 
 ### Apache-2.0 OR BSD-2-Clause OR MIT (2)
@@ -466,7 +466,7 @@ it no longer matches `Cargo.lock`.
 ### Apache-2.0 OR ISC OR MIT (2)
 
 - `hyper-rustls 0.27.7`
-- `rustls 0.23.37`
+- `rustls 0.23.46`
 
 ### Apache-2.0 OR LGPL-2.1-or-later OR MIT (2)
 

@@ -8,8 +8,11 @@ The project has **not** had an external security audit or penetration test, and
 
 ## Supported Versions
 
-No version has been released or published to any registry. Only the current tip of the
-development branch (`main`) receives fixes.
+`0.1.0` (alpha) is published on PyPI (`memoire-engine`, `memoire-mcp`), crates.io
+(`memoire-engine`) and the Official MCP Registry. Only the latest `0.1.x` release and the
+current tip of `main` receive fixes. Published versions are immutable and are not
+backported: a fix ships as a new version, and a fix made on `main` is not in `0.1.0` until
+such a version is released.
 
 ## Reporting a Vulnerability
 
@@ -149,8 +152,11 @@ in-range trust. Use opt-in only for snapshots you exported yourself.
   that directory can substitute model files.
 - Builds download a prebuilt ONNX Runtime (`ort` with `download-binaries`). Third-party
   license and notice obligations for redistributed binaries have not yet been reviewed.
-- Python dependencies for the MCP server are pinned in `mcp-server/uv.lock`
-  (`uv sync --locked`). Nothing is published to PyPI or crates.io yet.
+- Python dependencies for source checkouts of the MCP server are pinned in
+  `mcp-server/uv.lock` (`uv sync --locked`). The published `memoire-mcp` `0.1.0` does not use
+  that lockfile: it declares `mcp[cli]==1.27.1` and its other dependencies resolve at install
+  time. Dependency advisories that affect the published `0.1.0` artifacts can only be
+  addressed by publishing a new version.
 
 ## Hardening Checklist for Users
 

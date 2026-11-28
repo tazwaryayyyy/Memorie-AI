@@ -1,6 +1,9 @@
 # Release Guide
 
-This guide is for technical GitHub releases. It does not assume PyPI or crates.io publishing.
+This guide covers technical GitHub releases and the manual publishing steps for PyPI, crates.io
+and the Official MCP Registry. `0.1.0` is already published (see
+[Published Releases](#published-releases)); registries never accept the same version twice, so any
+fix needs a new version.
 
 ## Release Contract
 
@@ -11,11 +14,36 @@ Memoire ships as two layers:
 
 The Python SDK (`bindings/python`, import name `memoire_engine`) is a PyO3 extension
 built with maturin, so it is compiled per platform; there is no separate native
-library to locate and `MEMOIRE_LIB` / `MEMOIRE_HOME` are not used by it. Until wheels
-are published, users build it from a source checkout with a Rust toolchain.
+library to locate and `MEMOIRE_LIB` / `MEMOIRE_HOME` are not used by it. Prebuilt wheels exist
+only for Linux `x86_64` (`manylinux_2_28`), macOS `arm64` and Windows `x86_64`; there is no
+sdist, so every other platform builds it from a source checkout with a Rust toolchain.
 
 The C library (`libmemoire.so` / `libmemoire.dylib` / `memoire.dll`) is still built
 for the C FFI and attached to GitHub Releases separately.
+
+## Published Releases
+
+`0.1.0` (alpha):
+
+- PyPI `memoire-engine` `0.1.0`: three `cp310-abi3` wheels (`manylinux_2_28_x86_64`,
+  `macosx_11_0_arm64`, `win_amd64`) and no sdist. Import name `memoire_engine`.
+- PyPI `memoire-mcp` `0.1.0`: wheel and sdist; requires `mcp[cli]==1.27.1` and
+  `memoire-engine>=0.1.0,<0.2.0`.
+- crates.io `memoire-engine` `0.1.0` (library name `memoire`).
+- Official MCP Registry `io.github.tazwaryayyyy/memoire-mcp` `0.1.0`.
+- GitHub Release `v0.1.0 (alpha)`, tag `v0.1.0` (commit `e69154d`).
+
+Known, immutable provenance differences in `0.1.0`:
+
+1. The PyPI wheels and the MCP Registry entry come from `e69154d` (earlier draft
+   `THIRD_PARTY_NOTICES.md` and pre-rename README). The crates.io crate was built from `71357c9`
+   and, like `main`, carries the full 381-crate inventory; `glama.json` exists only on `main`.
+2. Published `0.1.0` metadata on PyPI, crates.io and the MCP Registry still links to the old
+   `Memorie-AI` repository name (GitHub redirects it) until a new version is published.
+3. `memoire-server`, `dashboard/`, `bindings/node/`, `bindings/go/` and `wasm` are experimental or
+   unmaintained and are not part of the supported surface.
+
+Never move or delete a published tag, and never reuse a published version number.
 
 ## Tag Release
 
@@ -41,8 +69,8 @@ uv run pytest
 4. Create and push a tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z      # X.Y.Z from step 1; `v0.1.0` already exists and must not be moved
+git push origin vX.Y.Z
 ```
 
 Before tagging, exercise the whole pipeline without a tag: GitHub -> Actions -> Release -> "Run
@@ -86,7 +114,9 @@ Order matters because each later step checks the earlier one:
    already on PyPI.
 4. `memoire-engine` to crates.io (`cargo publish --dry-run --locked` first).
 
-Re-check on PyPI and crates.io that the names are still unregistered immediately before step 1.
+`memoire-engine` and `memoire-mcp` on PyPI, `memoire-engine` on crates.io and the MCP Registry name
+are already registered to this project, so each new release needs a new version in all three
+manifests and in `mcp-server/server.json`.
 Wheel platforms: Linux x86_64, macOS arm64, Windows x86_64 only. There is no sdist for
 `memoire-engine`, so other platforms cannot install it from PyPI; the `memoire-mcp` install fails
 there too.
@@ -100,7 +130,7 @@ python -m venv .venv
 . .venv/bin/activate                  # Windows: .venv\Scripts\activate
 python -m pip install maturin
 python -m pip install ./bindings/python        # builds the PyO3 extension
-python -m pip install "mcp[cli]==1.27.1"
+python -m pip install "mcp[cli]>=1.30.0,<2"
 python -m pip install --no-deps ./mcp-server
 
 python -c "from memoire_engine.client import _get_lib; print(_get_lib())"

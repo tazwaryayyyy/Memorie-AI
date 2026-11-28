@@ -1,11 +1,16 @@
 """
 memoire_engine — Python bindings for the Memoire semantic memory engine.
 
-Install from a source checkout (needs a Rust toolchain), inside a virtualenv:
+Install from PyPI (prebuilt wheels for Linux x86_64, macOS arm64 and Windows
+x86_64 only; there is no sdist):
+    pip install memoire-engine
+
+Other platforms, or development: install from a source checkout (needs a Rust
+toolchain), inside a virtualenv:
     cd bindings/python && maturin develop --release
 
-The PyPI distribution name (provisionally ``memoire-engine``) is not published
-yet. The unrelated PyPI project ``memoire`` is a different package.
+The import name is ``memoire_engine``. The unrelated PyPI project ``memoire`` is
+a different package.
 
 Usage:
     from memoire_engine import Memoire

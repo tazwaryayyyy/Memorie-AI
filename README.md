@@ -157,7 +157,8 @@ with Memoire("agent.db", namespace="billing-agent") as m:
 
 ### Rust
 
-Not on crates.io. Use a path or git dependency; the library target is named `memoire`:
+Published on crates.io as `memoire-engine` (`0.1.0`; `cargo add memoire-engine`). The library
+target is named `memoire`:
 
 ```rust
 use memoire::Memoire;
@@ -521,7 +522,10 @@ condition), one seed, conflicting lessons plus one deliberately wrong "poison" l
    The `v0.1.0` PyPI wheels (`e69154d`) shipped the earlier draft notices and `~23 MB` text;
    `main` and the `crates.io` `0.1.0` crate carry the full 381-crate `THIRD_PARTY_NOTICES.md`
    inventory (summaries only, without full upstream license texts; ONNX Runtime notices are
-   linked, not bundled).
+   linked, not bundled). The published `0.1.0` metadata on PyPI, crates.io and the MCP
+   Registry still links to the old `Memorie-AI` repository name (GitHub redirects it) and cannot
+   change until a new version is published. PyPI `memoire-mcp` `0.1.0` also pins
+   `mcp[cli]==1.27.1` exactly.
 6. **Python wrapper gap** (`recall_reranked`) and per-query `Memoire` construction in
    `memoire_engine.adapters` (reloads the embedder on each retrieval).
 7. Other known debt: `resolve_contradictions_for_id` skips new memories whose polarity is

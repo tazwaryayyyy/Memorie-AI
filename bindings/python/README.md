@@ -3,11 +3,18 @@
 Python bindings for the Memoire semantic memory engine, built as a PyO3
 extension with maturin. Import name: `memoire_engine`.
 
-The PyPI distribution name `memoire-engine` is **not published yet**. The
-unrelated PyPI project `memoire` is a different package; do not install it
-expecting this one.
+`memoire-engine` `0.1.0` is on PyPI as prebuilt `cp310-abi3` wheels for Linux `x86_64`
+(`manylinux_2_28`), macOS `arm64` and Windows `x86_64` (Python 3.10+). There is no sdist. The
+import name is `memoire_engine`; the unrelated PyPI project `memoire` is a different package, so
+do not install it expecting this one.
 
-Install from a source checkout (needs a Rust toolchain), inside a virtualenv:
+```bash
+pip install memoire-engine
+```
+
+On any other platform (for example Intel macOS, Linux `aarch64` or musl), or to develop, build
+from a source checkout (needs a Rust toolchain; targets without a prebuilt ONNX Runtime also need
+`ORT_LIB_LOCATION`, see `docs/RELEASE.md`), inside a virtualenv:
 
 ```bash
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate

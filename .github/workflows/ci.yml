@@ -289,7 +289,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin
           python -m pip install --no-build-isolation ./bindings/python
-          python -m pip install "mcp[cli]==1.27.1"
+          python -m pip install "mcp[cli]>=1.30.0,<2"
           python -m pip install --no-deps ./mcp-server
 
       - name: Verify native discovery, package names and MCP health
