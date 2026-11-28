@@ -6,6 +6,7 @@ access to download the embedding model):
     cd bindings/python && maturin develop --release
     pytest tests/ -v
 """
+import sqlite3
 import struct
 from types import SimpleNamespace
 
@@ -399,6 +400,83 @@ class TestReinforceDeclared:
 
     def test_unknown_id_is_not_reinforced(self, m):
         assert m.reinforce_declared(999_999, session_id="s1") is False
+
+    def test_one_vote_per_session_even_when_other_sessions_voted_between(self, m):
+        (mid,) = m.remember_ids(_LESSONS[2])
+        assert m.reinforce_declared(mid, session_id="s1") is True
+        assert m.reinforce_declared(mid, session_id="s2") is True
+        assert m.reinforce_declared(mid, session_id="s1") is False
+        assert m.reinforce_declared(mid, session_id="s2") is False
+        assert m.recall("retry http backoff", top_k=1)[0].reinforcement_count == 2
+
+    @pytest.mark.parametrize("blank", [None, "", "   "])
+    def test_missing_or_blank_session_is_never_deduplicated(self, m, blank):
+        (mid,) = m.remember_ids(_LESSONS[2])
+        assert m.reinforce_declared(mid, session_id=blank) is True
+        assert m.reinforce_declared(mid, session_id=blank) is True
+
+
+class TestPenalizeIfUsed:
+    def test_repeated_ids_in_one_call_count_once(self, m):
+        (mid,) = m.remember_ids(_LESSONS[2])
+        out = m.penalize_if_used([mid, mid, mid])
+        assert [o["id"] for o in out] == [mid]
+        assert m.penalize_if_used([mid])  # a separate call still counts
+
+    def test_event_id_makes_a_replay_a_no_op(self, m):
+        (mid,) = m.remember_ids(_LESSONS[2])
+        assert len(m.penalize_if_used([mid], event_id="task-1")) == 1
+        assert m.penalize_if_used([mid], event_id="task-1") == []
+        assert len(m.penalize_if_used([mid], event_id="task-2")) == 1
+
+    def test_without_event_id_each_call_counts_and_reaches_quarantine(self, m):
+        # A memory with no successes quarantines at two failures; a per-process
+        # session id must not stand in the way (that is why this is `event_id`).
+        (mid,) = m.remember_ids(_LESSONS[2])
+        m.penalize_if_used([mid])
+        m.penalize_if_used([mid])
+        assert m.recall("retry http backoff", top_k=3) == []
+
+    @pytest.mark.parametrize("severity", [0.0, -1.0, float("nan"), float("inf")])
+    def test_non_positive_or_non_finite_severity_records_nothing(self, m, severity):
+        (mid,) = m.remember_ids(_LESSONS[2])
+        out = m.penalize_if_used([mid], severity)
+        assert len(out) == 1
+        assert out[0]["trust_before"] == out[0]["trust_after"]
+
+    def test_severity_is_a_gate_not_a_weight(self, m):
+        a, b = m.remember_ids(_LESSONS[2]), m.remember_ids(_LESSONS[1])
+        half = m.penalize_if_used(a, 0.5)[0]
+        full = m.penalize_if_used(b, 1.0)[0]
+        assert half["trust_after"] == full["trust_after"]
+
+
+class TestExposureTracksDecayedTrust:
+    def test_exposure_and_memory_policy_agree_after_100_days(self, tmp_path):
+        db = str(tmp_path / "decay.db")
+        with Memoire(db) as mem:
+            (mid,) = mem.remember_ids(_LESSONS[2])
+            for sid in ("s1", "s2", "s3"):
+                assert mem.reinforce_declared(mid, session_id=sid) is True
+            fresh = mem.recall("retry http backoff", top_k=1)[0]
+            assert (fresh.state, fresh.exposure) == ("active", "follow")
+            assert MemoryPolicy().evaluate([fresh])[0].action == "follow"
+
+            # Age the feedback by 100 days: trust 5/7 decays to ~0.579 (< 0.70).
+            con = sqlite3.connect(db)
+            try:
+                con.execute(
+                    "UPDATE memories SET last_accessed_at = strftime('%s','now') - 100 * 86400"
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            aged = mem.recall("retry http backoff", top_k=1)[0]
+            assert aged.trust == pytest.approx(0.5788, abs=1e-3)
+            assert aged.state == "active"  # state reads the raw counts; it does not decay
+            assert aged.exposure == "hint"
+            assert MemoryPolicy().evaluate([aged])[0].action == aged.exposure
 
 
 class TestPolicyThresholdsComeFromRust:

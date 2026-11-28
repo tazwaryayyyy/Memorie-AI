@@ -384,10 +384,20 @@ impl PyMemoire {
         })
     }
 
-    fn penalize_if_used(&self, memory_ids: Vec<i64>, failure_severity: f32) -> PyResult<String> {
+    /// Penalize memories behind a failed outcome. `failure_severity` is a gate: any
+    /// finite value > 0 records one failure, <= 0 / NaN / inf records none. `event_id`
+    /// (optional) makes the call idempotent per (memory, event_id); `None` or blank
+    /// means no cross-call deduplication.
+    #[pyo3(signature = (memory_ids, failure_severity, event_id = None))]
+    fn penalize_if_used(
+        &self,
+        memory_ids: Vec<i64>,
+        failure_severity: f32,
+        event_id: Option<&str>,
+    ) -> PyResult<String> {
         self.with_inner("penalize_if_used", |m| {
             let outcomes = m
-                .penalize_if_used(&memory_ids, failure_severity)
+                .penalize_if_used_with_event(&memory_ids, failure_severity, event_id)
                 .map_err(db_err)?;
             serde_json::to_string(&outcomes).map_err(db_err)
         })

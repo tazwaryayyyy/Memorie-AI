@@ -9,9 +9,9 @@ use std::sync::{Arc, RwLock};
 use crate::error::{MemoireError, Result};
 use crate::quality::{
     compute_gravity_radius, cosine_similarity, decayed_trust, derive_live_state, detect_polarity,
-    effective_weight, is_live_state, meets_follow, now_ts, posterior_trust, recency_bonus,
-    should_supersede, token_containment, trust_uncertainty, ContradictionMode, NliChecker,
-    NliLabel, NliSource, OnnxNliChecker, Polarity, QualityMeta, ScoringConfig,
+    effective_weight, is_live_state, now_ts, posterior_trust, recency_bonus, should_supersede,
+    token_containment, trust_uncertainty, ContradictionMode, NliChecker, NliLabel, NliSource,
+    OnnxNliChecker, Polarity, QualityMeta, ScoringConfig, FOLLOW_THRESHOLD, POLICY_TRUST_EPS,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,10 +31,15 @@ pub struct Memory {
     /// to modulate how strongly they act on a recall result.
     pub uncertainty: f32,
     pub state: String,
-    /// How this memory is being offered: `"follow"` (posterior trust >= 0.70),
-    /// `"hint"` (has feedback evidence, below follow), `"trial"` (no feedback yet:
-    /// unverified), `"hidden"` (shadow / probationary / quarantined, only returned when
-    /// hidden rows are requested) or `"plain"` (returned by `search_plain`).
+    /// How this memory is being offered: `"follow"` (the returned, time-decayed `trust`
+    /// is >= 0.70, the same test the Python `MemoryPolicy` applies), `"hint"` (has
+    /// feedback evidence, trust below follow), `"trial"` (no feedback yet: unverified),
+    /// `"hidden"` (shadow / probationary / quarantined, only returned when hidden rows
+    /// are requested) or `"plain"` (returned by `search_plain`).
+    ///
+    /// Because trust decays toward 0.5 as feedback ages, a memory can drop from
+    /// `"follow"` to `"hint"` with no new feedback while its `state` stays `"active"`
+    /// (`state` is derived from the raw counts and does not decay).
     pub exposure: String,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
@@ -432,16 +437,54 @@ fn memory_trust(successes: i64, failures: i64, feedback_ts: i64, now: i64, decay
 }
 
 /// Offer label for a memory; see `Memory::exposure`.
-fn exposure_label(state: &str, successes: i64, failures: i64) -> &'static str {
+///
+/// `trust` must be the same decayed value that is returned as `Memory::trust` and used
+/// for ranking (see [`memory_trust`]), so the label never contradicts the number shown
+/// beside it. The comparison matches the Python `MemoryPolicy` (`trust + eps >= bar`).
+/// The integer `meets_follow` rule is deliberately not used here: it reads the raw,
+/// undecayed counts and only drives the `active` state.
+fn exposure_label(state: &str, successes: i64, failures: i64, trust: f32) -> &'static str {
     if !is_live_state(state) {
         "hidden"
     } else if successes.saturating_add(failures) <= 0 {
         "trial"
-    } else if meets_follow(successes, failures) {
+    } else if f64::from(trust) + POLICY_TRUST_EPS >= FOLLOW_THRESHOLD {
         "follow"
     } else {
         "hint"
     }
+}
+
+/// `feedback_events.kind` of a recorded reinforcement (key: the `session_id`).
+const FEEDBACK_SUCCESS: &str = "success";
+/// `feedback_events.kind` of a recorded penalty (key: the `event_id`).
+const FEEDBACK_FAILURE: &str = "failure";
+
+/// Normalise a caller-supplied `session_id` / `event_id`: surrounding whitespace is
+/// trimmed and an empty or whitespace-only key counts as absent, so it is never
+/// deduplicated (the same rule as `None`).
+fn normalize_event_key(key: Option<&str>) -> Option<String> {
+    key.map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned)
+}
+
+/// Durably claim `(namespace, memory_id, kind, key)` inside the caller's transaction.
+/// Returns `false` when it was already claimed (a duplicate: the caller must change
+/// nothing). `INSERT OR IGNORE` against the UNIQUE constraint makes this atomic.
+fn claim_feedback_event(
+    tx: &Connection,
+    namespace: &str,
+    memory_id: i64,
+    kind: &str,
+    key: &str,
+) -> Result<bool> {
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO feedback_events (namespace, memory_id, kind, event_key)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![namespace, memory_id, kind, key],
+    )?;
+    Ok(inserted > 0)
 }
 
 /// State after feedback: live rows follow their counts, hidden rows stay put.
@@ -484,7 +527,7 @@ fn listing_memory(row: ListingRow, now: i64, decay_rate: f32) -> Memory {
         now,
         decay_rate,
     );
-    let exposure = exposure_label(&row.state, row.successes, row.failures);
+    let exposure = exposure_label(&row.state, row.successes, row.failures, trust);
     Memory {
         id: row.id,
         content: row.content,
@@ -630,6 +673,7 @@ impl Store {
             }
         }
         Self::migrate_to_v3(&conn)?;
+        Self::migrate_to_v4(&conn)?;
         let fingerprints = load_fingerprints_from_db(&conn, namespace)?;
         log::debug!(
             "SQLite store opened at {path} ns={namespace}; {} fingerprints loaded (embeddings deferred)",
@@ -699,6 +743,7 @@ impl Store {
             }
         }
         Self::migrate_to_v3(&conn)?;
+        Self::migrate_to_v4(&conn)?;
         drop(conn);
         Ok(Self {
             pool,
@@ -773,20 +818,24 @@ impl Store {
 
     /// Reinforcement with no text gate: the caller asserts that the agent declared it
     /// used this memory and that the task succeeded. Same namespace, quarantine and
-    /// one-vote-per-session rules as [`Self::reinforce_if_used`].
+    /// one-vote-per-session rules as [`Self::reinforce_if_used`]: a given non-blank
+    /// `session_id` counts at most once per memory, however many other sessions voted in
+    /// between. `None` or a blank `session_id` is never deduplicated.
     pub fn reinforce_declared(&self, memory_id: i64, session_id: Option<&str>) -> Result<bool> {
         self.apply_success(memory_id, session_id)
     }
 
     /// Record one attributed success in a single immediate transaction: the read of
     /// the counts, the state transition and the write cannot interleave with another
-    /// writer.
+    /// writer. A non-blank `session_id` is claimed durably in `feedback_events`, so a
+    /// repeat from the same session is refused even after other sessions voted.
     fn apply_success(&self, memory_id: i64, session_id: Option<&str>) -> Result<bool> {
+        let key = normalize_event_key(session_id);
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row = tx
             .query_row(
-                "SELECT reinforcement_count, failure_count, store_state, trust_last_session_id
+                "SELECT reinforcement_count, failure_count, store_state
                  FROM memories
                  WHERE id = ?1 AND namespace = ?2 AND archived = 0",
                 params![memory_id, self.namespace],
@@ -795,19 +844,19 @@ impl Store {
                         r.get::<_, i64>(0)?,
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
-                        r.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((successes, failures, state, last_session)) = row else {
+        let Some((successes, failures, state)) = row else {
             return Ok(false);
         };
         if state == "quarantined" {
             return Ok(false);
         }
-        if let (Some(sid), Some(last)) = (session_id, last_session.as_deref()) {
-            if sid == last {
+        if let Some(k) = key.as_deref() {
+            // Nothing has been written yet, so returning drops the transaction cleanly.
+            if !claim_feedback_event(&tx, &self.namespace, memory_id, FEEDBACK_SUCCESS, k)? {
                 return Ok(false);
             }
         }
@@ -825,7 +874,7 @@ impl Store {
             params![
                 successes,
                 new_state,
-                session_id,
+                key,
                 now_ts(),
                 memory_id,
                 self.namespace
@@ -848,25 +897,58 @@ impl Store {
     /// database error is returned. All ids are processed in one immediate transaction.
     ///
     /// Only the failure evidence changes: ingest-time `importance_base`, `confidence`
-    /// and the success count are left untouched. `failure_severity` currently gates
-    /// only (`> 0` counts one failure, `0` is a no-op); fractional evidence weights
-    /// would need REAL counters and are deferred.
+    /// and the success count are left untouched.
+    ///
+    /// `failure_severity` is a gate, not a weight: any finite value `> 0` records
+    /// exactly one failure, and a value `<= 0` (or NaN / infinite) records nothing and
+    /// returns a no-change outcome. Fractional evidence weights would need REAL
+    /// counters and are not supported in `0.1.x`.
+    ///
+    /// Repeated ids within one call count once. This is the same as
+    /// [`Self::penalize_if_used_with_event`] with no `event_id`.
     pub fn penalize_if_used(
         &self,
         memory_ids: &[i64],
         failure_severity: f32,
     ) -> Result<Vec<PenaltyOutcome>> {
+        self.penalize_if_used_with_event(memory_ids, failure_severity, None)
+    }
+
+    /// [`Self::penalize_if_used`] with an optional idempotency key.
+    ///
+    /// A non-blank `event_id` is claimed durably per `(memory, event_id)`: replaying the
+    /// same event (a retry, a duplicate delivery) records no second failure, and the
+    /// already-penalized ids are skipped, like unknown or quarantined ids. With `None`
+    /// or a blank `event_id` there is no cross-call deduplication, so separate calls
+    /// each count (only repeated ids inside one call collapse). Pass a key that
+    /// identifies one *outcome*, never a per-process or per-conversation id: reusing one
+    /// key across distinct failures would silently cap a memory at one failure.
+    pub fn penalize_if_used_with_event(
+        &self,
+        memory_ids: &[i64],
+        failure_severity: f32,
+        event_id: Option<&str>,
+    ) -> Result<Vec<PenaltyOutcome>> {
         if memory_ids.is_empty() {
             return Ok(vec![]);
         }
-        let severity = failure_severity.clamp(0.0, 1.0);
+        // `NaN <= 0.0` is false, so a plain `severity <= 0.0` test used to let NaN count
+        // as a failure; non-finite values now record nothing, like 0.
+        let counts_as_failure = failure_severity.is_finite() && failure_severity > 0.0;
+        let key = normalize_event_key(event_id);
+        let mut seen: HashSet<i64> = HashSet::with_capacity(memory_ids.len());
+        let unique_ids: Vec<i64> = memory_ids
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect();
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ts();
-        let mut outcomes = Vec::with_capacity(memory_ids.len());
+        let mut outcomes = Vec::with_capacity(unique_ids.len());
         let mut visibility_changes: Vec<(i64, bool)> = Vec::new();
         let mut penalized_ids: Vec<i64> = Vec::new();
-        for &id in memory_ids {
+        for id in unique_ids {
             let row = tx
                 .query_row(
                     "SELECT reinforcement_count, failure_count, store_state
@@ -890,7 +972,7 @@ impl Store {
             }
 
             let trust_before = posterior_trust(successes, failures);
-            if severity <= 0.0 {
+            if !counts_as_failure {
                 outcomes.push(PenaltyOutcome {
                     id,
                     trust_before,
@@ -898,6 +980,12 @@ impl Store {
                     uncertainty_after: trust_uncertainty(successes, failures),
                 });
                 continue;
+            }
+
+            if let Some(k) = key.as_deref() {
+                if !claim_feedback_event(&tx, &self.namespace, id, FEEDBACK_FAILURE, k)? {
+                    continue; // this event already penalized this memory
+                }
             }
 
             let failures = failures.saturating_add(1);
@@ -1235,7 +1323,7 @@ impl Store {
                 self.config.decay_rate,
             );
             let final_score = 0.75 * sim + 0.20 * trust + 0.05 * recency_bonus(created_at, now);
-            let exposure = exposure_label(&store_state, reinforcement_count, failure_count);
+            let exposure = exposure_label(&store_state, reinforcement_count, failure_count, trust);
 
             scored.push(Scored {
                 final_score,
@@ -2072,6 +2160,16 @@ impl Store {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 3 {
             conn.execute_batch(include_str!("../migrations/v3.sql"))?;
+        }
+        Ok(())
+    }
+
+    /// `user_version` 3 -> 4: durable feedback idempotency table (see
+    /// `migrations/v4.sql`). No-op on databases already at version 4.
+    fn migrate_to_v4(conn: &Connection) -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 4 {
+            conn.execute_batch(include_str!("../migrations/v4.sql"))?;
         }
         Ok(())
     }
@@ -3586,7 +3684,8 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        // v2 -> v3 (re-derive states, asserted above) -> v4 (events table).
+        assert_eq!(version, 4);
     }
 
     // ---- Step 8b-2: shadow corroboration ----
@@ -3732,5 +3831,355 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    // ---- Step 10, Batch 2: exposure vs decayed trust, durable feedback idempotency ----
+
+    fn backdate_feedback(store: &Store, id: i64, days: i64) {
+        let ts = now_ts() - days * 86_400;
+        store
+            .pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET last_accessed_at = ?1 WHERE id = ?2",
+                params![ts, id],
+            )
+            .unwrap();
+    }
+
+    fn feedback_event_count(store: &Store, kind: &str) -> i64 {
+        store
+            .pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM feedback_events WHERE kind = ?1",
+                params![kind],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn user_version_of(store: &Store) -> i64 {
+        store
+            .pool
+            .get()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn exposure_follows_decayed_trust_while_state_stays_active() {
+        let store = Store::in_memory().unwrap();
+        let id = store.insert("some lesson", &[1.0, 0.0]).unwrap();
+        for sid in ["s1", "s2", "s3"] {
+            assert!(store.reinforce_declared(id, Some(sid)).unwrap());
+        }
+        let fresh = store.search(&[1.0, 0.0], 3, false).unwrap().remove(0);
+        assert_eq!(fresh.exposure, "follow");
+        assert_eq!(fresh.state, "active");
+
+        // s = 3, f = 0: posterior 5/7. At 0.01/day it falls under 0.70 after ~6.9 days.
+        backdate_feedback(&store, id, 5);
+        let m = store.search(&[1.0, 0.0], 3, false).unwrap().remove(0);
+        assert_eq!(m.exposure, "follow", "trust {}", m.trust);
+
+        for days in [9, 100] {
+            backdate_feedback(&store, id, days);
+            let m = store.search(&[1.0, 0.0], 3, false).unwrap().remove(0);
+            assert_eq!(
+                m.state, "active",
+                "state reads raw counts and does not decay"
+            );
+            assert_eq!(m.exposure, "hint", "{days} days: trust {}", m.trust);
+            assert!(m.trust < 0.70, "{days} days: trust {}", m.trust);
+            // The listing path (`all`) must label the same row the same way.
+            let listed = store
+                .all()
+                .unwrap()
+                .into_iter()
+                .find(|x| x.id == id)
+                .unwrap();
+            assert_eq!(listed.exposure, "hint");
+            assert_eq!(listed.state, "active");
+            assert!((listed.trust - m.trust).abs() < 1e-4);
+        }
+        // 100 days: 0.5 + (5/7 - 0.5) * exp(-1) = 0.5788
+        let m = store.search(&[1.0, 0.0], 3, false).unwrap().remove(0);
+        assert!((m.trust - 0.5788).abs() < 1e-3, "trust {}", m.trust);
+    }
+
+    #[test]
+    fn exposure_label_equals_the_integer_rule_when_nothing_has_decayed() {
+        for s in 0..60i64 {
+            for f in 0..60i64 {
+                let trust = decayed_trust(posterior_trust(s, f), 0.0, 0.01);
+                let expected = if s + f == 0 {
+                    "trial"
+                } else if crate::quality::meets_follow(s, f) {
+                    "follow"
+                } else {
+                    "hint"
+                };
+                assert_eq!(
+                    exposure_label("active", s, f, trust),
+                    expected,
+                    "s={s} f={f}"
+                );
+            }
+        }
+        assert_eq!(exposure_label("quarantined", 5, 0, 0.9), "hidden");
+        assert_eq!(exposure_label("shadow", 5, 0, 0.9), "hidden");
+        assert_eq!(exposure_label("trial", 0, 0, 0.5), "trial");
+    }
+
+    #[test]
+    fn reinforce_declared_is_idempotent_across_non_consecutive_sessions() {
+        let store = Store::in_memory().unwrap();
+        let id = store.insert("some lesson", &[1.0, 0.0]).unwrap();
+        assert!(store.reinforce_declared(id, Some("s1")).unwrap());
+        assert!(store.reinforce_declared(id, Some("s2")).unwrap());
+        assert!(
+            !store.reinforce_declared(id, Some("s1")).unwrap(),
+            "s1 already voted; s2 in between must not reset that"
+        );
+        assert_eq!(raw_feedback_row(&store, id).reinforcement_count, 2);
+        assert!(!store.reinforce_declared(id, Some("s2")).unwrap());
+        assert!(store.reinforce_declared(id, Some("s3")).unwrap());
+        assert_eq!(raw_feedback_row(&store, id).reinforcement_count, 3);
+        assert_eq!(state_of(&store, id), "active");
+        assert_eq!(feedback_event_count(&store, "success"), 3);
+    }
+
+    #[test]
+    fn blank_keys_are_never_deduplicated_and_keys_are_trimmed() {
+        let store = Store::in_memory().unwrap();
+        let id = store.insert("some lesson", &[1.0, 0.0]).unwrap();
+        for blank in ["", "   ", "\t\n"] {
+            assert!(store.reinforce_declared(id, Some(blank)).unwrap());
+            assert!(store.reinforce_declared(id, Some(blank)).unwrap());
+        }
+        assert_eq!(raw_feedback_row(&store, id).reinforcement_count, 6);
+        assert_eq!(
+            feedback_event_count(&store, "success"),
+            0,
+            "blank keys are not stored"
+        );
+
+        let id2 = store.insert("another lesson", &[0.0, 1.0]).unwrap();
+        assert!(store.reinforce_declared(id2, Some("s1")).unwrap());
+        assert!(
+            !store.reinforce_declared(id2, Some("  s1 ")).unwrap(),
+            "trimmed"
+        );
+
+        let id3 = store.insert("third lesson", &[0.5, 0.5]).unwrap();
+        assert_eq!(
+            store
+                .penalize_if_used_with_event(&[id3], 1.0, Some(" "))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .penalize_if_used_with_event(&[id3], 1.0, Some(" "))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(raw_feedback_row(&store, id3).failure_count, 2);
+        assert_eq!(feedback_event_count(&store, "failure"), 0);
+    }
+
+    #[test]
+    fn penalize_counts_a_repeated_id_once_per_call() {
+        let store = Store::in_memory().unwrap();
+        let a = store.insert("lesson a", &[1.0, 0.0]).unwrap();
+        let b = store.insert("lesson b", &[0.0, 1.0]).unwrap();
+        let out = store.penalize_if_used(&[a, b, a, a, b], 1.0).unwrap();
+        assert_eq!(out.iter().map(|o| o.id).collect::<Vec<_>>(), vec![a, b]);
+        assert_eq!(raw_feedback_row(&store, a).failure_count, 1);
+        assert_eq!(raw_feedback_row(&store, b).failure_count, 1);
+        // Separate calls without an event id each count.
+        store.penalize_if_used(&[a], 1.0).unwrap();
+        assert_eq!(raw_feedback_row(&store, a).failure_count, 2);
+    }
+
+    #[test]
+    fn penalize_event_id_is_idempotent_and_none_still_reaches_quarantine() {
+        let store = Store::in_memory().unwrap();
+        let a = store.insert("lesson a", &[1.0, 0.0]).unwrap();
+        let first = store
+            .penalize_if_used_with_event(&[a], 1.0, Some("e1"))
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let replay = store
+            .penalize_if_used_with_event(&[a], 1.0, Some("e1"))
+            .unwrap();
+        assert!(replay.is_empty(), "same event replayed: nothing recorded");
+        assert_eq!(raw_feedback_row(&store, a).failure_count, 1);
+        assert_eq!(state_of(&store, a), "trial");
+        // A different event is a different outcome; s = 0, f = 2 quarantines.
+        let second = store
+            .penalize_if_used_with_event(&[a], 1.0, Some("e2"))
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(raw_feedback_row(&store, a).failure_count, 2);
+        assert_eq!(state_of(&store, a), "quarantined");
+
+        // Without an event id (the MCP default) a single session can still quarantine.
+        let b = store.insert("lesson b", &[0.0, 1.0]).unwrap();
+        store.penalize_if_used(&[b], 1.0).unwrap();
+        store.penalize_if_used(&[b], 1.0).unwrap();
+        assert_eq!(state_of(&store, b), "quarantined");
+
+        // Keys are scoped per memory and per kind.
+        let c = store.insert("lesson c", &[0.5, 0.5]).unwrap();
+        let d = store.insert("lesson d", &[0.7, 0.3]).unwrap();
+        assert_eq!(
+            store
+                .penalize_if_used_with_event(&[c, d], 1.0, Some("e1"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            store.reinforce_declared(c, Some("e1")).unwrap(),
+            "a session id is not an event id"
+        );
+        assert_eq!(raw_feedback_row(&store, c).failure_count, 1);
+        assert_eq!(raw_feedback_row(&store, c).reinforcement_count, 1);
+
+        // One batch mixing a fresh id and an already-claimed id only penalizes the fresh one.
+        let e = store.insert("lesson e", &[0.2, 0.8]).unwrap();
+        let mixed = store
+            .penalize_if_used_with_event(&[c, e, c], 1.0, Some("e1"))
+            .unwrap();
+        assert_eq!(mixed.iter().map(|o| o.id).collect::<Vec<_>>(), vec![e]);
+        assert_eq!(raw_feedback_row(&store, c).failure_count, 1);
+    }
+
+    #[test]
+    fn penalize_severity_is_a_gate_and_non_finite_values_record_nothing() {
+        let store = Store::in_memory().unwrap();
+        let id = store.insert("some lesson", &[1.0, 0.0]).unwrap();
+        for sev in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let out = store.penalize_if_used(&[id], sev).unwrap();
+            assert_eq!(out.len(), 1, "severity {sev}");
+            assert_eq!(out[0].trust_before, out[0].trust_after, "severity {sev}");
+            assert_eq!(
+                raw_feedback_row(&store, id).failure_count,
+                0,
+                "severity {sev}"
+            );
+        }
+        // A no-op never claims an event id.
+        assert_eq!(
+            store
+                .penalize_if_used_with_event(&[id], f32::NAN, Some("e1"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(feedback_event_count(&store, "failure"), 0);
+        // Any finite value > 0 is exactly one failure: 0.5 == 1.0 == 7.0.
+        for (n, sev) in [0.5f32, 1.0, 7.0].into_iter().enumerate() {
+            store.penalize_if_used(&[id], sev).unwrap();
+            let expected = (n + 1) as i64;
+            if state_of(&store, id) == "quarantined" {
+                break; // s = 0 quarantines at f = 2; later calls skip the row
+            }
+            assert_eq!(
+                raw_feedback_row(&store, id).failure_count,
+                expected,
+                "severity {sev}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_v4_backfills_the_last_reinforcing_session_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        let path = path.to_str().unwrap();
+        let (a, b, c) = {
+            let store = Store::open_ns(path, "default").unwrap();
+            assert_eq!(user_version_of(&store), 4);
+            let a = store.insert("lesson a", &[1.0, 0.0, 0.0]).unwrap();
+            let b = store.insert("lesson b", &[0.0, 1.0, 0.0]).unwrap();
+            let c = store.insert("lesson c", &[0.0, 0.0, 1.0]).unwrap();
+            assert!(store.reinforce_declared(a, Some("s1")).unwrap());
+            (a, b, c)
+        };
+        {
+            // Rewind to what a v3 engine left behind: no events table, version 3, and
+            // only `trust_last_session_id` remembering the last reinforcing session.
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch("DROP TABLE feedback_events; PRAGMA user_version = 3;")
+                .unwrap();
+            conn.execute(
+                "UPDATE memories SET reinforcement_count = 1, trust_last_session_id = '  legacy '
+                 WHERE id = ?1",
+                params![b],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memories SET trust_last_session_id = '   ' WHERE id = ?1",
+                params![c],
+            )
+            .unwrap();
+        }
+        let store = Store::open_ns(path, "default").unwrap();
+        assert_eq!(user_version_of(&store), 4);
+        assert_eq!(
+            feedback_event_count(&store, "success"),
+            2,
+            "a and b; blank c skipped"
+        );
+        assert_eq!(feedback_event_count(&store, "failure"), 0);
+        assert!(
+            !store.reinforce_declared(a, Some("s1")).unwrap(),
+            "v3 guard survives"
+        );
+        assert!(
+            !store.reinforce_declared(b, Some("legacy")).unwrap(),
+            "trimmed backfill"
+        );
+        assert!(store.reinforce_declared(a, Some("s2")).unwrap());
+        assert!(store.reinforce_declared(c, Some("s1")).unwrap());
+        drop(store);
+
+        // Reopening a v4 database changes nothing.
+        let store = Store::open_ns(path, "default").unwrap();
+        assert_eq!(user_version_of(&store), 4);
+        assert_eq!(feedback_event_count(&store, "success"), 4);
+    }
+
+    #[test]
+    fn feedback_events_are_removed_with_their_memory() {
+        let store = Store::in_memory().unwrap();
+        let a = store.insert("lesson a", &[1.0, 0.0]).unwrap();
+        let b = store.insert("lesson b", &[0.0, 1.0]).unwrap();
+        assert!(store.reinforce_declared(a, Some("s1")).unwrap());
+        store
+            .penalize_if_used_with_event(&[b], 1.0, Some("e1"))
+            .unwrap();
+        assert_eq!(feedback_event_count(&store, "success"), 1);
+        assert_eq!(feedback_event_count(&store, "failure"), 1);
+
+        assert!(store.forget(a).unwrap());
+        assert_eq!(feedback_event_count(&store, "success"), 0);
+        assert_eq!(feedback_event_count(&store, "failure"), 1);
+
+        store.clear().unwrap();
+        assert_eq!(feedback_event_count(&store, "failure"), 0);
+
+        // ids are AUTOINCREMENT, so a new row never inherits a deleted row's events.
+        let fresh = store.insert("lesson a", &[1.0, 0.0]).unwrap();
+        assert!(fresh > a);
+        assert!(store.reinforce_declared(fresh, Some("s1")).unwrap());
     }
 }

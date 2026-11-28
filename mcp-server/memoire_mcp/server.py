@@ -103,10 +103,53 @@ _memoire_locks: Dict[Tuple[str, str], threading.Lock] = {}
 _instance_lock = threading.Lock()
 T = TypeVar("T")
 
-# One id per server process. Feedback tools pass it to the engine, which refuses a
-# second reinforcement of a memory whose most recent reinforcing session is this one.
+# One id per server process. Reinforcement tools pass it to the engine, which refuses a
+# second reinforcement of a memory that this session has already reinforced.
 # Two concurrent clients (each with its own server process) get different ids.
+# It is deliberately NOT used for penalties: an id that spans the whole process would
+# cap a memory at one failure per process, so it could never reach quarantine. Penalties
+# are deduplicated only when the caller supplies a per-outcome `event_id`.
 SESSION_ID = f"mcp-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+
+MAX_EVENT_ID_LENGTH = 256
+
+
+def clean_event_id(event_id: Optional[str]) -> Optional[str]:
+    """Normalise an optional penalty `event_id`.
+
+    ``None`` and blank / whitespace-only strings mean "no idempotency key" (the same
+    rule the engine applies). Surrounding whitespace is stripped. Raises ValueError for
+    a key longer than ``MAX_EVENT_ID_LENGTH`` characters.
+    """
+    if event_id is None:
+        return None
+    cleaned = event_id.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > MAX_EVENT_ID_LENGTH:
+        raise ValueError(f"event_id must be at most {MAX_EVENT_ID_LENGTH} characters")
+    return cleaned
+
+
+def unique_ids(memory_ids: List[int]) -> List[int]:
+    """Drop repeated ids, keeping first-seen order (``[5, 5]`` counts as ``[5]``)."""
+    return list(dict.fromkeys(memory_ids))
+
+
+def penalize_memories(
+    memoire: Memoire,
+    memory_ids: List[int],
+    failure_severity: float,
+    event_id: Optional[str],
+) -> List[dict]:
+    """Call the engine's penalty, passing ``event_id`` only when one was supplied.
+
+    Omitting the keyword when it is absent keeps this working against engine builds
+    that predate ``event_id`` (those simply have no cross-call idempotency).
+    """
+    if event_id is None:
+        return memoire.penalize_if_used(memory_ids, failure_severity)
+    return memoire.penalize_if_used(memory_ids, failure_severity, event_id=event_id)
 
 
 def trial_cap_from_env() -> Optional[int]:
@@ -463,10 +506,15 @@ def memoire_reinforce(memory_id: int, agent_output: str, task_succeeded: bool, c
 
 
 @mcp.tool()
-def memoire_penalize(memory_ids: List[int], failure_severity: float, ctx: Context, namespace: str = "default") -> dict:
+def memoire_penalize(memory_ids: List[int], failure_severity: float, ctx: Context, namespace: str = "default", event_id: Optional[str] = None) -> dict:
     """
     Penalize memories that contributed to a failed task outcome.
-    `failure_severity` is a scale factor [0.0, 1.0].
+    `failure_severity` is a gate in [0.0, 1.0], not a weight: any value above 0 records
+    exactly one failure per memory (0.5 counts the same as 1.0); 0 records nothing.
+    Repeated ids in `memory_ids` count once.
+    `event_id` (optional, at most 256 characters) makes the call idempotent: pass one
+    id per failed outcome and a retry of that same outcome will not count twice.
+    Do not reuse one id across different failures. Without it every call counts.
     """
     if not memory_ids:
         return error_response("invalid_argument", "memory_ids must not be empty")
@@ -478,12 +526,16 @@ def memoire_penalize(memory_ids: List[int], failure_severity: float, ctx: Contex
             "failure_severity must be between 0.0 and 1.0",
             failure_severity=failure_severity,
         )
+    try:
+        key = clean_event_id(event_id)
+    except ValueError as e:
+        return error_response("invalid_argument", str(e))
 
     try:
+        ids = unique_ids(memory_ids)
         results = run_memoire(
             ctx,
-            lambda memoire: memoire.penalize_if_used(
-                memory_ids, failure_severity),
+            lambda memoire: penalize_memories(memoire, ids, failure_severity, key),
             namespace=namespace,
         )
         return ok_response(outcomes=results)
@@ -493,11 +545,15 @@ def memoire_penalize(memory_ids: List[int], failure_severity: float, ctx: Contex
 
 
 @mcp.tool()
-def memoire_batch_feedback(memory_ids: List[int], task_succeeded: bool, task_output: str, ctx: Context, namespace: str = "default") -> dict:
+def memoire_batch_feedback(memory_ids: List[int], task_succeeded: bool, task_output: str, ctx: Context, namespace: str = "default", event_id: Optional[str] = None) -> dict:
     """
     Batch process feedback for a set of memories used in a task.
-    If task_succeeded is True, reinforces the memories. If False, penalizes them.
+    If task_succeeded is True, reinforces the memories. If False, penalizes them
+    (one failure per memory). Repeated ids count once.
     Explicitly define success. Do NOT guess from task_output.
+    `event_id` (optional, at most 256 characters) applies only to a failed task: pass
+    one id per failed outcome so a retry of it does not count twice. It is ignored when
+    task_succeeded is True (reinforcement is deduplicated per server session).
     """
     if not memory_ids:
         return error_response("invalid_argument", "memory_ids must not be empty")
@@ -505,23 +561,32 @@ def memoire_batch_feedback(memory_ids: List[int], task_succeeded: bool, task_out
         return error_response("invalid_argument", "all memory_ids must be positive", memory_ids=memory_ids)
     if task_succeeded and (not task_output or not task_output.strip()):
         return error_response("invalid_argument", "task_output must not be empty for successful feedback")
+    try:
+        key = clean_event_id(event_id)
+    except ValueError as e:
+        return error_response("invalid_argument", str(e))
+    ids = unique_ids(memory_ids)
 
     try:
         def apply_feedback(memoire: Memoire) -> Dict[str, Any]:
             if not task_succeeded:
-                results = memoire.penalize_if_used(
-                    memory_ids, failure_severity=1.0)
-                return ok_response(task_succeeded=False, penalized=len(results), outcomes=results)
+                results = penalize_memories(memoire, ids, 1.0, key)
+                return ok_response(
+                    task_succeeded=False,
+                    penalized=len(results),
+                    requested=len(ids),
+                    outcomes=results,
+                )
 
             reinforced_count = 0
-            for mid in memory_ids:
+            for mid in ids:
                 if memoire.reinforce_if_used(
                         mid, task_output, task_succeeded=True, session_id=SESSION_ID):
                     reinforced_count += 1
             return ok_response(
                 task_succeeded=True,
                 reinforced=reinforced_count,
-                requested=len(memory_ids),
+                requested=len(ids),
             )
 
         return run_memoire(ctx, apply_feedback, namespace=namespace)

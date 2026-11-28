@@ -509,9 +509,17 @@ impl ContradictionMode {
 }
 
 /// Trust at or above which a memory is offered as `follow` (default policy). Single
-/// source of truth for the Python `MemoryPolicy` and the MCP server; the integer rule
-/// [`meets_follow`] is the same threshold written without floats.
+/// source of truth for the Python `MemoryPolicy`, the MCP server and the `follow` label
+/// of `Memory::exposure`. All three compare the *decayed* trust (see [`decayed_trust`])
+/// against it, with [`POLICY_TRUST_EPS`] of slack. The integer rule [`meets_follow`] is
+/// the same threshold written over the raw, undecayed counts: it drives the `active`
+/// state, not the offer label.
 pub const FOLLOW_THRESHOLD: f64 = 0.70;
+/// Slack added to a trust value before it is compared with a policy threshold, so an
+/// `f32` trust that is mathematically exactly on the bar (for example 7/10) still
+/// counts as reaching it. Must equal `_TRUST_EPS` in `bindings/python/memoire_engine/client.py`
+/// (`MemoryPolicy`).
+pub const POLICY_TRUST_EPS: f64 = 1e-6;
 /// Trust at or above which a memory is offered as a `hint` (default policy). Below it
 /// the default policy ignores the memory; [`should_quarantine`] uses the same bar.
 pub const HINT_THRESHOLD: f64 = 0.40;

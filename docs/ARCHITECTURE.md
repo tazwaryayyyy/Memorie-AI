@@ -243,10 +243,35 @@ in the same immediate transaction as the feedback update:
 
 Default recall returns at most `ScoringConfig::trial_cap` (default 1) unverified
 (`s + f == 0`) rows; with no feedback history that bounds a default recall to one result.
-Each result carries `exposure`: `follow`, `hint`, `trial`, `hidden` or `plain`.
+Each result carries `exposure`: `follow`, `hint`, `trial`, `hidden` or `plain`. `follow`
+is judged on the same decayed `trust` the result carries (`trust + 1e-6 >= 0.70`, matching
+the Python `MemoryPolicy`), whereas `store_state` uses the raw counts. A fresh `s = 3, f = 0`
+row is `active` / `follow`; with no new feedback it becomes `active` / `hint` after about
+7 days at the default decay.
 Migration `user_version` 2 -> 3 (`migrations/v3.sql`) re-derives live states from the
 stored counts; legacy penalties decremented `reinforcement_count`, so that backfill is
 approximate.
+
+### Feedback idempotency
+
+Migration `user_version` 3 -> 4 (`migrations/v4.sql`) adds `feedback_events`:
+
+```
+feedback_events(id, namespace, memory_id -> memories.id ON DELETE CASCADE,
+                kind IN ('success', 'failure'), event_key, created_at,
+                UNIQUE (namespace, memory_id, kind, event_key))
+```
+
+A non-blank `session_id` (reinforcement, `kind = 'success'`) or `event_id` (penalty,
+`kind = 'failure'`) is claimed with `INSERT OR IGNORE` inside the same immediate transaction
+as the counter update, so a repeat is refused even when other keys arrived in between.
+Calls without a key (or with a blank one) are not recorded and never deduplicated across
+calls; repeated ids inside one `penalize_if_used` call count once. The v3 guard remembered
+only the last reinforcing session, so `s1, s2, s1` counted three votes. The migration
+back-fills each memory's `trust_last_session_id` as a `success` event, which keeps that
+guarantee; older history was never stored. Events are removed with their memory
+(`forget`, `clear`, maintenance pruning) and are not part of `export_namespace`; an import
+re-ingests content as new rows, so imported memories start with no events.
 
 ---
 
