@@ -5,14 +5,35 @@ All notable changes to Memoire will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
-> **Release status:** no version has been tagged or published to any registry. `Cargo.toml`,
-> `bindings/python/pyproject.toml` and `mcp-server/pyproject.toml` are all at `0.1.0`. The
-> `0.2.0` / `0.3.0` entries below record development milestones, not published releases.
+> **Release status:** `0.1.0` (alpha) is published: PyPI `memoire-engine` and `memoire-mcp`,
+> crates.io `memoire-engine`, the Official MCP Registry and GitHub Release `v0.1.0` (tag `v0.1.0`,
+> commit `e69154d`). `Cargo.toml`, `bindings/python/pyproject.toml` and
+> `mcp-server/pyproject.toml` are all at `0.1.0`. The `[Unreleased]` entries up to Step 9a describe
+> the tree tagged `v0.1.0`; Step 9b landed after the tag and is in the crates.io `0.1.0` crate (see
+> README Known Limitation 5 for the PyPI provenance difference). Splitting `[Unreleased]` into a
+> `[0.1.0]` section is left for the next release. The `0.2.0` / `0.3.0` entries and the
+> `0.1.0 — 2024-01-XX` entry at the bottom record pre-publication development milestones that were
+> never published; they are unrelated to the published `0.1.0`.
 
 ---
 
 ## [Unreleased]
-### Changed (Step 9b: pre-release polish; nothing published)
+### Changed (Step 10, Batch 1: post-`0.1.0` doc reconciliation and dependency floors)
+- Docs: removed claims that nothing is published or that the package names are unregistered from
+  `README.md`, `docs/RELEASE.md`, `SECURITY.md`, `mcp-server/README.md`, `bindings/python/README.md`
+  (the PyPI long description of `memoire-engine`), the `memoire_engine` package docstring, a comment
+  in `bindings/python/pyproject.toml` and this file; added a "Published Releases" section to
+  `docs/RELEASE.md` that records the immutable `0.1.0` provenance differences.
+- `mcp-server/pyproject.toml`: `mcp[cli]` is `>=1.30.0,<2` (was `==1.27.1`); the `dev` extra
+  `pytest` is `>=9.0.3,<10` (was `==8.4.2`).
+- `dashboard/package.json`: `next` and `eslint-config-next` are `16.4.5` (were `16.2.7`).
+- CI: the clean-venv install in `.github/workflows/ci.yml` and `release.yml` uses
+  `mcp[cli]>=1.30.0,<2` (was `==1.27.1`), so the release smoke job's `pip check` accepts the new
+  `memoire-mcp` requirement.
+- Not changed: `src/`, engine behaviour, the C ABI, MCP tool names, version numbers (`0.1.0`) and
+  the frozen Step 8d evaluation files. The only Python source change is a docstring.
+
+### Changed (Step 9b: pre-publication polish, merged after the `v0.1.0` tag)
 - `THIRD_PARTY_NOTICES.md` (and its copy inside the wheel) now inventories all 381 registry packages
   in `Cargo.lock` grouped by license, names the non-crate components (ONNX Runtime 1.23.2, SQLite,
   Oniguruma, tree-sitter) and the OpenSSL libraries `auditwheel` copies into Linux wheels. It does
@@ -30,7 +51,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   config files), not 23 MB; removed the stale `git checkout fix/p0-stabilization` instruction and
   the "until merged" wording in `SECURITY.md`.
 
-### Added (Step 9a: release engineering; nothing published)
+### Added (Step 9a: release engineering, before the first publication)
 - **CI** (`.github/workflows/ci.yml`): runs on `fix/p0-stabilization` pushes as well as `main`; adds
   `bindings/python/tests` (Python 3.10 and 3.13), offline `eval/tests`, the `wasm32` compile check,
   dashboard `tsc` and `npm test`, `cargo package --locked`, and a release-metadata consistency job;
@@ -49,7 +70,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   packages, `repository` / `homepage` and the notices file in `Cargo.toml`.
 - `scripts/check_release_metadata.py`, `scripts/inspect_wheel.py`, `scripts/smoke_installed.py`.
 - Not changed: `src/`, engine behaviour or defaults, bindings code, `eval/` and the frozen Step 8d
-  files. These workflow and packaging changes have not been executed in GitHub Actions.
+  files. At the time of writing, these workflow and packaging changes had not been executed in
+  GitHub Actions.
 
 ### Added (Steps 8c-8d: real-LLM evaluation harness, pre-registration, first held-out result)
 - **`eval/` real-LLM harness** (hermetic, resumable JSONL; arms A no memory, B plain vector, C0 static Memoire,
@@ -198,8 +220,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed (breaking, pre-release)
 - Python import package renamed `memoire` -> `memoire_engine` (distribution name `memoire-engine`,
-  provisional and unpublished); native module is `memoire_engine.memoire_engine`. The unrelated
-  PyPI project `memoire` ships an overlapping top-level `memoire` package.
+  provisional and unpublished when this was written; since published on PyPI as `0.1.0`); native
+  module is `memoire_engine.memoire_engine`. The unrelated PyPI project `memoire` ships an
+  overlapping top-level `memoire` package.
 - MCP server is now the `memoire_mcp` package (`memoire-mcp` / `python -m memoire_mcp`) instead of a
   generic top-level `server` module. `python mcp-server/server.py` no longer exists.
 - Cargo package name is `memoire-engine`; the library target stays `memoire` (`use memoire::...`,
@@ -317,7 +340,7 @@ re-ranking (`Memoire::with_reranker` / `recall_reranked`), and namespace snapsho
 
 ---
 
-## [0.3.0] — 2026-06-07
+## [0.3.0] — 2026-06-07 (internal milestone; never published)
 
 ### Fixed (P0 — bugs)
 
@@ -422,7 +445,7 @@ re-ranking (`Memoire::with_reranker` / `recall_reranked`), and namespace snapsho
 
 ---
 
-## [0.2.0] — 2026-06-05
+## [0.2.0] — 2026-06-05 (internal milestone; never published)
 
 ### Added
 
@@ -482,7 +505,7 @@ re-ranking (`Memoire::with_reranker` / `recall_reranked`), and namespace snapsho
 
 ---
 
-## [0.1.0] — 2024-01-XX
+## Pre-publication milestone "0.1.0" — 2024-01-XX (never published; not the published `0.1.0`)
 
 ### Added
 - **Core Rust library** (`cdylib` + `rlib`)

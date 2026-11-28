@@ -5,6 +5,17 @@
 MCP stdio server for Memoire. Python package: `memoire_mcp`. Console script:
 `memoire-mcp` (also `python -m memoire_mcp`).
 
+## Install from PyPI
+
+```bash
+uvx memoire-mcp          # or: pip install memoire-mcp
+```
+
+`memoire-mcp` `0.1.0` is on PyPI. It depends on `memoire-engine` (import name `memoire_engine`),
+which has prebuilt wheels only for Linux `x86_64` (`manylinux_2_28`), macOS `arm64` and Windows
+`x86_64` and no sdist, so installing `memoire-mcp` fails on other platforms unless you build from
+source (below). The unrelated PyPI project `memoire` must never be installed in its place.
+
 ## Run from a source checkout
 
 Requires a Rust toolchain: the Python SDK (`bindings/python`, import name
@@ -20,14 +31,14 @@ Manual virtualenv install (package smoke tests):
 
 ```bash
 python -m pip install ./bindings/python        # builds the PyO3 extension
-python -m pip install "mcp[cli]==1.27.1"
+python -m pip install "mcp[cli]>=1.30.0,<2"
 python -m pip install --no-deps ./mcp-server
 memoire-mcp
 ```
 
-Use `--no-deps` for the last step until the SDK's PyPI name is final: the
-provisional name `memoire-engine` is not registered, and the unrelated PyPI
-project `memoire` must never be installed in its place.
+`--no-deps` keeps `pip` from fetching `memoire-engine` from PyPI, so the local build from the
+first step is the one that gets used. The unrelated PyPI project `memoire` must never be
+installed in its place.
 
 `MEMOIRE_LIB` and `cargo build --release` are **not** used by the Python package.
 If the server reports `native_library_unavailable`, run `maturin develop --release`
@@ -38,8 +49,8 @@ is already cached.
 
 ## MCP client configuration
 
-Nothing is published to PyPI yet, so every command below points at the console script of a
-virtualenv you built from a source checkout (see above). Replace the `/ABSOLUTE/PATH/...`
+Every command below points at the console script of a virtualenv in which `memoire-mcp` is
+installed (from PyPI or from a source checkout, see above). Replace the `/ABSOLUTE/PATH/...`
 placeholders; on Windows use `...\.venv\Scripts\memoire-mcp.exe` and a path such as
 `C:\Users\you\.memoire\memoire.db`.
 
@@ -101,9 +112,10 @@ Put this in `~/.cursor/mcp.json` (all projects) or `<project>/.cursor/mcp.json`:
 }
 ```
 
-The old `python /path/to/mcp-server/server.py` invocation no longer exists. Once
-`memoire-mcp` is published, running it through `uvx` should also work; that has not been tested
-because nothing is published.
+The old `python /path/to/mcp-server/server.py` invocation no longer exists. `uvx memoire-mcp`
+also works: the maintainer ran `uvx memoire-mcp==0.1.0` end to end by hand (remember, recall and
+feedback across sessions). That run is not part of CI, and the client configuration blocks above
+have not been tested with `uvx`.
 
 ### `MEMOIRE_TRIAL_CAP`
 

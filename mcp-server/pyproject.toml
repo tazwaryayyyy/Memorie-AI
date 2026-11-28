@@ -11,16 +11,16 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]==1.27.1",
-    # Python SDK (import package `memoire_engine`). The unrelated PyPI project
-    # "memoire" must never be used here. Distribution name `memoire-engine` is
-    # unregistered until the owner publishes it.
+    # Stay on the 1.x SDK line this server was written against (`mcp.server.fastmcp`).
+    "mcp[cli]>=1.30.0,<2",
+    # Python SDK (import package `memoire_engine`), published on PyPI as `memoire-engine`.
+    # The unrelated PyPI project "memoire" must never be used here.
     "memoire-engine>=0.1.0,<0.2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest==8.4.2",
+    "pytest>=9.0.3,<10",
 ]
 
 [project.scripts]

@@ -216,7 +216,7 @@ jobs:
           python -m pip install --upgrade pip
           # Third-party dependency from the index; the two Memoire wheels come only from dist/
           # (--no-index), so an unrelated PyPI project can never be substituted.
-          python -m pip install "mcp[cli]==1.27.1"
+          python -m pip install "mcp[cli]>=1.30.0,<2"
           python -m pip install --no-index --no-deps --find-links dist memoire-engine memoire-mcp
           python -m pip check
           export FASTEMBED_CACHE_DIR="$RUNNER_TEMP/fastembed_cache"
